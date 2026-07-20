@@ -22,4 +22,6 @@ export interface Analysis {
   reasons: string[];
   tailoredCV: string; // markdown
   coverLetter: string;
+  demo?: boolean;
+  demoNote?: string;
 }

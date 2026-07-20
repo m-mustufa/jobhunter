@@ -362,6 +362,17 @@ function AnalysisPanel({
 
       {analysis && !analyzing && (
         <div className="mt-5">
+          {analysis.demo && (
+            <div className="mb-4 rounded-lg border border-beacon/30 bg-beacon/10 px-3 py-2.5">
+              <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-beacon">
+                Simulated demo
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-soft">
+                {analysis.demoNote || "Preview output generated without an AI API call."}
+                {" "}Verify and edit before using it in an application.
+              </p>
+            </div>
+          )}
           <div className="flex items-center gap-5">
             <ScoreRing score={analysis.score} />
             <div>

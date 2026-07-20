@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { Analysis } from "@/lib/types";
+import { buildDemoAnalysis } from "@/lib/demoAnalysis";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -42,12 +43,6 @@ Return only the JSON object.`;
 
 export async function POST(req: Request) {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) {
-    return NextResponse.json(
-      { error: "ANTHROPIC_API_KEY is not set. Add it to enable AI tailoring." },
-      { status: 400 }
-    );
-  }
 
   let body: any;
   try {
@@ -61,6 +56,12 @@ export async function POST(req: Request) {
     return NextResponse.json(
       { error: "Both a job and a master CV are required." },
       { status: 400 }
+    );
+  }
+
+  if (process.env.DEMO_MODE === "true" || !key) {
+    return NextResponse.json(
+      buildDemoAnalysis(job, masterCV, "Simulated preview — Claude was not called.")
     );
   }
 
@@ -81,8 +82,9 @@ export async function POST(req: Request) {
     });
 
     if (!r.ok) {
-      const detail = await r.text();
-      throw new Error(`Anthropic API ${r.status}: ${detail.slice(0, 300)}`);
+      return NextResponse.json(
+        buildDemoAnalysis(job, masterCV, "Simulated preview — Claude is currently unavailable.")
+      );
     }
 
     const data = await r.json();
@@ -105,8 +107,7 @@ export async function POST(req: Request) {
     return NextResponse.json(analysis);
   } catch (err: any) {
     return NextResponse.json(
-      { error: `Analysis failed: ${err.message}` },
-      { status: 500 }
+      buildDemoAnalysis(job, masterCV, "Simulated preview — live AI analysis could not be completed.")
     );
   }
 }
