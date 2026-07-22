@@ -1,0 +1,48 @@
+// The seniority/functional titles this agent hunts for, per the agent spec.
+export const TARGET_ROLE_TITLES = [
+  "Vice President",
+  "Assistant Vice President",
+  "General Manager",
+  "Deputy General Manager",
+  "Business Unit Head",
+  "Division Head",
+  "Department Head",
+  "Senior Manager",
+  "Department Manager",
+  "Area Manager",
+  "Senior Project Manager",
+  "Project Director",
+  "Engineering Manager",
+  "Operations Manager",
+  "Commercial Manager",
+  "Finance Manager",
+  "HR Manager",
+  "IT Manager",
+  "Data Management Manager",
+  "Quality Manager",
+  "QA-QC Manager",
+  "HSE Manager",
+  "Supply Chain Manager",
+  "Procurement Manager",
+  "Contracts Manager",
+  "Business Development Manager",
+  "Strategy and Transformation Manager",
+  "Governance, Risk and Compliance Manager",
+  "Team Leader",
+  "Section Head",
+  "Lead",
+];
+
+// Related titles grouped into OR-queries so one search click costs a
+// handful of JSearch calls instead of one per title.
+export const QUERY_GROUPS = [
+  "Vice President OR Assistant Vice President OR General Manager OR Deputy General Manager Abu Dhabi",
+  "Business Unit Head OR Division Head OR Department Head Abu Dhabi",
+  "Senior Manager OR Department Manager OR Area Manager Abu Dhabi",
+  "Project Director OR Senior Project Manager OR Engineering Manager Abu Dhabi",
+  "Operations Manager OR Commercial Manager OR Finance Manager OR HR Manager Abu Dhabi",
+  "IT Manager OR Data Management Manager OR Quality Manager OR QA-QC Manager OR HSE Manager Abu Dhabi",
+  "Supply Chain Manager OR Procurement Manager OR Contracts Manager Abu Dhabi",
+  "Business Development Manager OR Strategy and Transformation Manager OR Governance Risk and Compliance Manager Abu Dhabi",
+  "Team Leader OR Section Head OR Lead Abu Dhabi",
+];

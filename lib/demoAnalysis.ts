@@ -1,4 +1,5 @@
 import { Analysis, Job } from "./types";
+import { getMatchTier } from "./matchTier";
 
 const SKILLS = [
   "Angular", "React", "Next.js", "Node.js", "TypeScript", "JavaScript",
@@ -60,12 +61,34 @@ export function buildDemoAnalysis(job: Job, masterCV: string, note?: string): An
 
   const coverLetter = `Dear ${job.company} hiring team,\n\nI'm interested in the ${job.title} opportunity${job.location ? ` in ${job.location}` : ""}. My background combines ${skillPhrase} with hands-on ownership of production software from interface through backend delivery.\n\nIn my current and founding-engineer work, I have contributed to large SaaS products, built user-facing workflows, and taken features from requirements through implementation. The role's emphasis on ${highlights.slice(0, 2).join(" and ") || "practical full-stack ownership"} closely matches the work highlighted in my CV. I would bring a product-minded approach, attention to reliable delivery, and the ability to collaborate across the stack.\n\nI would welcome a conversation about the challenges your team is solving and how my experience could contribute.\n\nBest regards,\n${name}`;
 
+  const gapAnalysis = gaps.length
+    ? `The posting mentions ${gaps.slice(0, 3).join(", ")}, which ${gaps.length > 1 ? "are" : "is"} not explicit in the Master CV. Everything else in this preview draws only on experience already documented there.`
+    : "No significant gaps detected between the posting's stated requirements and the Master CV in this preview.";
+
+  const auditTrail = highlights.length
+    ? highlights.slice(0, 4).map((skill) => ({
+        statement: `Experience with ${skill}`,
+        source: "Core Skills / Experience section of the Master CV",
+      }))
+    : [
+        {
+          statement: "End-to-end product delivery experience",
+          source: "Experience section of the Master CV",
+        },
+      ];
+
+  const tier = getMatchTier(score);
+
   return {
     score,
+    tier: tier.key,
+    tierLabel: tier.label,
     verdict,
     reasons,
     tailoredCV,
     coverLetter,
+    gapAnalysis,
+    auditTrail,
     demo: true,
     demoNote: note || "Simulated preview generated locally without an AI API call.",
   };

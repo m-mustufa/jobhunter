@@ -1,22 +1,23 @@
-# JobHunter — demo slice
+# JobHunter
 
-A live demo of the AI Job Hunter agent: search real job listings, and for any
-role the agent **scores your fit** and **tailors your CV** (plus a cover letter)
-to that exact posting — truthfully, in seconds.
-
-This is the "wow" slice, not the full agent. No accounts, cron, or notifications —
-just the core loop: **real jobs in → tailored CV out.**
+An AI job-hunting agent for Abu Dhabi: one click searches every open vacancy
+across ~30 senior/functional titles (VP down to Team Lead), scores your fit
+against each one, and generates a tailored CV + cover letter for every match —
+truthfully, in one batch.
 
 ## What it does
 
-- Pulls live listings from **JSearch** (Google for Jobs — covers LinkedIn, Indeed,
-  Glassdoor, company pages).
-- Sends the job description + your master CV to **Claude**, which returns a
-  0–100 match score, the reasons, a tailored CV, and a cover letter.
-- Tailoring is **truthful by design**: Claude only re-emphasizes what's already in
-  your master CV. It never invents experience.
-
-Works out of the box with sample jobs even before you add any keys.
+- Searches **JSearch** (Google for Jobs — covers LinkedIn, Indeed, Glassdoor,
+  company pages) across the target-role query list, filters results to Abu
+  Dhabi, and dedupes them.
+- Streams each vacancy through **Claude**, which returns a 0–100 match score
+  (bucketed into Strong / Good / Partial / Limited match tiers), the reasons,
+  a tailored CV, a cover letter, a short gap analysis, and an audit trail
+  showing which master-CV statement backs each tailored-CV claim.
+- Tailoring is **truthful by design**: Claude only re-orders, re-emphasizes,
+  and rephrases what's already in your master CV. It never invents
+  experience — gaps are called out explicitly instead.
+- Works out of the box with sample jobs even before you add any keys.
 
 ## Run locally
 
@@ -34,6 +35,11 @@ npm run dev                  # http://localhost:3000
 | `JSEARCH_API_KEY` | Optional | Live jobs. Without it, the app serves realistic sample listings. Get it on RapidAPI (JSearch). |
 | `ANTHROPIC_MODEL` | Optional | Defaults to `claude-sonnet-5`. |
 
+**RapidAPI quota note**: each "Find & tailor all matches" click runs ~9
+JSearch calls (one per grouped title query) to cover all ~30 target titles.
+JSearch's free RapidAPI tier has a limited monthly request quota — heavy use
+may need a paid tier.
+
 ## Deploy to Vercel (public link in ~5 min)
 
 1. Push this folder to a GitHub repo.
@@ -43,10 +49,30 @@ npm run dev                  # http://localhost:3000
 
 That URL is what you share with the client.
 
+## How search works
+
+Job titles searched: VP, AVP, GM, DGM, Business Unit Head, Division Head,
+Department Head, Senior Manager, Department Manager, Area Manager, Senior
+Project Manager, Project Director, Engineering Manager, Operations Manager,
+Commercial Manager, Finance Manager, HR Manager, IT Manager, Data Management
+Manager, Quality/QA-QC Manager, HSE Manager, Supply Chain Manager,
+Procurement Manager, Contracts Manager, Business Development Manager,
+Strategy and Transformation Manager, Governance/Risk/Compliance Manager,
+Team Leader, Section Head, Lead — see [lib/targetRoles.ts](lib/targetRoles.ts).
+
+These are grouped into ~9 combined queries (`lib/targetRoles.ts` →
+`QUERY_GROUPS`) to keep API usage bounded, then every result is filtered to
+Abu Dhabi server-side, deduped, and capped at 30 vacancies per batch.
+
+The **Employers** panel (top right) is a browsable reference list of major
+Abu Dhabi government, GRE, and private-sector employers from the agent spec —
+informational only, not wired into the automated search.
+
 ## Notes
 
 - Keys stay server-side (in the API routes) — they're never exposed to the browser.
 - Edit your master CV in the app via the **Master CV** button (top right), or change
   the default in `lib/masterCV.ts`.
 - Stack: Next.js (App Router) + TypeScript + Tailwind. Zero runtime dependencies
-  beyond React/Next.
+  beyond React/Next — batch analysis streams via a native `ReadableStream`
+  (NDJSON), no extra libraries.

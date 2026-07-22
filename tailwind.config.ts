@@ -14,6 +14,8 @@ const config: Config = {
         beacon: "#f2b13c",
         beaconDim: "#7a5a1e",
         good: "#5ecb8f",
+        partial: "#e0793c",
+        weak: "#c9506a",
       },
       fontFamily: {
         display: ["Space Grotesk", "ui-sans-serif", "system-ui", "sans-serif"],

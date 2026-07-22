@@ -1,67 +1,116 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { Analysis, Job, JobsResponse } from "@/lib/types";
+import { useRef, useState } from "react";
+import { Analysis, BatchItem, Job, JobsResponse } from "@/lib/types";
 import { DEFAULT_MASTER_CV } from "@/lib/masterCV";
+import { EMPLOYER_DIRECTORY, linkedInSearchUrl } from "@/lib/employerDirectory";
+import { getMatchTier } from "@/lib/matchTier";
+
+const TIER_COLOR: Record<string, string> = {
+  strong: "#5ecb8f",
+  good: "#f2b13c",
+  partial: "#e0793c",
+  weak: "#c9506a",
+};
 
 export default function Home() {
-  const [role, setRole] = useState("Senior Full-Stack Engineer");
-  const [location, setLocation] = useState("Abu Dhabi");
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [loadingJobs, setLoadingJobs] = useState(false);
+  const [keyword, setKeyword] = useState("");
+  const [items, setItems] = useState<BatchItem[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [sampleNote, setSampleNote] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
 
-  const [selected, setSelected] = useState<Job | null>(null);
-  const [analysis, setAnalysis] = useState<Analysis | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [tab, setTab] = useState<"cv" | "letter">("cv");
 
   const [masterCV, setMasterCV] = useState(DEFAULT_MASTER_CV);
   const [showCV, setShowCV] = useState(false);
+  const [showEmployers, setShowEmployers] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
 
-  async function findJobs() {
-    setLoadingJobs(true);
-    setSearched(true);
-    setSelected(null);
-    setAnalysis(null);
-    setAnalyzeError(null);
-    try {
-      const r = await fetch(
-        `/api/jobs?role=${encodeURIComponent(role)}&location=${encodeURIComponent(location)}`
-      );
-      const data: JobsResponse = await r.json();
-      setJobs(data.jobs || []);
-      setSampleNote(data.sample ? data.note || "Showing sample jobs." : null);
-    } catch {
-      setJobs([]);
-      setSampleNote("Could not reach the jobs service.");
-    } finally {
-      setLoadingJobs(false);
-    }
+  const itemsRef = useRef<BatchItem[]>([]);
+
+  function setItemsSynced(next: BatchItem[]) {
+    itemsRef.current = next;
+    setItems(next);
   }
 
-  async function analyze(job: Job) {
-    setSelected(job);
-    setAnalysis(null);
-    setAnalyzeError(null);
-    setAnalyzing(true);
-    setTab("cv");
+  function patchItem(jobId: string, patch: Partial<BatchItem>) {
+    const next = itemsRef.current.map((it) => (it.job.id === jobId ? { ...it, ...patch } : it));
+    setItemsSynced(next);
+  }
+
+  async function findAndTailor() {
+    setSearching(true);
+    setSearched(true);
+    setSelectedId(null);
+    setItemsSynced([]);
+    setProgress({ done: 0, total: 0 });
+
+    let jobs: Job[] = [];
     try {
-      const r = await fetch("/api/analyze", {
+      const r = await fetch(`/api/jobs${keyword ? `?keyword=${encodeURIComponent(keyword)}` : ""}`);
+      const data: JobsResponse = await r.json();
+      jobs = data.jobs || [];
+      setSampleNote(data.sample ? data.note || "Showing sample jobs." : null);
+    } catch {
+      setSampleNote("Could not reach the jobs service.");
+    } finally {
+      setSearching(false);
+    }
+
+    if (!jobs.length) return;
+
+    const initial: BatchItem[] = jobs.map((job) => ({ job, status: "pending" }));
+    setItemsSynced(initial);
+    setProgress({ done: 0, total: jobs.length });
+    setBatchRunning(true);
+
+    try {
+      const r = await fetch("/api/analyze-batch", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ job, masterCV }),
+        body: JSON.stringify({ jobs, masterCV }),
       });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || "Analysis failed.");
-      setAnalysis(data);
+
+      if (!r.body) throw new Error("No response stream.");
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let doneCount = 0;
+      let firstJobId: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const parsed: { jobId: string; analysis?: Analysis; error?: string } = JSON.parse(line);
+          doneCount += 1;
+          setProgress({ done: doneCount, total: jobs.length });
+          if (parsed.error) {
+            patchItem(parsed.jobId, { status: "error", error: parsed.error });
+          } else {
+            patchItem(parsed.jobId, { status: "done", analysis: parsed.analysis });
+          }
+          if (!firstJobId) {
+            firstJobId = parsed.jobId;
+            setSelectedId(parsed.jobId);
+          }
+        }
+      }
     } catch (e: any) {
-      setAnalyzeError(e.message);
+      setSampleNote((prev) => prev || `Batch analysis failed: ${e.message}`);
     } finally {
-      setAnalyzing(false);
+      setBatchRunning(false);
+      const sorted = [...itemsRef.current].sort((a, b) => (b.analysis?.score ?? -1) - (a.analysis?.score ?? -1));
+      setItemsSynced(sorted);
     }
   }
 
@@ -70,6 +119,8 @@ export default function Home() {
     setCopied(label);
     setTimeout(() => setCopied(null), 1500);
   }
+
+  const selected = items.find((it) => it.job.id === selectedId) || null;
 
   return (
     <main className="mx-auto max-w-6xl px-5 pb-24">
@@ -86,12 +137,20 @@ export default function Home() {
             </div>
           </div>
         </div>
-        <button
-          onClick={() => setShowCV(true)}
-          className="rounded-lg border border-line bg-raised px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
-        >
-          Master CV
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowEmployers(true)}
+            className="rounded-lg border border-line bg-raised px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
+          >
+            Employers
+          </button>
+          <button
+            onClick={() => setShowCV(true)}
+            className="rounded-lg border border-line bg-raised px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
+          >
+            Master CV
+          </button>
+        </div>
       </header>
 
       {/* Hero + search */}
@@ -100,38 +159,43 @@ export default function Home() {
           Live application agent
         </p>
         <h1 className="font-display text-3xl font-semibold leading-tight tracking-tight text-bright sm:text-4xl">
-          Real jobs in. A tailored CV out.
+          Every open vacancy in Abu Dhabi. Tailored CVs for all of them.
         </h1>
         <p className="mt-3 max-w-xl text-soft">
-          Search live listings, and for any role the agent scores your fit and
-          rewrites your CV to match — truthfully, in seconds.
+          One click searches VP-through-Team-Lead roles across Abu Dhabi, scores your
+          fit against every vacancy, and tailors a CV + cover letter for each one —
+          truthfully, in one pass.
         </p>
 
-        <div className="mt-6 grid gap-3 sm:grid-cols-[1fr_1fr_auto]">
+        <div className="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]">
           <Field
-            label="Role"
-            value={role}
-            onChange={setRole}
-            placeholder="e.g. Full-Stack Engineer"
-            onEnter={findJobs}
-          />
-          <Field
-            label="Location"
-            value={location}
-            onChange={setLocation}
-            placeholder="e.g. Abu Dhabi"
-            onEnter={findJobs}
+            label="Narrow by keyword (optional)"
+            value={keyword}
+            onChange={setKeyword}
+            placeholder="e.g. Engineering, Finance, Procurement"
+            onEnter={findAndTailor}
           />
           <button
-            onClick={findJobs}
-            disabled={loadingJobs}
+            onClick={findAndTailor}
+            disabled={searching || batchRunning}
             className="mt-auto rounded-lg bg-beacon px-6 py-3 font-medium text-ink transition hover:brightness-105 disabled:opacity-60"
           >
-            {loadingJobs ? "Searching…" : "Find jobs"}
+            {searching ? "Searching…" : batchRunning ? "Tailoring…" : "Find & tailor all matches"}
           </button>
         </div>
         {sampleNote && (
           <p className="mt-3 font-mono text-xs text-soft/80">▹ {sampleNote}</p>
+        )}
+        {(searching || batchRunning) && (
+          <div className="mt-3 flex items-center gap-3 font-mono text-xs text-soft">
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full rounded-full bg-beacon animate-pulseDot" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-beacon" />
+            </span>
+            {searching
+              ? "Searching Abu Dhabi vacancies across ~30 target titles…"
+              : `Analyzing ${progress.done} of ${progress.total} vacancies…`}
+          </div>
         )}
       </section>
 
@@ -140,20 +204,23 @@ export default function Home() {
         {/* Job list */}
         <div className="space-y-3">
           {!searched && <ListHint />}
-          {searched && !loadingJobs && jobs.length === 0 && (
+          {searched && !searching && items.length === 0 && (
             <div className="rounded-xl border border-line bg-surface p-6 text-soft">
-              No listings came back. Try a broader role or a different location.
+              No listings came back. Try a different keyword or clear it to search everything.
             </div>
           )}
-          {loadingJobs &&
+          {searching &&
             [0, 1, 2].map((i) => <JobSkeleton key={i} />)}
-          {!loadingJobs &&
-            jobs.map((job) => (
+          {!searching &&
+            items.map((item) => (
               <JobCard
-                key={job.id}
-                job={job}
-                active={selected?.id === job.id}
-                onAnalyze={() => analyze(job)}
+                key={item.job.id}
+                item={item}
+                active={selectedId === item.job.id}
+                onSelect={() => {
+                  setSelectedId(item.job.id);
+                  setTab("cv");
+                }}
               />
             ))}
         </div>
@@ -161,10 +228,7 @@ export default function Home() {
         {/* Analysis panel */}
         <div className="lg:sticky lg:top-6 lg:self-start">
           <AnalysisPanel
-            job={selected}
-            analysis={analysis}
-            analyzing={analyzing}
-            error={analyzeError}
+            item={selected}
             tab={tab}
             setTab={setTab}
             copy={copy}
@@ -182,8 +246,11 @@ export default function Home() {
         />
       )}
 
+      {/* Employer directory drawer */}
+      {showEmployers && <EmployerDirectory onClose={() => setShowEmployers(false)} />}
+
       <footer className="mt-16 border-t border-line pt-5 text-center font-mono text-xs text-soft/70">
-        JobHunter demo — jobs via JSearch (Google for Jobs), tailoring via Claude.
+        JobHunter — jobs via JSearch (Google for Jobs), scoring + tailoring via Claude.
       </footer>
     </main>
   );
@@ -227,8 +294,8 @@ function ListHint() {
         Waiting
       </div>
       <p className="mt-2 text-soft">
-        Run a search to pull live listings. Pick any job to see your fit score
-        and a tailored CV.
+        Click "Find & tailor all matches" to pull every open Abu Dhabi vacancy across
+        the target role list, score your fit, and tailor a CV for each one.
       </p>
     </div>
   );
@@ -246,29 +313,64 @@ function JobSkeleton() {
   );
 }
 
+function TierBadge({ tier, label }: { tier: string; label: string }) {
+  const color = TIER_COLOR[tier] || "#8b98b4";
+  return (
+    <span
+      className="rounded-md border px-2 py-0.5 font-mono text-xs"
+      style={{ borderColor: `${color}4d`, backgroundColor: `${color}1a`, color }}
+    >
+      {label}
+    </span>
+  );
+}
+
 function JobCard({
-  job,
+  item,
   active,
-  onAnalyze,
+  onSelect,
 }: {
-  job: Job;
+  item: BatchItem;
   active: boolean;
-  onAnalyze: () => void;
+  onSelect: () => void;
 }) {
+  const { job, analysis, status } = item;
   return (
     <article
-      className={`rounded-xl border bg-surface p-4 transition ${
+      onClick={onSelect}
+      className={`cursor-pointer rounded-xl border bg-surface p-4 transition ${
         active ? "border-beacon shadow-[0_0_0_1px_rgba(242,177,60,0.5)]" : "border-line hover:border-line/80"
       }`}
     >
-      <h3 className="font-display font-semibold leading-snug text-bright">
-        {job.title}
-      </h3>
-      <p className="mt-0.5 text-sm text-soft">
-        {job.company}
-        {job.location ? ` · ${job.location}` : ""}
-      </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="font-display font-semibold leading-snug text-bright">
+            {job.title}
+          </h3>
+          <p className="mt-0.5 text-sm text-soft">
+            {job.company}
+            {job.location ? ` · ${job.location}` : ""}
+          </p>
+        </div>
+        {analysis && (
+          <div className="shrink-0 text-right">
+            <div className="font-display text-lg font-semibold text-bright">{analysis.score}</div>
+            <div className="font-mono text-[10px] text-soft/60">/ 100</div>
+          </div>
+        )}
+      </div>
+
       <div className="mt-3 flex flex-wrap items-center gap-2">
+        {analysis && <TierBadge tier={analysis.tier} label={analysis.tierLabel} />}
+        {status === "pending" && (
+          <span className="font-mono text-xs text-soft/60">Queued…</span>
+        )}
+        {status === "analyzing" && (
+          <span className="font-mono text-xs text-beacon">Analyzing…</span>
+        )}
+        {status === "error" && (
+          <span className="font-mono text-xs text-weak">Analysis failed</span>
+        )}
         {job.salary && (
           <span className="rounded-md border border-good/30 bg-good/10 px-2 py-0.5 font-mono text-xs text-good">
             {job.salary}
@@ -277,62 +379,51 @@ function JobCard({
         {job.source && (
           <span className="font-mono text-[11px] text-soft/70">{job.source}</span>
         )}
-        {job.postedAt && (
-          <span className="font-mono text-[11px] text-soft/50">· {job.postedAt}</span>
-        )}
       </div>
-      <div className="mt-4 flex items-center gap-3">
-        <button
-          onClick={onAnalyze}
-          className="rounded-lg border border-beacon/50 bg-beacon/10 px-3.5 py-2 text-sm font-medium text-beacon transition hover:bg-beacon/20"
-        >
-          {active ? "Re-analyze fit" : "Analyze fit"}
-        </button>
-        {job.applyLink && (
+
+      {job.applyLink && (
+        <div className="mt-3">
           <a
             href={job.applyLink}
             target="_blank"
             rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
             className="text-sm text-soft underline-offset-4 hover:text-bright hover:underline"
           >
             View posting ↗
           </a>
-        )}
-      </div>
+        </div>
+      )}
     </article>
   );
 }
 
 function AnalysisPanel({
-  job,
-  analysis,
-  analyzing,
-  error,
+  item,
   tab,
   setTab,
   copy,
   copied,
 }: {
-  job: Job | null;
-  analysis: Analysis | null;
-  analyzing: boolean;
-  error: string | null;
+  item: BatchItem | null;
   tab: "cv" | "letter";
   setTab: (t: "cv" | "letter") => void;
   copy: (t: string, label: string) => void;
   copied: string | null;
 }) {
-  if (!job) {
+  if (!item) {
     return (
       <div className="flex min-h-[260px] flex-col items-center justify-center rounded-2xl border border-line bg-surface p-8 text-center">
         <ScoreRing score={0} idle />
         <p className="mt-5 max-w-xs text-soft">
-          Pick a job on the left. The agent will score your fit and tailor your
-          CV to that exact posting.
+          Run a search. Pick any result on the left to see its fit score, tailored
+          CV, cover letter, gap analysis, and audit trail.
         </p>
       </div>
     );
   }
+
+  const { job, analysis, status, error } = item;
 
   return (
     <div className="rounded-2xl border border-line bg-surface p-5">
@@ -344,7 +435,7 @@ function AnalysisPanel({
       </h2>
       <p className="text-sm text-soft">{job.company}</p>
 
-      {analyzing && (
+      {(status === "pending" || status === "analyzing") && (
         <div className="mt-6 flex items-center gap-3 text-soft">
           <span className="relative flex h-2.5 w-2.5">
             <span className="absolute inline-flex h-full w-full rounded-full bg-beacon animate-pulseDot" />
@@ -354,13 +445,13 @@ function AnalysisPanel({
         </div>
       )}
 
-      {error && (
-        <div className="mt-6 rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
-          {error}
+      {status === "error" && (
+        <div className="mt-6 rounded-lg border border-weak/30 bg-weak/10 p-4 text-sm text-weak">
+          {error || "Analysis failed."}
         </div>
       )}
 
-      {analysis && !analyzing && (
+      {analysis && status === "done" && (
         <div className="mt-5">
           {analysis.demo && (
             <div className="mb-4 rounded-lg border border-beacon/30 bg-beacon/10 px-3 py-2.5">
@@ -376,7 +467,10 @@ function AnalysisPanel({
           <div className="flex items-center gap-5">
             <ScoreRing score={analysis.score} />
             <div>
-              <div className="font-display text-sm text-soft">Match</div>
+              <div className="flex items-center gap-2">
+                <span className="font-display text-sm text-soft">Match</span>
+                <TierBadge tier={analysis.tier} label={analysis.tierLabel} />
+              </div>
               <p className="font-display text-base font-medium text-bright">
                 {analysis.verdict}
               </p>
@@ -392,6 +486,15 @@ function AnalysisPanel({
                 </li>
               ))}
             </ul>
+          )}
+
+          {analysis.gapAnalysis && (
+            <div className="mt-4 rounded-lg border border-line bg-ink/60 p-3">
+              <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">
+                Gap analysis
+              </div>
+              <p className="mt-1 text-sm leading-relaxed text-soft">{analysis.gapAnalysis}</p>
+            </div>
           )}
 
           {/* Tabs */}
@@ -422,6 +525,22 @@ function AnalysisPanel({
               {tab === "cv" ? analysis.tailoredCV : analysis.coverLetter}
             </div>
           </div>
+
+          {analysis.auditTrail.length > 0 && (
+            <details className="mt-4 rounded-lg border border-line bg-ink/60 p-3">
+              <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-[0.15em] text-soft">
+                Audit trail ({analysis.auditTrail.length})
+              </summary>
+              <ul className="mt-2 space-y-2">
+                {analysis.auditTrail.map((e, i) => (
+                  <li key={i} className="text-sm text-soft">
+                    <span className="text-bright/90">{e.statement}</span>
+                    <span className="block font-mono text-xs text-soft/60">→ {e.source}</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
 
           {job.applyLink && (
             <a
@@ -461,25 +580,11 @@ function TabBtn({
 }
 
 function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
-  const [shown, setShown] = useState(0);
-  useEffect(() => {
-    if (idle) return;
-    let raf = 0;
-    const start = performance.now();
-    const dur = 700;
-    const tick = (now: number) => {
-      const p = Math.min(1, (now - start) / dur);
-      setShown(Math.round(p * score));
-      if (p < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [score, idle]);
-
   const r = 34;
   const c = 2 * Math.PI * r;
-  const off = c - (c * (idle ? 0 : shown)) / 100;
-  const color = shown >= 75 ? "#5ecb8f" : shown >= 50 ? "#f2b13c" : "#e0793c";
+  const off = c - (c * (idle ? 0 : score)) / 100;
+  const tier = getMatchTier(score);
+  const color = TIER_COLOR[tier.key];
 
   return (
     <div className="relative h-[88px] w-[88px] shrink-0">
@@ -496,7 +601,7 @@ function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
             strokeLinecap="round"
             strokeDasharray={c}
             strokeDashoffset={off}
-            style={{ transition: "stroke-dashoffset 0.1s linear" }}
+            style={{ transition: "stroke-dashoffset 0.4s ease" }}
           />
         )}
       </svg>
@@ -506,7 +611,7 @@ function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
         ) : (
           <>
             <span className="font-display text-2xl font-semibold text-bright">
-              {shown}
+              {score}
             </span>
             <span className="font-mono text-[10px] text-soft">/ 100</span>
           </>
@@ -555,6 +660,67 @@ function CVEditor({
           onChange={(e) => onChange(e.target.value)}
           className="scroll-thin mt-4 flex-1 resize-none rounded-lg border border-line bg-ink p-4 font-mono text-sm leading-relaxed text-bright/90 outline-none focus:border-beacon/60"
         />
+      </div>
+    </div>
+  );
+}
+
+function EmployerDirectory({ onClose }: { onClose: () => void }) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex justify-end bg-black/60"
+      onClick={onClose}
+    >
+      <div
+        className="flex h-full w-full max-w-xl flex-col border-l border-line bg-surface p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="font-display text-lg font-semibold text-bright">
+              Abu Dhabi Employer Directory
+            </h2>
+            <p className="text-sm text-soft">
+              Reference list of major employers — not wired into search, browse and
+              search each on LinkedIn directly.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-lg border border-line px-3 py-1.5 text-sm text-soft hover:text-bright"
+          >
+            Done
+          </button>
+        </div>
+        <div className="scroll-thin mt-4 flex-1 overflow-y-auto pr-1">
+          {EMPLOYER_DIRECTORY.map((cat) => (
+            <div key={cat.category} className="mb-6">
+              <h3 className="font-mono text-[11px] uppercase tracking-[0.15em] text-beacon/80">
+                {cat.category}
+              </h3>
+              <ul className="mt-2 space-y-2">
+                {cat.employers.map((emp) => (
+                  <li key={emp.name} className="rounded-lg border border-line bg-ink/50 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-medium text-bright">{emp.name}</div>
+                        <p className="mt-0.5 text-xs text-soft">{emp.blurb}</p>
+                      </div>
+                      <a
+                        href={linkedInSearchUrl(emp.name)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="shrink-0 whitespace-nowrap font-mono text-xs text-soft underline-offset-4 hover:text-beacon hover:underline"
+                      >
+                        LinkedIn ↗
+                      </a>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

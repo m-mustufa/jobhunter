@@ -16,12 +16,28 @@ export interface JobsResponse {
   note?: string;
 }
 
+export interface AuditTrailEntry {
+  statement: string; // a claim made in the tailored CV
+  source: string; // the master CV section/line it's drawn from
+}
+
 export interface Analysis {
   score: number; // 0-100
+  tier: "strong" | "good" | "partial" | "weak";
+  tierLabel: string;
   verdict: string;
   reasons: string[];
   tailoredCV: string; // markdown
   coverLetter: string;
+  gapAnalysis: string;
+  auditTrail: AuditTrailEntry[];
   demo?: boolean;
   demoNote?: string;
+}
+
+export interface BatchItem {
+  job: Job;
+  analysis?: Analysis;
+  status: "pending" | "analyzing" | "done" | "error";
+  error?: string;
 }
