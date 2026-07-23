@@ -32,7 +32,9 @@ function toJob(j: any): Job {
     id: j.job_id,
     title: j.job_title,
     company: j.employer_name,
-    location: [j.job_city, j.job_country].filter(Boolean).join(", ") || "Abu Dhabi, UAE",
+    // job_city is frequently null for UAE listings — job_state (e.g.
+    // "Abu Dhabi") is where the useful value actually lives here.
+    location: [j.job_city || j.job_state, "UAE"].filter(Boolean).join(", ") || "Abu Dhabi, UAE",
     salary: formatSalary(j),
     description: j.job_description || "",
     applyLink: j.job_apply_link || null,
@@ -44,7 +46,9 @@ function toJob(j: any): Job {
 }
 
 async function fetchQueryGroup(query: string, key: string): Promise<any[]> {
-  const url = `https://jsearch.p.rapidapi.com/search?query=${encodeURIComponent(query)}&page=1&num_pages=1`;
+  // JSearch's endpoint is /search-v2 (renamed from /search at some point
+  // after this integration was first built — /search now 404s).
+  const url = `https://jsearch.p.rapidapi.com/search-v2?query=${encodeURIComponent(query)}&num_pages=1&country=ae&date_posted=all&language=en`;
   const r = await fetch(url, {
     headers: {
       "X-RapidAPI-Key": key,
@@ -54,7 +58,9 @@ async function fetchQueryGroup(query: string, key: string): Promise<any[]> {
   });
   if (!r.ok) throw new Error(`JSearch responded ${r.status}`);
   const data = await r.json();
-  return data.data || [];
+  // /search-v2 nests results at data.data.jobs (the old /search endpoint
+  // had them directly at data.data — different response shape).
+  return data.data?.jobs || [];
 }
 
 // Runs the query groups with limited concurrency so we don't fire all
@@ -70,8 +76,10 @@ async function runGroupsWithConcurrency(key: string): Promise<any[]> {
       try {
         const jobs = await fetchQueryGroup(query, key);
         results.push(...jobs);
-      } catch {
-        // fail soft per group — other groups still contribute
+      } catch (err: any) {
+        // Fail soft per group — other groups still contribute — but log
+        // so a systemic issue (bad endpoint, bad key) doesn't go silent.
+        console.error(`JSearch query group failed ("${query}"):`, err.message);
       }
     }
   }

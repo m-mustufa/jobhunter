@@ -1,37 +1,63 @@
+import { Profile } from "./types";
+import { DEFAULT_PROFILE } from "./profile";
+
+// Serializes structured Profile data into the Markdown convention the
+// tailoring prompt (lib/analyzeJob.ts) and the demo-mode parser
+// (lib/demoAnalysis.ts's parseMasterCV) already expect:
+//   # Name
+//   Title — Location
+//   email · phone · link · link
+//
+//   ## Summary
+//   ...
+//
+//   ## Core Skills
+//   comma, separated, list
+//
+//   ## Experience
+//
+//   ### Company — Role (dates)
+//   - bullet
+//
+//   ## Education
+//   ...
+export function buildMasterCVMarkdown(profile: Profile): string {
+  const lines: string[] = [`# ${profile.name || "Candidate"}`];
+
+  const subtitle = [profile.title, profile.location].filter(Boolean).join(" — ");
+  if (subtitle) lines.push(subtitle);
+
+  const contact = [profile.email, profile.phone, ...profile.links].filter(Boolean).join(" · ");
+  if (contact) lines.push(contact);
+
+  lines.push("");
+
+  if (profile.summary) {
+    lines.push("## Summary", profile.summary, "");
+  }
+
+  if (profile.skills.length) {
+    lines.push("## Core Skills", profile.skills.join(", "), "");
+  }
+
+  if (profile.experience.length) {
+    lines.push("## Experience", "");
+    for (const e of profile.experience) {
+      const header = [e.company, e.role].filter(Boolean).join(" — ");
+      lines.push(`### ${header}${e.dates ? ` (${e.dates})` : ""}`);
+      for (const b of e.bullets) lines.push(`- ${b}`);
+      lines.push("");
+    }
+  }
+
+  if (profile.education.length) {
+    lines.push("## Education", profile.education.join("\n"), "");
+  }
+
+  return lines.join("\n").trim() + "\n";
+}
+
 // Default master CV used to seed the editor so the demo works immediately.
-// Replace this with your own — the agent only ever re-emphasizes what's here,
-// it never invents experience.
-
-export const DEFAULT_MASTER_CV = `# Muhammad Mustafa
-Senior Full-Stack Engineer — Karachi, Pakistan (UTC+5)
-mustufa50@gmail.com · mustcode.netlify.app · linkedin.com/in/muhammad-mustafa-16477a99
-
-## Summary
-Senior full-stack engineer with 10+ years of experience building and shipping
-production SaaS. Comfortable owning features end to end — from database design
-to polished UI — across large multi-tenant platforms and solo-founded products.
-
-## Core Skills
-Angular (v8–v19), React, Next.js, Node.js, TypeScript, JavaScript, MongoDB,
-PostgreSQL, Supabase, REST APIs, Stripe, Clerk, TailwindCSS, OpenAI/Claude APIs.
-
-## Experience
-
-### AutoLeap — Senior Full-Stack Engineer (2021–present)
-Canadian SaaS platform serving 5,000+ auto-repair shops across North America.
-- 2,800+ commits across core modules: Workboard 2.0, Repair Orders, Purchase Orders.
-- Built and maintained performant, user-friendly UIs used daily by thousands of shops.
-- Designed and integrated scalable backend logic and APIs on a large multi-tenant system.
-
-### CultureAI — Founding Engineer (solo)
-Live multi-tenant, AI-powered employee-engagement SaaS, built and shipped solo.
-- Owned the full stack: auth, multi-tenancy, data model, AI features, and UI.
-- Integrated LLM APIs into product workflows end to end.
-
-### StartStorez — Co-founder (2021–present)
-Shopify store-building service; delivered 2,000+ stores.
-- Built repeatable delivery processes and client-facing web work at volume.
-
-## Earlier
-Started as a UI intern in 2014; grew into senior full-stack work over a decade.
-`;
+// Derived from DEFAULT_PROFILE so the two can never drift apart — replace
+// DEFAULT_PROFILE in lib/profile.ts with your own details.
+export const DEFAULT_MASTER_CV = buildMasterCVMarkdown(DEFAULT_PROFILE);

@@ -29,7 +29,11 @@ export async function POST(req: Request) {
   let rawText: string;
   try {
     if (name.endsWith(".pdf") || file.type === "application/pdf") {
-      const pdfParse = (await import("pdf-parse")).default;
+      // Import the underlying implementation directly, not the package's
+      // top-level index.js — that file has a leftover debug self-test
+      // (`if (!module.parent) { ...reads a hardcoded test fixture... }`)
+      // that misfires under Next.js's bundler and throws ENOENT.
+      const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
       rawText = (await pdfParse(buffer)).text;
     } else if (
       name.endsWith(".docx") ||

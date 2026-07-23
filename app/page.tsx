@@ -1,18 +1,17 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Analysis, BatchItem, Job, JobsResponse, Profile, TailoredCVContent } from "@/lib/types";
 import { DEFAULT_MASTER_CV } from "@/lib/masterCV";
-import { DEFAULT_PROFILE } from "@/lib/profile";
+import { DEFAULT_PROFILE, sanitizeProfile } from "@/lib/profile";
 import { EMPLOYER_DIRECTORY, linkedInSearchUrl } from "@/lib/employerDirectory";
 import { getMatchTier } from "@/lib/matchTier";
 import { FUNCTIONAL_DOMAINS, matchFunctionalDomain, matchTargetTitle } from "@/lib/targetRoles";
-import { loadJSON, saveJSON } from "@/lib/persist";
+import { loadJSON, saveJSON, MASTER_CV_KEY, PROFILE_KEY } from "@/lib/persist";
 import { buildCVDocument, buildCoverLetterDocument, serializeCVText } from "@/lib/cvDocument";
 import { downloadBlobsStaggered, safeFileSlug } from "@/lib/download";
-
-const MASTER_CV_KEY = "jobhunter:masterCV";
-const PROFILE_KEY = "jobhunter:profile";
+import { TabBtn } from "@/app/components/ui";
 
 const TIER_COLOR: Record<string, string> = {
   strong: "#5ecb8f",
@@ -42,7 +41,6 @@ export default function Home() {
 
   const [masterCV, setMasterCV] = useState(DEFAULT_MASTER_CV);
   const [profile, setProfile] = useState<Profile>(DEFAULT_PROFILE);
-  const [showProfile, setShowProfile] = useState(false);
   const [showEmployers, setShowEmployers] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null); // e.g. "cv:<jobId>" | "letter:<jobId>"
@@ -52,7 +50,7 @@ export default function Home() {
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
     setMasterCV(loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV));
-    setProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE));
+    setProfile(sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE)));
     setHydrated(true);
   }, []);
 
@@ -152,11 +150,14 @@ export default function Home() {
     }
   }
 
-  // Load the latest vacancies automatically on first visit.
+  // Load the latest vacancies automatically on first visit. Gated on
+  // `hydrated` so `findAndTailor`'s closure captures the loaded masterCV/
+  // profile instead of racing hydration and always tailoring against the
+  // defaults.
   useEffect(() => {
-    findAndTailor();
+    if (hydrated) findAndTailor();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [hydrated]);
 
   function copy(text: string, label: string) {
     navigator.clipboard?.writeText(text);
@@ -220,27 +221,6 @@ export default function Home() {
     downloadCV(item);
   }
 
-  async function importResumeFile(file: File) {
-    const replaceMasterCV =
-      !masterCV.trim() ||
-      confirm("Replace your current Master CV with the content extracted from this file?");
-
-    const form = new FormData();
-    form.append("file", file);
-    try {
-      const r = await fetch("/api/parse-resume", { method: "POST", body: form });
-      const data = await r.json();
-      if (!r.ok) {
-        alert(data.error || "Could not read that file.");
-        return;
-      }
-      setProfile((p) => ({ ...p, ...data.profile }));
-      if (replaceMasterCV) setMasterCV(data.masterCV);
-    } catch {
-      alert("Could not reach the resume-parsing service.");
-    }
-  }
-
   const selected = items.find((it) => it.job.id === selectedId) || null;
 
   const titleOptions = useMemo(() => {
@@ -299,12 +279,12 @@ export default function Home() {
           >
             Employers
           </button>
-          <button
-            onClick={() => setShowProfile(true)}
+          <Link
+            href="/profile"
             className="rounded-lg border border-line bg-raised px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
           >
             Profile & CV
-          </button>
+          </Link>
         </div>
       </header>
 
@@ -424,18 +404,6 @@ export default function Home() {
           />
         </div>
       </section>
-
-      {/* Profile & Master CV drawer */}
-      {showProfile && (
-        <ProfileDrawer
-          profile={profile}
-          onProfileChange={setProfile}
-          masterCV={masterCV}
-          onMasterCVChange={setMasterCV}
-          onImportFile={importResumeFile}
-          onClose={() => setShowProfile(false)}
-        />
-      )}
 
       {/* Employer directory drawer */}
       {showEmployers && <EmployerDirectory onClose={() => setShowEmployers(false)} />}
@@ -892,27 +860,6 @@ function TailoredCVPreview({ cv }: { cv: TailoredCVContent }) {
   );
 }
 
-function TabBtn({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`flex-1 rounded-md px-3 py-1.5 text-sm transition ${
-        active ? "bg-raised text-bright" : "text-soft hover:text-bright"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
 function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
   const r = 34;
   const c = 2 * Math.PI * r;
@@ -952,163 +899,6 @@ function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
         )}
       </div>
     </div>
-  );
-}
-
-function ProfileDrawer({
-  profile,
-  onProfileChange,
-  masterCV,
-  onMasterCVChange,
-  onImportFile,
-  onClose,
-}: {
-  profile: Profile;
-  onProfileChange: (p: Profile) => void;
-  masterCV: string;
-  onMasterCVChange: (v: string) => void;
-  onImportFile: (file: File) => void;
-  onClose: () => void;
-}) {
-  const [tab, setTab] = useState<"profile" | "cv">("profile");
-
-  function updateField<K extends keyof Profile>(key: K, value: Profile[K]) {
-    onProfileChange({ ...profile, [key]: value });
-  }
-
-  function updateLink(i: number, value: string) {
-    const links = [...profile.links];
-    links[i] = value;
-    updateField("links", links);
-  }
-
-  function addLink() {
-    updateField("links", [...profile.links, ""]);
-  }
-
-  function removeLink(i: number) {
-    updateField(
-      "links",
-      profile.links.filter((_, idx) => idx !== i)
-    );
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={onClose}>
-      <div
-        className="flex h-full w-full max-w-xl flex-col border-l border-line bg-surface p-6"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="font-display text-lg font-semibold text-bright">Profile & CV</h2>
-            <p className="text-sm text-soft">
-              Contact details fill the header of every generated document. Master CV
-              stays the tailoring source, unchanged.
-            </p>
-          </div>
-          <button
-            onClick={onClose}
-            className="rounded-lg border border-line px-3 py-1.5 text-sm text-soft hover:text-bright"
-          >
-            Done
-          </button>
-        </div>
-
-        <div className="mt-4 flex gap-1 rounded-lg border border-line bg-ink p-1">
-          <TabBtn active={tab === "profile"} onClick={() => setTab("profile")}>
-            Profile
-          </TabBtn>
-          <TabBtn active={tab === "cv"} onClick={() => setTab("cv")}>
-            Master CV
-          </TabBtn>
-        </div>
-
-        {tab === "profile" ? (
-          <div className="scroll-thin mt-4 flex-1 space-y-4 overflow-y-auto pr-1">
-            <label className="block">
-              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
-                Import from CV
-              </span>
-              <input
-                type="file"
-                accept=".pdf,.docx"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) onImportFile(f);
-                  e.target.value = "";
-                }}
-                className="block w-full text-sm text-soft file:mr-3 file:rounded-lg file:border file:border-line file:bg-raised file:px-3 file:py-2 file:text-sm file:text-soft"
-              />
-              <span className="mt-1 block text-xs text-soft/70">
-                Upload a .pdf or .docx resume (e.g. LinkedIn's own "Save to PDF" export
-                from your profile page) to prefill these fields.
-              </span>
-            </label>
-
-            <ProfileField label="Full name" value={profile.name} onChange={(v) => updateField("name", v)} />
-            <ProfileField label="Title" value={profile.title} onChange={(v) => updateField("title", v)} />
-            <ProfileField label="Location" value={profile.location} onChange={(v) => updateField("location", v)} />
-            <ProfileField label="Email" value={profile.email} onChange={(v) => updateField("email", v)} />
-            <ProfileField label="Phone" value={profile.phone} onChange={(v) => updateField("phone", v)} />
-
-            <div>
-              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
-                Links
-              </span>
-              <div className="space-y-2">
-                {profile.links.map((link, i) => (
-                  <div key={i} className="flex gap-2">
-                    <input
-                      value={link}
-                      onChange={(e) => updateLink(i, e.target.value)}
-                      placeholder="linkedin.com/in/..."
-                      className="w-full rounded-lg border border-line bg-ink px-3 py-2 text-sm text-bright outline-none focus:border-beacon/60"
-                    />
-                    <button
-                      onClick={() => removeLink(i)}
-                      className="rounded-lg border border-line px-2.5 text-sm text-soft hover:text-weak"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                ))}
-                <button onClick={addLink} className="font-mono text-xs text-soft hover:text-beacon">
-                  + Add link
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <textarea
-            value={masterCV}
-            onChange={(e) => onMasterCVChange(e.target.value)}
-            className="scroll-thin mt-4 flex-1 resize-none rounded-lg border border-line bg-ink p-4 font-mono text-sm leading-relaxed text-bright/90 outline-none focus:border-beacon/60"
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ProfileField({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">{label}</span>
-      <input
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-lg border border-line bg-ink px-3.5 py-2.5 text-bright outline-none transition focus:border-beacon/60"
-      />
-    </label>
   );
 }
 
@@ -1172,3 +962,4 @@ function EmployerDirectory({ onClose }: { onClose: () => void }) {
     </div>
   );
 }
+

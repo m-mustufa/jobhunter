@@ -1,12 +1,14 @@
 import { Profile } from "./types";
+import { sanitizeProfile } from "./profile";
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 
-const SYSTEM = `You turn raw, messily-extracted resume text into two things: a
-structured contact profile, and a clean Master CV in Markdown. Preserve every
-fact in the source text truthfully — do not invent employers, titles, dates,
-skills, or achievements. Fix obvious extraction artifacts (broken line breaks,
-stray page-number text) but do not add content that isn't there.
+const SYSTEM = `You turn raw, messily-extracted resume text into a single
+structured profile. Preserve every fact in the source text truthfully — do
+not invent employers, titles, dates, skills, or achievements. Fix obvious
+extraction artifacts (broken line breaks, stray page-number text) but do not
+add content that isn't there. Leave a field empty/omit an entry if the
+source text genuinely doesn't contain it — don't guess.
 
 Return ONLY a valid JSON object. No markdown fences, no preamble.`;
 
@@ -16,40 +18,35 @@ ${rawText}
 
 Return a single JSON object with exactly these keys:
 {
-  "profile": {
-    "name": "<full name>",
-    "title": "<current or most recent job title>",
-    "location": "<city, country>",
-    "email": "<email address, or empty string if none found>",
-    "phone": "<phone number, or empty string if none found>",
-    "links": ["<links found, e.g. LinkedIn, portfolio, GitHub — no duplicates>"]
-  },
-  "masterCV": "<the full CV rewritten in clean Markdown using this exact structure:\\n# Full Name\\nTitle — Location\\nemail · link · link\\n\\n## Summary\\n...\\n\\n## Core Skills\\ncomma, separated, list\\n\\n## Experience\\n\\n### Company — Role (dates)\\n- bullet\\n- bullet\\n\\n## Earlier\\n...brief earlier-career or education notes>"
+  "name": "<full name>",
+  "title": "<current or most recent job title>",
+  "location": "<city, country>",
+  "email": "<email address, or empty string if none found>",
+  "phone": "<phone number, or empty string if none found>",
+  "links": ["<links found, e.g. LinkedIn, portfolio, GitHub — no duplicates>"],
+  "summary": "<the professional summary/about section, rewritten cleanly, or a 1-2 sentence summary inferred from the experience if the source has no explicit summary>",
+  "skills": ["<individual skills, tools, and technologies listed in the source>"],
+  "experience": [
+    { "company": "<employer>", "role": "<title>", "dates": "<e.g. 2021–present>", "bullets": ["<achievement/responsibility, as stated in the source>"] }
+  ],
+  "education": ["<education or earlier-career lines, kept brief>"]
 }
 
 Return only the JSON object.`;
 }
 
-export interface ParsedResume {
+export interface ExtractedProfile {
   profile: Profile;
-  masterCV: string;
-}
-
-function toProfile(raw: any): Profile {
-  return {
-    name: String(raw?.name || ""),
-    title: String(raw?.title || ""),
-    location: String(raw?.location || ""),
-    email: String(raw?.email || ""),
-    phone: String(raw?.phone || ""),
-    links: Array.isArray(raw?.links) ? raw.links.map(String).filter(Boolean) : [],
-  };
+  demo: boolean;
+  demoNote?: string;
 }
 
 // Best-effort extraction with no AI call, so uploading a CV still does
-// something useful without an ANTHROPIC_API_KEY. Can't restructure the text
-// like Claude can, so the Master CV is just the raw extracted text.
-function buildDemoProfileExtraction(rawText: string): ParsedResume {
+// something useful without an ANTHROPIC_API_KEY. Can't restructure freeform
+// text into a summary/skills/experience breakdown without AI, so only the
+// contact fields get filled — everything else stays empty rather than
+// guessed. Flagged as `demo` so the UI can tell the user why.
+function buildDemoProfileExtraction(rawText: string, note: string): ExtractedProfile {
   const email = rawText.match(/[\w.+-]+@[\w-]+\.[\w.-]+/)?.[0] || "";
   const phone = rawText.match(/(\+?\d[\d\s().-]{7,}\d)/)?.[0]?.trim() || "";
   const firstLine = rawText.split("\n").map((l) => l.trim()).find(Boolean) || "";
@@ -63,15 +60,23 @@ function buildDemoProfileExtraction(rawText: string): ParsedResume {
       email,
       phone,
       links: linkedin ? [linkedin] : [],
+      summary: "",
+      skills: [],
+      experience: [],
+      education: [],
     },
-    masterCV: rawText.trim(),
+    demo: true,
+    demoNote: note,
   };
 }
 
-export async function extractStructuredResume(rawText: string): Promise<ParsedResume> {
+export async function extractStructuredResume(rawText: string): Promise<ExtractedProfile> {
   const key = process.env.ANTHROPIC_API_KEY;
   if (process.env.DEMO_MODE === "true" || !key) {
-    return buildDemoProfileExtraction(rawText);
+    return buildDemoProfileExtraction(
+      rawText,
+      "No ANTHROPIC_API_KEY configured — only contact details (name, email, phone, LinkedIn) could be extracted automatically. Add a key to also extract Summary, Skills, Experience, and Education, or fill them in yourself below."
+    );
   }
 
   try {
@@ -90,7 +95,9 @@ export async function extractStructuredResume(rawText: string): Promise<ParsedRe
       }),
     });
 
-    if (!r.ok) return buildDemoProfileExtraction(rawText);
+    if (!r.ok) {
+      return buildDemoProfileExtraction(rawText, "Claude is currently unavailable — only contact details could be extracted.");
+    }
 
     const data = await r.json();
     const text: string = (data.content || [])
@@ -98,13 +105,8 @@ export async function extractStructuredResume(rawText: string): Promise<ParsedRe
       .join("")
       .trim();
     const clean = text.replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
-    const parsed = JSON.parse(clean);
-
-    return {
-      profile: toProfile(parsed.profile),
-      masterCV: String(parsed.masterCV || rawText),
-    };
+    return { profile: sanitizeProfile(JSON.parse(clean)), demo: false };
   } catch {
-    return buildDemoProfileExtraction(rawText);
+    return buildDemoProfileExtraction(rawText, "Live extraction failed — only contact details could be extracted.");
   }
 }

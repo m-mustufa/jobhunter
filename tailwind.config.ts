@@ -31,10 +31,15 @@ const config: Config = {
           "0%": { transform: "translateX(-100%)" },
           "100%": { transform: "translateX(200%)" },
         },
+        fadeIn: {
+          "0%": { opacity: "0", transform: "translateY(6px)" },
+          "100%": { opacity: "1", transform: "translateY(0)" },
+        },
       },
       animation: {
         pulseDot: "pulseDot 1.6s ease-in-out infinite",
         sweep: "sweep 1.4s ease-in-out infinite",
+        fadeIn: "fadeIn 0.15s ease",
       },
     },
   },

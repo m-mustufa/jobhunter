@@ -1,6 +1,11 @@
 // Thin localStorage helpers, guarded for SSR (Next.js renders this module
 // server-side too, where `window` doesn't exist).
 
+// Shared across app/page.tsx and app/profile/page.tsx so the two routes
+// read/write the same persisted state.
+export const MASTER_CV_KEY = "jobhunter:masterCV";
+export const PROFILE_KEY = "jobhunter:profile";
+
 export function loadJSON<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
   try {

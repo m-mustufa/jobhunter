@@ -35,9 +35,9 @@ export interface TailoredCVContent {
   education: string[];
 }
 
-// Structured contact/header info, kept separate from the freeform Master CV
-// text. Fills in the header of every generated CV/cover letter deterministically
-// instead of relying on Claude to re-guess contact details each time.
+// The candidate's full structured resume — contact info plus content.
+// Master CV (a Markdown string) is generated FROM this via
+// lib/masterCV.ts's buildMasterCVMarkdown, so the two can't drift apart.
 export interface Profile {
   name: string;
   title: string;
@@ -45,6 +45,10 @@ export interface Profile {
   email: string;
   phone: string;
   links: string[];
+  summary: string;
+  skills: string[];
+  experience: ExperienceEntry[];
+  education: string[];
 }
 
 export interface Analysis {
