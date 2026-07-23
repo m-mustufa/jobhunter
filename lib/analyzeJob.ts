@@ -1,4 +1,4 @@
-import { Analysis, Job } from "./types";
+import { Analysis, Job, TailoredCVContent } from "./types";
 import { buildDemoAnalysis } from "./demoAnalysis";
 import { getMatchTier } from "./matchTier";
 
@@ -45,13 +45,42 @@ Do the following and return a single JSON object with exactly these keys:
   "score": <integer 0-100, how well the candidate fits this job>,
   "verdict": "<one short sentence, e.g. 'Strong fit — lead with SaaS + React'>",
   "reasons": ["<3-5 short bullet reasons behind the score, matches and gaps>"],
-  "tailoredCV": "<the candidate's CV, rewritten in Markdown, tailored to THIS job — truthful, re-emphasized, keyword-aligned to the description, following the pipeline in the system prompt>",
-  "coverLetter": "<a short, specific cover letter (120-180 words) in a natural human voice, no clichés>",
+  "tailoredCV": {
+    "summary": "<2-4 sentence professional summary tailored to THIS job, truthful, drawn only from the master CV>",
+    "skills": ["<skills from the master CV, reordered so the most relevant to THIS job come first>"],
+    "experience": [
+      {
+        "company": "<employer, exactly as in the master CV>",
+        "role": "<title, exactly as in the master CV>",
+        "dates": "<dates, exactly as in the master CV>",
+        "bullets": ["<achievement/responsibility bullets from that role, reworded and reordered for relevance to THIS job, truthful and only from the master CV>"]
+      }
+    ],
+    "education": ["<education/earlier-career lines from the master CV, kept brief, or an empty array if none>"]
+  },
+  "coverLetter": "<a short, specific cover-letter BODY (120-180 words, 2-3 paragraphs) in a natural human voice, no clichés — do NOT include a greeting/salutation or a sign-off, those are added separately>",
   "gapAnalysis": "<2-4 sentences: what this role wants that the master CV does not clearly support, stated plainly>",
   "auditTrail": [{"statement": "<a specific claim made in the tailored CV>", "source": "<the master CV section/line/experience it is drawn from>"}]
 }
 
 Return only the JSON object.`;
+}
+
+function toTailoredCV(raw: any): TailoredCVContent {
+  const experience = Array.isArray(raw?.experience)
+    ? raw.experience.map((e: any) => ({
+        company: String(e?.company || ""),
+        role: String(e?.role || ""),
+        dates: String(e?.dates || ""),
+        bullets: Array.isArray(e?.bullets) ? e.bullets.map(String) : [],
+      }))
+    : [];
+  return {
+    summary: String(raw?.summary || ""),
+    skills: Array.isArray(raw?.skills) ? raw.skills.map(String) : [],
+    experience,
+    education: Array.isArray(raw?.education) ? raw.education.map(String) : [],
+  };
 }
 
 function toAnalysis(parsed: any): Analysis {
@@ -63,7 +92,7 @@ function toAnalysis(parsed: any): Analysis {
     tierLabel: tier.label,
     verdict: String(parsed.verdict || ""),
     reasons: Array.isArray(parsed.reasons) ? parsed.reasons.map(String) : [],
-    tailoredCV: String(parsed.tailoredCV || ""),
+    tailoredCV: toTailoredCV(parsed.tailoredCV),
     coverLetter: String(parsed.coverLetter || ""),
     gapAnalysis: String(parsed.gapAnalysis || ""),
     auditTrail: Array.isArray(parsed.auditTrail)

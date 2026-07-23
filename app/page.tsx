@@ -1,10 +1,18 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { Analysis, BatchItem, Job, JobsResponse } from "@/lib/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Analysis, BatchItem, Job, JobsResponse, Profile, TailoredCVContent } from "@/lib/types";
 import { DEFAULT_MASTER_CV } from "@/lib/masterCV";
+import { DEFAULT_PROFILE } from "@/lib/profile";
 import { EMPLOYER_DIRECTORY, linkedInSearchUrl } from "@/lib/employerDirectory";
 import { getMatchTier } from "@/lib/matchTier";
+import { FUNCTIONAL_DOMAINS, matchFunctionalDomain, matchTargetTitle } from "@/lib/targetRoles";
+import { loadJSON, saveJSON } from "@/lib/persist";
+import { buildCVDocument, buildCoverLetterDocument, serializeCVText } from "@/lib/cvDocument";
+import { downloadBlobsStaggered, safeFileSlug } from "@/lib/download";
+
+const MASTER_CV_KEY = "jobhunter:masterCV";
+const PROFILE_KEY = "jobhunter:profile";
 
 const TIER_COLOR: Record<string, string> = {
   strong: "#5ecb8f",
@@ -12,6 +20,9 @@ const TIER_COLOR: Record<string, string> = {
   partial: "#e0793c",
   weak: "#c9506a",
 };
+
+const PAGE_SIZE = 10;
+const OTHER = "Other";
 
 export default function Home() {
   const [keyword, setKeyword] = useState("");
@@ -25,10 +36,34 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [tab, setTab] = useState<"cv" | "letter">("cv");
 
+  const [titleFilter, setTitleFilter] = useState("all");
+  const [fieldFilter, setFieldFilter] = useState("all");
+  const [page, setPage] = useState(1);
+
   const [masterCV, setMasterCV] = useState(DEFAULT_MASTER_CV);
-  const [showCV, setShowCV] = useState(false);
+  const [profile, setProfile] = useState<Profile>(DEFAULT_PROFILE);
+  const [showProfile, setShowProfile] = useState(false);
   const [showEmployers, setShowEmployers] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null); // e.g. "cv:<jobId>" | "letter:<jobId>"
+
+  // Hydrate persisted Master CV / Profile after mount (kept out of the
+  // initial useState so server- and first-client-render markup match).
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => {
+    setMasterCV(loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV));
+    setProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE));
+    setHydrated(true);
+  }, []);
+
+  // Gated on `hydrated` so this can't fire with default values before the
+  // load above has committed and clobber what's actually in storage.
+  useEffect(() => {
+    if (hydrated) saveJSON(MASTER_CV_KEY, masterCV);
+  }, [masterCV, hydrated]);
+  useEffect(() => {
+    if (hydrated) saveJSON(PROFILE_KEY, profile);
+  }, [profile, hydrated]);
 
   const itemsRef = useRef<BatchItem[]>([]);
 
@@ -48,6 +83,9 @@ export default function Home() {
     setSelectedId(null);
     setItemsSynced([]);
     setProgress({ done: 0, total: 0 });
+    setTitleFilter("all");
+    setFieldFilter("all");
+    setPage(1);
 
     let jobs: Job[] = [];
     try {
@@ -114,19 +152,136 @@ export default function Home() {
     }
   }
 
+  // Load the latest vacancies automatically on first visit.
+  useEffect(() => {
+    findAndTailor();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function copy(text: string, label: string) {
     navigator.clipboard?.writeText(text);
     setCopied(label);
     setTimeout(() => setCopied(null), 1500);
   }
 
+  function fileSlug(job: Job) {
+    return `${safeFileSlug(profile.name || "candidate")}-${safeFileSlug(job.title)}`;
+  }
+
+  async function downloadCV(item: BatchItem) {
+    if (!item.analysis) return;
+    const key = `cv:${item.job.id}`;
+    setBusy(key);
+    try {
+      const [{ generateCVPdfBlob }, { buildCVDocxBlob }] = await Promise.all([
+        import("@/lib/pdf/generate"),
+        import("@/lib/docx/buildCVDocx"),
+      ]);
+      const doc = buildCVDocument(profile, item.analysis.tailoredCV);
+      const slug = fileSlug(item.job);
+      const [pdfBlob, docxBlob] = await Promise.all([generateCVPdfBlob(doc), buildCVDocxBlob(doc)]);
+      await downloadBlobsStaggered([
+        { blob: pdfBlob, filename: `${slug}-CV.pdf` },
+        { blob: docxBlob, filename: `${slug}-CV.docx` },
+      ]);
+    } finally {
+      setBusy((b) => (b === key ? null : b));
+    }
+  }
+
+  async function downloadCoverLetter(item: BatchItem) {
+    if (!item.analysis) return;
+    const key = `letter:${item.job.id}`;
+    setBusy(key);
+    try {
+      const [{ generateCoverLetterPdfBlob }, { buildCoverLetterDocxBlob }] = await Promise.all([
+        import("@/lib/pdf/generate"),
+        import("@/lib/docx/buildCoverLetterDocx"),
+      ]);
+      const doc = buildCoverLetterDocument(profile, item.job, item.analysis.coverLetter);
+      const slug = fileSlug(item.job);
+      const [pdfBlob, docxBlob] = await Promise.all([
+        generateCoverLetterPdfBlob(doc),
+        buildCoverLetterDocxBlob(doc),
+      ]);
+      await downloadBlobsStaggered([
+        { blob: pdfBlob, filename: `${slug}-CoverLetter.pdf` },
+        { blob: docxBlob, filename: `${slug}-CoverLetter.docx` },
+      ]);
+    } finally {
+      setBusy((b) => (b === key ? null : b));
+    }
+  }
+
+  function applyWithCV(item: BatchItem) {
+    // Open the posting first, synchronously, so the popup blocker doesn't
+    // catch it once the async PDF/DOCX generation below kicks in.
+    if (item.job.applyLink) window.open(item.job.applyLink, "_blank", "noopener,noreferrer");
+    downloadCV(item);
+  }
+
+  async function importResumeFile(file: File) {
+    const replaceMasterCV =
+      !masterCV.trim() ||
+      confirm("Replace your current Master CV with the content extracted from this file?");
+
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const r = await fetch("/api/parse-resume", { method: "POST", body: form });
+      const data = await r.json();
+      if (!r.ok) {
+        alert(data.error || "Could not read that file.");
+        return;
+      }
+      setProfile((p) => ({ ...p, ...data.profile }));
+      if (replaceMasterCV) setMasterCV(data.masterCV);
+    } catch {
+      alert("Could not reach the resume-parsing service.");
+    }
+  }
+
   const selected = items.find((it) => it.job.id === selectedId) || null;
+
+  const titleOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const it of items) set.add(matchTargetTitle(it.job.title) || OTHER);
+    return [...set].sort();
+  }, [items]);
+
+  const domainOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const it of items) set.add(matchFunctionalDomain(it.job.title) || OTHER);
+    return FUNCTIONAL_DOMAINS.map((d) => d.domain).filter((d) => set.has(d)).concat(set.has(OTHER) ? [OTHER] : []);
+  }, [items]);
+
+  const filteredItems = useMemo(() => {
+    return items.filter((it) => {
+      const titleOk = titleFilter === "all" || (matchTargetTitle(it.job.title) || OTHER) === titleFilter;
+      const fieldOk = fieldFilter === "all" || (matchFunctionalDomain(it.job.title) || OTHER) === fieldFilter;
+      return titleOk && fieldOk;
+    });
+  }, [items, titleFilter, fieldFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredItems.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const pageItems = filteredItems.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
+  function updateTitleFilter(v: string) {
+    setTitleFilter(v);
+    setPage(1);
+  }
+
+  function updateFieldFilter(v: string) {
+    setFieldFilter(v);
+    setPage(1);
+  }
 
   return (
     <main className="mx-auto max-w-6xl px-5 pb-24">
       {/* Header */}
       <header className="flex items-center justify-between py-6">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-1">
           <span className="relative flex h-2.5 w-2.5">
             <span className="absolute inline-flex h-full w-full rounded-full bg-beacon animate-pulseDot" />
             <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-beacon" />
@@ -145,10 +300,10 @@ export default function Home() {
             Employers
           </button>
           <button
-            onClick={() => setShowCV(true)}
+            onClick={() => setShowProfile(true)}
             className="rounded-lg border border-line bg-raised px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
           >
-            Master CV
+            Profile & CV
           </button>
         </div>
       </header>
@@ -204,15 +359,35 @@ export default function Home() {
         {/* Job list */}
         <div className="space-y-3">
           {!searched && <ListHint />}
-          {searched && !searching && items.length === 0 && (
+
+          {searched && items.length > 0 && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Select
+                label="Title"
+                value={titleFilter}
+                onChange={updateTitleFilter}
+                options={[{ value: "all", label: "All titles" }, ...titleOptions.map((t) => ({ value: t, label: t }))]}
+              />
+              <Select
+                label="Field"
+                value={fieldFilter}
+                onChange={updateFieldFilter}
+                options={[{ value: "all", label: "All fields" }, ...domainOptions.map((d) => ({ value: d, label: d }))]}
+              />
+            </div>
+          )}
+
+          {searched && !searching && filteredItems.length === 0 && (
             <div className="rounded-xl border border-line bg-surface p-6 text-soft">
-              No listings came back. Try a different keyword or clear it to search everything.
+              {items.length === 0
+                ? "No listings came back. Try a different keyword or clear it to search everything."
+                : "No vacancies match the current filters."}
             </div>
           )}
           {searching &&
             [0, 1, 2].map((i) => <JobSkeleton key={i} />)}
           {!searching &&
-            items.map((item) => (
+            pageItems.map((item) => (
               <JobCard
                 key={item.job.id}
                 item={item}
@@ -223,26 +398,42 @@ export default function Home() {
                 }}
               />
             ))}
+
+          {!searching && filteredItems.length > 0 && (
+            <Pagination
+              page={currentPage}
+              totalPages={totalPages}
+              total={filteredItems.length}
+              onChange={setPage}
+            />
+          )}
         </div>
 
         {/* Analysis panel */}
         <div className="lg:sticky lg:top-6 lg:self-start">
           <AnalysisPanel
             item={selected}
+            profile={profile}
             tab={tab}
             setTab={setTab}
             copy={copy}
             copied={copied}
+            busy={busy}
+            onApply={applyWithCV}
+            onDownloadLetter={downloadCoverLetter}
           />
         </div>
       </section>
 
-      {/* Master CV drawer */}
-      {showCV && (
-        <CVEditor
-          value={masterCV}
-          onChange={setMasterCV}
-          onClose={() => setShowCV(false)}
+      {/* Profile & Master CV drawer */}
+      {showProfile && (
+        <ProfileDrawer
+          profile={profile}
+          onProfileChange={setProfile}
+          masterCV={masterCV}
+          onMasterCVChange={setMasterCV}
+          onImportFile={importResumeFile}
+          onClose={() => setShowProfile(false)}
         />
       )}
 
@@ -284,6 +475,74 @@ function Field({
         className="w-full rounded-lg border border-line bg-surface px-3.5 py-3 text-bright outline-none transition placeholder:text-soft/50 focus:border-beacon/70"
       />
     </label>
+  );
+}
+
+function Select({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+        {label}
+      </span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg border border-line bg-surface px-3.5 py-2.5 text-bright outline-none transition focus:border-beacon/70"
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function Pagination({
+  page,
+  totalPages,
+  total,
+  onChange,
+}: {
+  page: number;
+  totalPages: number;
+  total: number;
+  onChange: (p: number) => void;
+}) {
+  if (totalPages <= 1) return null;
+  return (
+    <div className="flex items-center justify-between pt-1">
+      <span className="font-mono text-xs text-soft/70">
+        Page {page} of {totalPages} · {total} vacancies
+      </span>
+      <div className="flex gap-2">
+        <button
+          onClick={() => onChange(Math.max(1, page - 1))}
+          disabled={page <= 1}
+          className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-soft transition hover:border-beacon/60 hover:text-bright disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Previous
+        </button>
+        <button
+          onClick={() => onChange(Math.min(totalPages, page + 1))}
+          disabled={page >= totalPages}
+          className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-soft transition hover:border-beacon/60 hover:text-bright disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Next
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -400,16 +659,24 @@ function JobCard({
 
 function AnalysisPanel({
   item,
+  profile,
   tab,
   setTab,
   copy,
   copied,
+  busy,
+  onApply,
+  onDownloadLetter,
 }: {
   item: BatchItem | null;
+  profile: Profile;
   tab: "cv" | "letter";
   setTab: (t: "cv" | "letter") => void;
   copy: (t: string, label: string) => void;
   copied: string | null;
+  busy: string | null;
+  onApply: (item: BatchItem) => void;
+  onDownloadLetter: (item: BatchItem) => void;
 }) {
   if (!item) {
     return (
@@ -508,11 +775,20 @@ function AnalysisPanel({
           </div>
 
           <div className="mt-3">
-            <div className="mb-2 flex justify-end">
+            <div className="mb-2 flex justify-end gap-3">
+              {tab === "letter" && (
+                <button
+                  onClick={() => onDownloadLetter(item)}
+                  disabled={busy === `letter:${job.id}`}
+                  className="font-mono text-xs text-soft transition hover:text-beacon disabled:opacity-50"
+                >
+                  {busy === `letter:${job.id}` ? "Preparing…" : "Download (PDF + DOCX)"}
+                </button>
+              )}
               <button
                 onClick={() =>
                   copy(
-                    tab === "cv" ? analysis.tailoredCV : analysis.coverLetter,
+                    tab === "cv" ? serializeCVText(profile, analysis.tailoredCV) : analysis.coverLetter,
                     tab
                   )
                 }
@@ -521,8 +797,12 @@ function AnalysisPanel({
                 {copied === tab ? "Copied ✓" : "Copy"}
               </button>
             </div>
-            <div className="scroll-thin max-h-[420px] overflow-y-auto whitespace-pre-wrap rounded-lg border border-line bg-ink p-4 text-sm leading-relaxed text-bright/90">
-              {tab === "cv" ? analysis.tailoredCV : analysis.coverLetter}
+            <div className="scroll-thin max-h-[420px] overflow-y-auto rounded-lg border border-line bg-ink p-4 text-sm leading-relaxed text-bright/90">
+              {tab === "cv" ? (
+                <TailoredCVPreview cv={analysis.tailoredCV} />
+              ) : (
+                <p className="whitespace-pre-wrap">{analysis.coverLetter}</p>
+              )}
             </div>
           </div>
 
@@ -542,16 +822,70 @@ function AnalysisPanel({
             </details>
           )}
 
-          {job.applyLink && (
-            <a
-              href={job.applyLink}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-4 inline-block rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105"
-            >
-              Apply with this CV ↗
-            </a>
-          )}
+          <button
+            onClick={() => onApply(item)}
+            disabled={busy === `cv:${job.id}`}
+            className="mt-4 inline-block rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105 disabled:opacity-60"
+          >
+            {busy === `cv:${job.id}` ? "Preparing your CV…" : "Apply with this CV ↗"}
+          </button>
+          <p className="mt-2 font-mono text-[10px] text-soft/60">
+            Opens the posting and downloads a ready-to-attach CV (PDF + DOCX).
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TailoredCVPreview({ cv }: { cv: TailoredCVContent }) {
+  return (
+    <div className="space-y-4">
+      {cv.summary && (
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">Summary</div>
+          <p className="mt-1">{cv.summary}</p>
+        </div>
+      )}
+      {cv.skills.length > 0 && (
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">Core Skills</div>
+          <p className="mt-1">{cv.skills.join(" · ")}</p>
+        </div>
+      )}
+      {cv.experience.length > 0 && (
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">Experience</div>
+          <div className="mt-1 space-y-3">
+            {cv.experience.map((e, i) => (
+              <div key={i}>
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="font-medium text-bright/90">
+                    {[e.role, e.company].filter(Boolean).join(" — ")}
+                  </span>
+                  {e.dates && <span className="shrink-0 text-xs text-soft/70">{e.dates}</span>}
+                </div>
+                <ul className="mt-1 space-y-1">
+                  {e.bullets.map((b, j) => (
+                    <li key={j} className="flex gap-2">
+                      <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-soft/70" />
+                      <span>{b}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {cv.education.length > 0 && (
+        <div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">Education</div>
+          <div className="mt-1 space-y-1">
+            {cv.education.map((line, i) => (
+              <p key={i}>{line}</p>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -621,31 +955,56 @@ function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
   );
 }
 
-function CVEditor({
-  value,
-  onChange,
+function ProfileDrawer({
+  profile,
+  onProfileChange,
+  masterCV,
+  onMasterCVChange,
+  onImportFile,
   onClose,
 }: {
-  value: string;
-  onChange: (v: string) => void;
+  profile: Profile;
+  onProfileChange: (p: Profile) => void;
+  masterCV: string;
+  onMasterCVChange: (v: string) => void;
+  onImportFile: (file: File) => void;
   onClose: () => void;
 }) {
+  const [tab, setTab] = useState<"profile" | "cv">("profile");
+
+  function updateField<K extends keyof Profile>(key: K, value: Profile[K]) {
+    onProfileChange({ ...profile, [key]: value });
+  }
+
+  function updateLink(i: number, value: string) {
+    const links = [...profile.links];
+    links[i] = value;
+    updateField("links", links);
+  }
+
+  function addLink() {
+    updateField("links", [...profile.links, ""]);
+  }
+
+  function removeLink(i: number) {
+    updateField(
+      "links",
+      profile.links.filter((_, idx) => idx !== i)
+    );
+  }
+
   return (
-    <div
-      className="fixed inset-0 z-50 flex justify-end bg-black/60"
-      onClick={onClose}
-    >
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={onClose}>
       <div
         className="flex h-full w-full max-w-xl flex-col border-l border-line bg-surface p-6"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="font-display text-lg font-semibold text-bright">
-              Master CV
-            </h2>
+            <h2 className="font-display text-lg font-semibold text-bright">Profile & CV</h2>
             <p className="text-sm text-soft">
-              The single source of truth. Tailoring only re-emphasizes what's here.
+              Contact details fill the header of every generated document. Master CV
+              stays the tailoring source, unchanged.
             </p>
           </div>
           <button
@@ -655,13 +1014,101 @@ function CVEditor({
             Done
           </button>
         </div>
-        <textarea
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="scroll-thin mt-4 flex-1 resize-none rounded-lg border border-line bg-ink p-4 font-mono text-sm leading-relaxed text-bright/90 outline-none focus:border-beacon/60"
-        />
+
+        <div className="mt-4 flex gap-1 rounded-lg border border-line bg-ink p-1">
+          <TabBtn active={tab === "profile"} onClick={() => setTab("profile")}>
+            Profile
+          </TabBtn>
+          <TabBtn active={tab === "cv"} onClick={() => setTab("cv")}>
+            Master CV
+          </TabBtn>
+        </div>
+
+        {tab === "profile" ? (
+          <div className="scroll-thin mt-4 flex-1 space-y-4 overflow-y-auto pr-1">
+            <label className="block">
+              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                Import from CV
+              </span>
+              <input
+                type="file"
+                accept=".pdf,.docx"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) onImportFile(f);
+                  e.target.value = "";
+                }}
+                className="block w-full text-sm text-soft file:mr-3 file:rounded-lg file:border file:border-line file:bg-raised file:px-3 file:py-2 file:text-sm file:text-soft"
+              />
+              <span className="mt-1 block text-xs text-soft/70">
+                Upload a .pdf or .docx resume (e.g. LinkedIn's own "Save to PDF" export
+                from your profile page) to prefill these fields.
+              </span>
+            </label>
+
+            <ProfileField label="Full name" value={profile.name} onChange={(v) => updateField("name", v)} />
+            <ProfileField label="Title" value={profile.title} onChange={(v) => updateField("title", v)} />
+            <ProfileField label="Location" value={profile.location} onChange={(v) => updateField("location", v)} />
+            <ProfileField label="Email" value={profile.email} onChange={(v) => updateField("email", v)} />
+            <ProfileField label="Phone" value={profile.phone} onChange={(v) => updateField("phone", v)} />
+
+            <div>
+              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                Links
+              </span>
+              <div className="space-y-2">
+                {profile.links.map((link, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      value={link}
+                      onChange={(e) => updateLink(i, e.target.value)}
+                      placeholder="linkedin.com/in/..."
+                      className="w-full rounded-lg border border-line bg-ink px-3 py-2 text-sm text-bright outline-none focus:border-beacon/60"
+                    />
+                    <button
+                      onClick={() => removeLink(i)}
+                      className="rounded-lg border border-line px-2.5 text-sm text-soft hover:text-weak"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                <button onClick={addLink} className="font-mono text-xs text-soft hover:text-beacon">
+                  + Add link
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <textarea
+            value={masterCV}
+            onChange={(e) => onMasterCVChange(e.target.value)}
+            className="scroll-thin mt-4 flex-1 resize-none rounded-lg border border-line bg-ink p-4 font-mono text-sm leading-relaxed text-bright/90 outline-none focus:border-beacon/60"
+          />
+        )}
       </div>
     </div>
+  );
+}
+
+function ProfileField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">{label}</span>
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg border border-line bg-ink px-3.5 py-2.5 text-bright outline-none transition focus:border-beacon/60"
+      />
+    </label>
   );
 }
 

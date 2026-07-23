@@ -17,6 +17,14 @@ truthfully, in one batch.
 - Tailoring is **truthful by design**: Claude only re-orders, re-emphasizes,
   and rephrases what's already in your master CV. It never invents
   experience — gaps are called out explicitly instead.
+- **"Apply with this CV"** opens the original posting and downloads a
+  finished, ready-to-attach CV as both PDF and DOCX — no manual reformatting.
+  A matching "Download cover letter" button does the same for the letter.
+- A **Profile** section (contact details: name, title, location, email,
+  phone, links) fills the header of every generated document. Fill it in
+  manually, or upload an existing CV (.pdf/.docx — e.g. LinkedIn's own "Save
+  to PDF" export) to auto-extract it via Claude. Profile and Master CV
+  persist locally in your browser.
 - Works out of the box with sample jobs even before you add any keys.
 
 ## Run locally
@@ -71,8 +79,11 @@ informational only, not wired into the automated search.
 ## Notes
 
 - Keys stay server-side (in the API routes) — they're never exposed to the browser.
-- Edit your master CV in the app via the **Master CV** button (top right), or change
-  the default in `lib/masterCV.ts`.
-- Stack: Next.js (App Router) + TypeScript + Tailwind. Zero runtime dependencies
-  beyond React/Next — batch analysis streams via a native `ReadableStream`
-  (NDJSON), no extra libraries.
+- Edit your Profile and Master CV in the app via the **Profile & CV** button
+  (top right), or change the defaults in `lib/profile.ts` / `lib/masterCV.ts`.
+- Stack: Next.js (App Router) + TypeScript + Tailwind. Batch analysis streams
+  via a native `ReadableStream` (NDJSON). Four extra runtime dependencies
+  beyond React/Next: `@react-pdf/renderer` and `docx` generate the
+  downloadable PDF/DOCX files client-side (lazy-loaded on click, not in the
+  main bundle); `pdf-parse` and `mammoth` extract text from uploaded resume
+  files server-side for the Profile importer.

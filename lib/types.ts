@@ -21,13 +21,39 @@ export interface AuditTrailEntry {
   source: string; // the master CV section/line it's drawn from
 }
 
+export interface ExperienceEntry {
+  company: string;
+  role: string;
+  dates: string;
+  bullets: string[];
+}
+
+export interface TailoredCVContent {
+  summary: string;
+  skills: string[];
+  experience: ExperienceEntry[];
+  education: string[];
+}
+
+// Structured contact/header info, kept separate from the freeform Master CV
+// text. Fills in the header of every generated CV/cover letter deterministically
+// instead of relying on Claude to re-guess contact details each time.
+export interface Profile {
+  name: string;
+  title: string;
+  location: string;
+  email: string;
+  phone: string;
+  links: string[];
+}
+
 export interface Analysis {
   score: number; // 0-100
   tier: "strong" | "good" | "partial" | "weak";
   tierLabel: string;
   verdict: string;
   reasons: string[];
-  tailoredCV: string; // markdown
+  tailoredCV: TailoredCVContent;
   coverLetter: string;
   gapAnalysis: string;
   auditTrail: AuditTrailEntry[];
