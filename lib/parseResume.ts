@@ -60,6 +60,8 @@ function buildDemoProfileExtraction(rawText: string, note: string): ExtractedPro
       email,
       phone,
       links: linkedin ? [linkedin] : [],
+      photo: "",
+      cvFormat: "both",
       summary: "",
       skills: [],
       experience: [],
@@ -72,7 +74,13 @@ function buildDemoProfileExtraction(rawText: string, note: string): ExtractedPro
 
 export async function extractStructuredResume(rawText: string): Promise<ExtractedProfile> {
   const key = process.env.ANTHROPIC_API_KEY;
-  if (process.env.DEMO_MODE === "true" || !key) {
+  if (process.env.DEMO_MODE === "true") {
+    return buildDemoProfileExtraction(
+      rawText,
+      "Demo mode is on — only contact details (name, email, phone, LinkedIn) could be extracted automatically. Turn off DEMO_MODE to also extract Summary, Skills, Experience, and Education, or fill them in yourself below."
+    );
+  }
+  if (!key) {
     return buildDemoProfileExtraction(
       rawText,
       "No ANTHROPIC_API_KEY configured — only contact details (name, email, phone, LinkedIn) could be extracted automatically. Add a key to also extract Summary, Skills, Experience, and Education, or fill them in yourself below."
@@ -89,13 +97,14 @@ export async function extractStructuredResume(rawText: string): Promise<Extracte
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 3000,
+        max_tokens: 8000,
         system: SYSTEM,
         messages: [{ role: "user", content: buildPrompt(rawText) }],
       }),
     });
 
     if (!r.ok) {
+      console.error("extractStructuredResume: Claude API error", r.status, await r.text());
       return buildDemoProfileExtraction(rawText, "Claude is currently unavailable — only contact details could be extracted.");
     }
 
@@ -106,7 +115,8 @@ export async function extractStructuredResume(rawText: string): Promise<Extracte
       .trim();
     const clean = text.replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
     return { profile: sanitizeProfile(JSON.parse(clean)), demo: false };
-  } catch {
+  } catch (err) {
+    console.error("extractStructuredResume: extraction failed", err);
     return buildDemoProfileExtraction(rawText, "Live extraction failed — only contact details could be extracted.");
   }
 }

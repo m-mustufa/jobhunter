@@ -105,14 +105,18 @@ export async function GET(req: Request) {
   const keyword = (searchParams.get("keyword") || "").trim().toLowerCase();
   const key = process.env.JSEARCH_API_KEY;
 
-  // No key configured — return sample data so the demo still works.
-  if (!key) {
+  // No key configured, or DEMO_MODE forces it — return sample data so
+  // local/demo use never burns paid JSearch quota.
+  if (!key || process.env.DEMO_MODE === "true") {
     let jobs = SAMPLE_JOBS;
     if (keyword) jobs = jobs.filter((j) => `${j.title} ${j.description}`.toLowerCase().includes(keyword));
     const res: JobsResponse = {
       jobs,
       sample: true,
-      note: "Showing sample jobs. Add JSEARCH_API_KEY to pull live listings.",
+      note:
+        process.env.DEMO_MODE === "true"
+          ? "Showing sample jobs — DEMO_MODE is on."
+          : "Showing sample jobs. Add JSEARCH_API_KEY to pull live listings.",
     };
     return NextResponse.json(res);
   }

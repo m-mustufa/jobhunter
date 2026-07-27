@@ -45,6 +45,8 @@ export interface Profile {
   email: string;
   phone: string;
   links: string[];
+  photo: string; // JPEG data URL, or "" if none set
+  cvFormat: "pdf" | "docx" | "both"; // which files "Apply with this CV" downloads
   summary: string;
   skills: string[];
   experience: ExperienceEntry[];

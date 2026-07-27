@@ -5,6 +5,7 @@
 // read/write the same persisted state.
 export const MASTER_CV_KEY = "jobhunter:masterCV";
 export const PROFILE_KEY = "jobhunter:profile";
+export const JOBS_CACHE_KEY = "jobhunter:jobsCache";
 
 export function loadJSON<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;

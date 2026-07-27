@@ -1,8 +1,10 @@
-import { Document, Page, StyleSheet, Text, View } from "@react-pdf/renderer";
+import { Document, Image, Page, StyleSheet, Text, View } from "@react-pdf/renderer";
 import { CVDocument } from "../cvDocument";
 
 const styles = StyleSheet.create({
   page: { padding: 40, fontSize: 10.5, fontFamily: "Helvetica", color: "#1a1a1a", lineHeight: 1.4 },
+  headerRow: { flexDirection: "row", alignItems: "center" },
+  photo: { width: 64, height: 64, borderRadius: 32, marginRight: 14 },
   name: { fontSize: 20, fontFamily: "Helvetica-Bold", marginBottom: 2 },
   titleLine: { fontSize: 11, color: "#333333", marginBottom: 3 },
   contactLine: { fontSize: 9.5, color: "#555555" },
@@ -45,13 +47,18 @@ export function CVPdf({ doc }: { doc: CVDocument }) {
   return (
     <Document>
       <Page size="A4" style={styles.page}>
-        <Text style={styles.name}>{profile.name || "Candidate"}</Text>
-        {(profile.title || profile.location) && (
-          <Text style={styles.titleLine}>
-            {[profile.title, profile.location].filter(Boolean).join(" — ")}
-          </Text>
-        )}
-        {contactParts.length > 0 && <Text style={styles.contactLine}>{contactParts.join("  ·  ")}</Text>}
+        <View style={styles.headerRow}>
+          {profile.photo && <Image src={profile.photo} style={styles.photo} />}
+          <View>
+            <Text style={styles.name}>{profile.name || "Candidate"}</Text>
+            {(profile.title || profile.location) && (
+              <Text style={styles.titleLine}>
+                {[profile.title, profile.location].filter(Boolean).join(" — ")}
+              </Text>
+            )}
+            {contactParts.length > 0 && <Text style={styles.contactLine}>{contactParts.join("  ·  ")}</Text>}
+          </View>
+        </View>
         <View style={styles.divider} />
 
         {summary && (

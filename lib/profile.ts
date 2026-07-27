@@ -1,5 +1,7 @@
 import { Profile } from "./types";
 
+const VALID_CV_FORMATS: Profile["cvFormat"][] = ["pdf", "docx", "both"];
+
 // Coerces an arbitrary value (an API response, or something read back from
 // localStorage) into a fully-valid Profile — every array field guaranteed
 // to be an array, every string field guaranteed to be a string. Needed
@@ -15,6 +17,8 @@ export function sanitizeProfile(raw: any): Profile {
     email: typeof raw?.email === "string" ? raw.email : "",
     phone: typeof raw?.phone === "string" ? raw.phone : "",
     links: Array.isArray(raw?.links) ? raw.links.map(String) : [],
+    photo: typeof raw?.photo === "string" ? raw.photo : "",
+    cvFormat: VALID_CV_FORMATS.includes(raw?.cvFormat) ? raw.cvFormat : "both",
     summary: typeof raw?.summary === "string" ? raw.summary : "",
     skills: Array.isArray(raw?.skills) ? raw.skills.map(String) : [],
     experience: Array.isArray(raw?.experience)
@@ -39,6 +43,8 @@ export const DEFAULT_PROFILE: Profile = {
   email: "mustufa50@gmail.com",
   phone: "",
   links: ["mustcode.netlify.app", "linkedin.com/in/muhammad-mustafa-16477a99"],
+  photo: "",
+  cvFormat: "both",
   summary:
     "Senior full-stack engineer with 10+ years of experience building and shipping " +
     "production SaaS. Comfortable owning features end to end — from database design " +

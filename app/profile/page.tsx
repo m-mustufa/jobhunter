@@ -6,6 +6,7 @@ import { ExperienceEntry, Profile } from "@/lib/types";
 import { DEFAULT_PROFILE, sanitizeProfile } from "@/lib/profile";
 import { DEFAULT_MASTER_CV, buildMasterCVMarkdown } from "@/lib/masterCV";
 import { loadJSON, saveJSON, MASTER_CV_KEY, PROFILE_KEY } from "@/lib/persist";
+import { fileToDataUrl, resizeImageDataUrl } from "@/lib/image";
 import { TabBtn, TextField, TextAreaField, ListField, ConfirmDialog, Toast } from "@/app/components/ui";
 
 export default function ProfilePage() {
@@ -16,6 +17,7 @@ export default function ProfilePage() {
   const [importing, setImporting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
 
   // Same hydrate-then-gate-on-`hydrated` pattern as app/page.tsx, so a
   // save effect firing on the very first (pre-hydration) render can't
@@ -73,16 +75,39 @@ export default function ProfilePage() {
         setToast(data.error || "Could not read that file.");
         return;
       }
-      updateProfile(data.profile as Profile);
+      let incoming = data.profile as Profile;
+      let gotPhoto = false;
+      if (incoming.photo) {
+        try {
+          incoming = { ...incoming, photo: await resizeImageDataUrl(incoming.photo) };
+          gotPhoto = true;
+        } catch {
+          incoming = { ...incoming, photo: "" };
+        }
+      }
+      updateProfile(incoming);
       if (data.demo) {
         setDemoNotice(data.demoNote || "Only contact details could be extracted automatically.");
       } else {
-        setToast("Profile updated from the uploaded CV.");
+        setToast(gotPhoto ? "Profile updated from the uploaded CV — photo detected." : "Profile updated from the uploaded CV.");
       }
     } catch {
       setToast("Could not reach the resume-parsing service.");
     } finally {
       setImporting(false);
+    }
+  }
+
+  async function selectPhotoFile(file: File) {
+    setPhotoBusy(true);
+    try {
+      const raw = await fileToDataUrl(file);
+      const resized = await resizeImageDataUrl(raw);
+      updateField("photo", resized);
+    } catch {
+      setToast("Could not read that image.");
+    } finally {
+      setPhotoBusy(false);
     }
   }
 
@@ -162,6 +187,73 @@ export default function ProfilePage() {
           </div>
 
           <div className="rounded-2xl border border-line bg-surface p-5">
+            <h2 className="font-display text-sm font-semibold text-bright">CV Format</h2>
+            <p className="mt-1 text-xs text-soft/70">
+              Controls what "Apply with this CV" downloads, and what appears on your generated CV.
+            </p>
+
+            <div className="mt-4">
+              <label className="block">
+                <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                  Download format
+                </span>
+                <select
+                  value={profile.cvFormat}
+                  onChange={(e) => updateField("cvFormat", e.target.value as Profile["cvFormat"])}
+                  className="w-full rounded-lg border border-line bg-ink px-3.5 py-2.5 text-bright outline-none transition focus:border-beacon/60"
+                >
+                  <option value="both">PDF + DOCX (both)</option>
+                  <option value="pdf">PDF only</option>
+                  <option value="docx">DOCX only</option>
+                </select>
+              </label>
+            </div>
+
+            <div className="mt-5 border-t border-line pt-4">
+              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                Photo
+              </span>
+              <p className="text-xs text-soft/70">
+                Auto-filled from an imported CV when one's found in it, or upload one directly.
+              </p>
+            </div>
+            <div className="mt-3 flex items-center gap-4">
+              <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-full border border-line bg-ink">
+                {profile.photo ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={profile.photo} alt="Profile" className="h-full w-full object-cover" />
+                ) : (
+                  <span className="font-mono text-[10px] text-soft/50">None</span>
+                )}
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="inline-block w-fit cursor-pointer rounded-lg border border-line bg-raised px-3 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright">
+                  {photoBusy ? "Uploading…" : profile.photo ? "Replace photo" : "Upload photo"}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    disabled={photoBusy}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) selectPhotoFile(f);
+                      e.target.value = "";
+                    }}
+                    className="hidden"
+                  />
+                </label>
+                {profile.photo && (
+                  <button
+                    onClick={() => updateField("photo", "")}
+                    className="font-mono text-xs text-soft transition hover:text-weak"
+                  >
+                    Remove photo
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-line bg-surface p-5">
             <h2 className="font-display text-sm font-semibold text-bright">Contact</h2>
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <TextField label="Full name" value={profile.name} onChange={(v) => updateField("name", v)} />
@@ -199,6 +291,7 @@ export default function ProfilePage() {
                 onChange={(skills) => updateField("skills", skills)}
                 placeholder="e.g. React"
                 addLabel="+ Add skill"
+                pill
               />
             </div>
           </div>

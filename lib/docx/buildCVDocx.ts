@@ -1,7 +1,24 @@
-import { AlignmentType, Document, HeadingLevel, Packer, Paragraph, TextRun } from "docx";
+import {
+  AlignmentType,
+  BorderStyle,
+  Document,
+  HeadingLevel,
+  ImageRun,
+  Packer,
+  Paragraph,
+  Table,
+  TableCell,
+  TableRow,
+  TextRun,
+  VerticalAlign,
+  WidthType,
+} from "docx";
 import { CVDocument } from "../cvDocument";
+import { dataUrlToBytes } from "../image";
 
 const ACCENT = "1F3A5F";
+const NO_BORDER = { style: BorderStyle.NONE, size: 0, color: "FFFFFF" } as const;
+const NO_CELL_BORDERS = { top: NO_BORDER, bottom: NO_BORDER, left: NO_BORDER, right: NO_BORDER };
 
 function sectionHeading(text: string) {
   return new Paragraph({
@@ -15,14 +32,14 @@ export async function buildCVDocxBlob(doc: CVDocument): Promise<Blob> {
   const { profile, summary, skills, experience, education } = doc;
   const contactParts = [profile.email, profile.phone, ...profile.links].filter(Boolean);
 
-  const children: Paragraph[] = [
+  const nameBlock: Paragraph[] = [
     new Paragraph({
       children: [new TextRun({ text: profile.name || "Candidate", bold: true, size: 40 })],
     }),
   ];
 
   if (profile.title || profile.location) {
-    children.push(
+    nameBlock.push(
       new Paragraph({
         spacing: { after: 40 },
         children: [
@@ -33,12 +50,54 @@ export async function buildCVDocxBlob(doc: CVDocument): Promise<Blob> {
   }
 
   if (contactParts.length) {
-    children.push(
+    nameBlock.push(
       new Paragraph({
         spacing: { after: 200 },
         children: [new TextRun({ text: contactParts.join("  ·  "), size: 19, color: "555555" })],
       })
     );
+  }
+
+  const children: (Paragraph | Table)[] = [];
+
+  if (profile.photo) {
+    const { bytes, mime } = dataUrlToBytes(profile.photo);
+    children.push(
+      new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        borders: NO_CELL_BORDERS,
+        rows: [
+          new TableRow({
+            children: [
+              new TableCell({
+                width: { size: 18, type: WidthType.PERCENTAGE },
+                verticalAlign: VerticalAlign.CENTER,
+                borders: NO_CELL_BORDERS,
+                children: [
+                  new Paragraph({
+                    children: [
+                      new ImageRun({
+                        type: mime === "image/png" ? "png" : "jpg",
+                        data: bytes,
+                        transformation: { width: 72, height: 72 },
+                      }),
+                    ],
+                  }),
+                ],
+              }),
+              new TableCell({
+                width: { size: 82, type: WidthType.PERCENTAGE },
+                verticalAlign: VerticalAlign.CENTER,
+                borders: NO_CELL_BORDERS,
+                children: nameBlock,
+              }),
+            ],
+          }),
+        ],
+      })
+    );
+  } else {
+    children.push(...nameBlock);
   }
 
   if (summary) {
