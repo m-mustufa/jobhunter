@@ -127,6 +127,23 @@ export async function GET(req: Request) {
     let jobs: Job[] = deduped.slice(0, MAX_RESULTS).map(toJob);
     if (keyword) jobs = jobs.filter((j) => `${j.title} ${j.description}`.toLowerCase().includes(keyword));
 
+    // Every query group can fail individually (e.g. JSearch rate-limited)
+    // without runGroupsWithConcurrency itself throwing, since failures are
+    // caught per-group there — so a total outage looks like a clean, empty
+    // result rather than an error. Fall back to samples here too, same as
+    // the catch block below, so that case degrades gracefully instead of
+    // silently showing "no listings found."
+    if (jobs.length === 0) {
+      let sample = SAMPLE_JOBS;
+      if (keyword) sample = sample.filter((j) => `${j.title} ${j.description}`.toLowerCase().includes(keyword));
+      const res: JobsResponse = {
+        jobs: sample,
+        sample: true,
+        note: "Live search returned no results right now (JSearch may be rate-limited) — showing sample jobs.",
+      };
+      return NextResponse.json(res);
+    }
+
     const res: JobsResponse = { jobs, sample: false };
     return NextResponse.json(res);
   } catch (err: any) {
