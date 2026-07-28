@@ -18,6 +18,7 @@ export default function ProfilePage() {
   const [toast, setToast] = useState<string | null>(null);
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [photoBusy, setPhotoBusy] = useState(false);
+  const [resumeFileName, setResumeFileName] = useState<string | null>(null);
 
   // Same hydrate-then-gate-on-`hydrated` pattern as app/page.tsx, so a
   // save effect firing on the very first (pre-hydration) render can't
@@ -145,26 +146,108 @@ export default function ProfilePage() {
       {tab === "profile" ? (
         <div className="mt-5 space-y-6">
           <div className="rounded-2xl border border-line bg-surface p-5">
-            <label className="block">
-              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
-                Import from CV
-              </span>
-              <input
-                type="file"
-                accept=".pdf,.docx"
-                disabled={importing}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) selectResumeFile(f);
-                  e.target.value = "";
-                }}
-                className="block w-full text-sm text-soft file:mr-3 file:rounded-lg file:border file:border-line file:bg-raised file:px-3 file:py-2 file:text-sm file:text-soft disabled:cursor-not-allowed disabled:opacity-50"
-              />
-              <span className="mt-1 block text-xs text-soft/70">
-                Upload a .pdf or .docx resume (e.g. LinkedIn's own "Save to PDF" export from
-                your profile page) to prefill everything below.
-              </span>
-            </label>
+            <div className="grid gap-5 sm:grid-cols-[auto_1fr_auto]">
+              <div>
+                <span className="mb-2 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                  Photo
+                </span>
+                <div className="flex items-center gap-3">
+                  <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-full border border-line bg-ink">
+                    {profile.photo ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={profile.photo} alt="Profile" className="h-full w-full object-cover" />
+                    ) : (
+                      <span className="font-mono text-[10px] text-soft/50">None</span>
+                    )}
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <label
+                      title={profile.photo ? "Replace photo" : "Upload photo"}
+                      className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full border border-beacon/40 text-beacon transition hover:bg-beacon/10"
+                    >
+                      <span className="h-4 w-4">{photoBusy ? "…" : <PencilIcon />}</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        disabled={photoBusy}
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) selectPhotoFile(f);
+                          e.target.value = "";
+                        }}
+                        className="hidden"
+                      />
+                    </label>
+                    <button
+                      onClick={() => updateField("photo", "")}
+                      disabled={!profile.photo}
+                      title="Remove photo"
+                      className="flex h-8 w-8 items-center justify-center rounded-full border border-line text-soft transition hover:border-weak/60 hover:text-weak disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <span className="h-4 w-4">
+                        <TrashIcon />
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <label className="block">
+                <span className="mb-2 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                  Import from CV
+                </span>
+                <div className="rounded-xl border border-dashed border-line px-3 py-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="flex shrink-0 cursor-pointer items-center gap-2 rounded-lg border border-beacon/40 bg-beacon/10 px-3 py-2 text-sm font-medium text-beacon transition hover:bg-beacon/20">
+                      <span className="h-4 w-4">
+                        <UploadIcon />
+                      </span>
+                      Choose file
+                    </span>
+                    <span className="min-w-0 break-words text-sm text-soft/70">
+                      {resumeFileName || "No file chosen"}
+                    </span>
+                    <input
+                      type="file"
+                      accept=".pdf,.docx"
+                      disabled={importing}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) {
+                          setResumeFileName(f.name);
+                          selectResumeFile(f);
+                        }
+                        e.target.value = "";
+                      }}
+                      className="sr-only"
+                    />
+                  </div>
+                  <span className="mt-2 block text-xs text-soft/70">
+                    .pdf or .docx (e.g. LinkedIn's "Save to PDF" export) — prefills everything below.
+                  </span>
+                </div>
+              </label>
+
+              <label className="block sm:w-60">
+                <span className="mb-2 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
+                  Download format
+                </span>
+                <div className="relative">
+                  <span className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-soft">
+                    <FileIcon />
+                  </span>
+                  <select
+                    value={profile.cvFormat}
+                    onChange={(e) => updateField("cvFormat", e.target.value as Profile["cvFormat"])}
+                    className="w-full rounded-lg border border-line bg-ink py-2.5 pl-10 pr-3.5 text-bright outline-none transition focus:border-beacon/60"
+                  >
+                    <option value="both">PDF + DOCX (both)</option>
+                    <option value="pdf">PDF only</option>
+                    <option value="docx">DOCX only</option>
+                  </select>
+                </div>
+              </label>
+            </div>
 
             {importing && (
               <div className="mt-4 flex items-center gap-3 rounded-lg border border-beacon/30 bg-beacon/10 px-4 py-3">
@@ -184,73 +267,6 @@ export default function ProfilePage() {
                 <p className="mt-1 text-xs leading-relaxed text-soft">{demoNotice}</p>
               </div>
             )}
-          </div>
-
-          <div className="rounded-2xl border border-line bg-surface p-5">
-            <h2 className="font-display text-sm font-semibold text-bright">CV Format</h2>
-            <p className="mt-1 text-xs text-soft/70">
-              Controls what "Apply with this CV" downloads, and what appears on your generated CV.
-            </p>
-
-            <div className="mt-4">
-              <label className="block">
-                <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
-                  Download format
-                </span>
-                <select
-                  value={profile.cvFormat}
-                  onChange={(e) => updateField("cvFormat", e.target.value as Profile["cvFormat"])}
-                  className="w-full rounded-lg border border-line bg-ink px-3.5 py-2.5 text-bright outline-none transition focus:border-beacon/60"
-                >
-                  <option value="both">PDF + DOCX (both)</option>
-                  <option value="pdf">PDF only</option>
-                  <option value="docx">DOCX only</option>
-                </select>
-              </label>
-            </div>
-
-            <div className="mt-5 border-t border-line pt-4">
-              <span className="mb-1.5 block font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
-                Photo
-              </span>
-              <p className="text-xs text-soft/70">
-                Auto-filled from an imported CV when one's found in it, or upload one directly.
-              </p>
-            </div>
-            <div className="mt-3 flex items-center gap-4">
-              <div className="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-full border border-line bg-ink">
-                {profile.photo ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={profile.photo} alt="Profile" className="h-full w-full object-cover" />
-                ) : (
-                  <span className="font-mono text-[10px] text-soft/50">None</span>
-                )}
-              </div>
-              <div className="flex flex-col gap-2">
-                <label className="inline-block w-fit cursor-pointer rounded-lg border border-line bg-raised px-3 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright">
-                  {photoBusy ? "Uploading…" : profile.photo ? "Replace photo" : "Upload photo"}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    disabled={photoBusy}
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) selectPhotoFile(f);
-                      e.target.value = "";
-                    }}
-                    className="hidden"
-                  />
-                </label>
-                {profile.photo && (
-                  <button
-                    onClick={() => updateField("photo", "")}
-                    className="font-mono text-xs text-soft transition hover:text-weak"
-                  >
-                    Remove photo
-                  </button>
-                )}
-              </div>
-            </div>
           </div>
 
           <div className="rounded-2xl border border-line bg-surface p-5">
@@ -350,6 +366,61 @@ export default function ProfilePage() {
 
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}
     </main>
+  );
+}
+
+function Icon({ children }: { children: React.ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-full w-full"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <Icon>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </Icon>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <Icon>
+      <path d="M3 6h18" />
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+      <path d="M10 11v6M14 11v6" />
+    </Icon>
+  );
+}
+
+function UploadIcon() {
+  return (
+    <Icon>
+      <path d="M12 3v12" />
+      <path d="M7 8l5-5 5 5" />
+      <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+    </Icon>
+  );
+}
+
+function FileIcon() {
+  return (
+    <Icon>
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
+      <path d="M14 2v6h6" />
+    </Icon>
   );
 }
 
