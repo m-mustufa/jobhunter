@@ -10,6 +10,10 @@ extraction artifacts (broken line breaks, stray page-number text) but do not
 add content that isn't there. Leave a field empty/omit an entry if the
 source text genuinely doesn't contain it — don't guess.
 
+Copy employer/company/department names exactly as written in the source.
+Never prepend a parent organization, expand abbreviations, translate a
+label, or correct its spelling.
+
 Return ONLY a valid JSON object. No markdown fences, no preamble.`;
 
 function buildPrompt(rawText: string) {
@@ -27,9 +31,11 @@ Return a single JSON object with exactly these keys:
   "summary": "<the professional summary/about section, rewritten cleanly, or a 1-2 sentence summary inferred from the experience if the source has no explicit summary>",
   "skills": ["<individual skills, tools, and technologies listed in the source>"],
   "experience": [
-    { "company": "<employer>", "role": "<title>", "dates": "<e.g. 2021–present>", "bullets": ["<achievement/responsibility, as stated in the source>"] }
+    { "company": "<employer/company/department name copied verbatim from the source>", "role": "<title>", "dates": "<e.g. 2021–present>", "bullets": ["<achievement/responsibility, as stated in the source>"] }
   ],
-  "education": ["<education or earlier-career lines, kept brief>"]
+  "education": ["<education or earlier-career lines, kept brief>"],
+  "certifications": ["<professional certifications/licences found in the source, e.g. 'PMP', 'NEBOSH', or an empty array if none>"],
+  "languages": ["<languages found in the source, e.g. 'Arabic (Fluent)', or an empty array if none>"]
 }
 
 Return only the JSON object.`;
@@ -66,6 +72,8 @@ function buildDemoProfileExtraction(rawText: string, note: string): ExtractedPro
       skills: [],
       experience: [],
       education: [],
+      certifications: [],
+      languages: [],
     },
     demo: true,
     demoNote: note,

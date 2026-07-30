@@ -5,13 +5,23 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Analysis, BatchItem, Job, JobsResponse, Profile, TailoredCVContent } from "@/lib/types";
 import { DEFAULT_MASTER_CV } from "@/lib/masterCV";
 import { DEFAULT_PROFILE, sanitizeProfile } from "@/lib/profile";
-import { buildDemoAnalysis } from "@/lib/demoAnalysis";
 import { EMPLOYER_DIRECTORY, linkedInSearchUrl } from "@/lib/employerDirectory";
 import { getMatchTier } from "@/lib/matchTier";
 import { FUNCTIONAL_DOMAINS, matchFunctionalDomain, matchTargetTitle } from "@/lib/targetRoles";
-import { loadJSON, saveJSON, MASTER_CV_KEY, PROFILE_KEY, JOBS_CACHE_KEY } from "@/lib/persist";
+import {
+  loadJSON,
+  saveJSON,
+  MASTER_CV_KEY,
+  PROFILE_KEY,
+  JOBS_CACHE_KEY,
+  TAILORED_ANALYSES_KEY,
+} from "@/lib/persist";
+import { fetchStoredProfile } from "@/lib/profileStore";
 import { buildCVDocument, buildCoverLetterDocument, serializeCVText } from "@/lib/cvDocument";
 import { downloadBlobsStaggered, safeFileSlug } from "@/lib/download";
+import { CvHtmlTemplate } from "@/lib/pdf/CvHtmlTemplate";
+import { CoverLetterHtmlTemplate } from "@/lib/pdf/CoverLetterHtmlTemplate";
+import { printReactDocument } from "@/lib/print/printHtml";
 import { TabBtn } from "@/app/components/ui";
 
 const TIER_COLOR: Record<string, string> = {
@@ -24,11 +34,6 @@ const TIER_COLOR: Record<string, string> = {
 const PAGE_SIZE = 10;
 const OTHER = "Other";
 
-// Shown on every job until the user asks for the real thing — makes clear
-// this score costs nothing and isn't the truthful, AI-tailored version yet.
-const QUICK_MATCH_NOTE =
-  'Quick match estimate, computed instantly with no AI call. Click "Tailor CV for this job" for a precise, AI-tailored CV, cover letter, and gap analysis.';
-
 interface JobsCache {
   jobs: Job[];
   fetchedAt: number;
@@ -36,10 +41,143 @@ interface JobsCache {
   sampleNote: string | null;
 }
 
-function scoreJobs(jobs: Job[], masterCV: string): BatchItem[] {
-  return jobs
-    .map((job) => ({ job, status: "done" as const, analysis: buildDemoAnalysis(job, masterCV, QUICK_MATCH_NOTE) }))
-    .sort((a, b) => (b.analysis?.score ?? -1) - (a.analysis?.score ?? -1));
+interface SavedTailoredAnalysis {
+  jobSignature: string;
+  analysis: Analysis;
+  tailoredAt: number;
+}
+
+interface TailoredAnalysisCache {
+  version: number;
+  profileSignature: string;
+  entries: Record<string, SavedTailoredAnalysis>;
+}
+
+const TAILORED_ANALYSIS_CACHE_VERSION = 1;
+const MAX_SAVED_ANALYSES = 30;
+
+function createAnalysisSignature(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function getProfileAnalysisSignature(profile: Profile): string {
+  return createAnalysisSignature({
+    name: profile.name,
+    title: profile.title,
+    location: profile.location,
+    summary: profile.summary,
+    skills: profile.skills,
+    experience: profile.experience,
+    education: profile.education,
+    certifications: profile.certifications,
+    languages: profile.languages,
+  });
+}
+
+function getJobAnalysisSignature(job: Job): string {
+  return createAnalysisSignature({
+    id: job.id,
+    title: job.title,
+    company: job.company,
+    location: job.location,
+    description: job.description,
+  });
+}
+
+function isUsableSavedAnalysis(value: unknown): value is SavedTailoredAnalysis {
+  const saved = value as SavedTailoredAnalysis | undefined;
+  const analysis = saved?.analysis;
+  return Boolean(
+    saved &&
+      typeof saved.jobSignature === "string" &&
+      Number.isFinite(saved.tailoredAt) &&
+      analysis &&
+      Number.isFinite(analysis.score) &&
+      typeof analysis.tier === "string" &&
+      typeof analysis.tierLabel === "string" &&
+      typeof analysis.verdict === "string" &&
+      Array.isArray(analysis.reasons) &&
+      typeof analysis.tailoredCV?.summary === "string" &&
+      Array.isArray(analysis.tailoredCV?.skills) &&
+      Array.isArray(analysis.tailoredCV?.experience) &&
+      Array.isArray(analysis.tailoredCV?.education) &&
+      typeof analysis.coverLetter === "string" &&
+      Array.isArray(analysis.auditTrail)
+  );
+}
+
+function getSavedAnalysisCache(): TailoredAnalysisCache | null {
+  const saved = loadJSON<unknown>(TAILORED_ANALYSES_KEY, null);
+  if (!saved || typeof saved !== "object") return null;
+
+  const cache = saved as TailoredAnalysisCache;
+  if (
+    cache.version !== TAILORED_ANALYSIS_CACHE_VERSION ||
+    typeof cache.profileSignature !== "string" ||
+    !cache.entries ||
+    typeof cache.entries !== "object" ||
+    Array.isArray(cache.entries)
+  ) {
+    return null;
+  }
+  return cache;
+}
+
+// No automatic scoring — every job starts unanalyzed until the user
+// explicitly clicks "Tailor CV for this job" (see tailorJob), which is the
+// only thing that ever produces a real score.
+function toBatchItems(jobs: Job[], profile: Profile): BatchItem[] {
+  const profileSignature = getProfileAnalysisSignature(profile);
+  const savedCache = getSavedAnalysisCache();
+  const savedAnalyses =
+    savedCache?.profileSignature === profileSignature ? savedCache.entries : {};
+
+  return jobs.map((job) => {
+    const saved = savedAnalyses[job.id];
+    if (
+      isUsableSavedAnalysis(saved) &&
+      saved.jobSignature === getJobAnalysisSignature(job)
+    ) {
+      return {
+        job,
+        analysis: saved.analysis,
+        tailoredAt: saved.tailoredAt,
+        status: "done" as const,
+      };
+    }
+    return { job, status: "pending" as const };
+  });
+}
+
+function saveTailoredAnalysis(
+  job: Job,
+  profile: Profile,
+  analysis: Analysis,
+  tailoredAt: number
+) {
+  const profileSignature = getProfileAnalysisSignature(profile);
+  const savedCache = getSavedAnalysisCache();
+  const existingEntries =
+    savedCache?.profileSignature === profileSignature ? savedCache.entries : {};
+  const nextEntries: Record<string, SavedTailoredAnalysis> = {
+    ...existingEntries,
+    [job.id]: {
+      jobSignature: getJobAnalysisSignature(job),
+      analysis,
+      tailoredAt,
+    },
+  };
+  const recentEntries = Object.entries(nextEntries)
+    .filter((entry): entry is [string, SavedTailoredAnalysis] =>
+      isUsableSavedAnalysis(entry[1])
+    )
+    .sort(([, a], [, b]) => b.tailoredAt - a.tailoredAt)
+    .slice(0, MAX_SAVED_ANALYSES);
+  saveJSON(TAILORED_ANALYSES_KEY, {
+    version: TAILORED_ANALYSIS_CACHE_VERSION,
+    profileSignature,
+    entries: Object.fromEntries(recentEntries),
+  } satisfies TailoredAnalysisCache);
 }
 
 function timeAgo(ts: number) {
@@ -74,6 +212,31 @@ export default function Home() {
   const [copied, setCopied] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null); // e.g. "letter:<jobId>" | "tailor:<jobId>"
   const [actionError, setActionError] = useState<string | null>(null);
+  const [applyItem, setApplyItem] = useState<BatchItem | null>(null);
+  const pageRootRef = useRef<HTMLElement | null>(null);
+  const tailoringBusy = busy?.startsWith("tailor:") === true;
+
+  // The Claude call is intentionally modal: prevent scrolling, pointer
+  // interaction, and keyboard focus from reaching the page until it ends.
+  useEffect(() => {
+    if (!tailoringBusy) return;
+
+    const pageRoot = pageRootRef.current;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    pageRoot?.setAttribute("inert", "");
+    pageRoot?.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+
+    return () => {
+      pageRoot?.removeAttribute("inert");
+      pageRoot?.removeAttribute("aria-hidden");
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overflow = previousHtmlOverflow;
+    };
+  }, [tailoringBusy]);
 
   // Hydrate persisted Master CV / Profile after mount (kept out of the
   // initial useState so server- and first-client-render markup match), then
@@ -81,24 +244,30 @@ export default function Home() {
   // run a first search if nothing's cached yet.
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
-    const mCV = loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV);
-    const prof = sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE));
-    setMasterCV(mCV);
-    setProfile(prof);
-    setHydrated(true);
+    (async () => {
+      // Server (Vercel Blob) first — the durable copy that survives
+      // incognito/other browsers/devices; local storage is only a
+      // fallback for when the server copy is empty or unreachable.
+      const remote = await fetchStoredProfile();
+      const mCV = remote ? remote.masterCV : loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV);
+      const prof = remote ? sanitizeProfile(remote.profile) : sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE));
+      setMasterCV(mCV);
+      setProfile(prof);
+      setHydrated(true);
 
-    const cache = loadJSON<JobsCache | null>(JOBS_CACHE_KEY, null);
-    if (cache && cache.jobs?.length) {
-      if (cache.keyword) setKeyword(cache.keyword);
-      setSampleNote(cache.sampleNote);
-      setFetchedAt(cache.fetchedAt);
-      setSearched(true);
-      const scored = scoreJobs(cache.jobs, mCV);
-      setItemsSynced(scored);
-      setSelectedId(scored[0]?.job.id ?? null);
-    } else {
-      runSearch(mCV);
-    }
+      const cache = loadJSON<JobsCache | null>(JOBS_CACHE_KEY, null);
+      if (cache && cache.jobs?.length) {
+        if (cache.keyword) setKeyword(cache.keyword);
+        setSampleNote(cache.sampleNote);
+        setFetchedAt(cache.fetchedAt);
+        setSearched(true);
+        const scored = toBatchItems(cache.jobs, prof);
+        setItemsSynced(scored);
+        setSelectedId(scored[0]?.job.id ?? null);
+      } else {
+        runSearch(prof);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -123,13 +292,11 @@ export default function Home() {
     setItemsSynced(next);
   }
 
-  // Fetches jobs and scores every one instantly with the free heuristic
-  // scorer (no AI call) — real, AI-tailored CVs/cover letters are generated
-  // per-job, on demand, only when the user clicks "Tailor CV for this job"
-  // (see tailorJob below). Keeps this to one fetch that both the initial
-  // load and the explicit "Refresh listings" action can call.
-  async function runSearch(masterCVOverride?: string) {
-    const cv = masterCVOverride ?? masterCV;
+  // Fetches jobs — every one starts unanalyzed; real, AI-tailored CVs/cover
+  // letters (and their score) are generated per-job, on demand, only when
+  // the user clicks "Tailor CV for this job" (see tailorJob below). Keeps
+  // this to one fetch that both the initial load and "Refresh listings" call.
+  async function runSearch(profileForCache = profile) {
     setSearching(true);
     setSearched(true);
     setSelectedId(null);
@@ -155,7 +322,7 @@ export default function Home() {
 
     if (!jobs.length) return;
 
-    const scored = scoreJobs(jobs, cv);
+    const scored = toBatchItems(jobs, profileForCache);
     setItemsSynced(scored);
     setSelectedId(scored[0]?.job.id ?? null);
 
@@ -167,22 +334,66 @@ export default function Home() {
   // Runs the real, paid Claude call for exactly one job — only fired when
   // the user explicitly asks to tailor that specific vacancy, not for every
   // result in the list.
-  async function tailorJob(item: BatchItem) {
+  async function tailorJob(item: BatchItem, rewriteExisting = false) {
+    if (item.analysis && !rewriteExisting) {
+      setSelectedId(item.job.id);
+      setActionError(null);
+      return;
+    }
+
     const key = `tailor:${item.job.id}`;
     setBusy(key);
     setActionError(null);
+    // fetch() has no built-in timeout — if the serverless function hangs or
+    // is killed past its own maxDuration without a clean response, the
+    // request would otherwise sit as pending forever and the button would
+    // stay stuck on "Tailoring with Claude…" indefinitely.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 70_000);
     try {
+      // The photo can be a large base64 JPEG and is not used by Claude.
+      // Preserve the Profile shape while keeping it out of the request body.
+      const analysisProfile = { ...profile, photo: "" };
+      const analysisJob = {
+        id: item.job.id,
+        title: item.job.title,
+        company: item.job.company,
+        location: item.job.location,
+        description: item.job.description,
+      };
       const r = await fetch("/api/analyze", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ job: item.job, masterCV }),
+        body: JSON.stringify({ job: analysisJob, profile: analysisProfile }),
+        signal: controller.signal,
       });
-      if (!r.ok) throw new Error("Tailoring failed — try again.");
-      const analysis: Analysis = await r.json();
-      patchItem(item.job.id, { analysis, status: "done" });
+      const payload = await r.json().catch(() => null);
+      if (!r.ok) {
+        throw new Error(payload?.error || "Tailoring failed — try again.");
+      }
+      const analysis = payload as Analysis;
+      if (!analysis || analysis.demo) {
+        throw new Error(
+          analysis?.demoNote ||
+            "Live tailoring was unavailable. Your existing preview was left unchanged."
+        );
+      }
+
+      const tailoredAt = Date.now();
+      const completedItem: BatchItem = {
+        ...item,
+        analysis,
+        tailoredAt,
+        status: "done",
+      };
+      patchItem(item.job.id, { analysis, tailoredAt, status: "done" });
+      saveTailoredAnalysis(item.job, profile, analysis, tailoredAt);
+      setApplyItem(completedItem);
     } catch (e: any) {
-      setActionError(e?.message || "Tailoring failed — try again.");
+      const message = e?.name === "AbortError" ? "Tailoring timed out — try again." : e?.message;
+      setActionError(message || "Tailoring failed — try again.");
     } finally {
+      clearTimeout(timeout);
       setBusy((b) => (b === key ? null : b));
     }
   }
@@ -198,36 +409,33 @@ export default function Home() {
   }
 
   // Respects the user's preferred download format (Profile → CV Format):
-  // "both" generates PDF + DOCX as before, "pdf"/"docx" skip generating
-  // (and downloading) the format the user doesn't want.
-  async function downloadCVAndCoverLetter(item: BatchItem) {
+  // "both" prints (PDF, via the browser's native print-to-PDF) and
+  // downloads a .docx, "pdf"/"docx" only does its one. Used by the apply
+  // modal's standalone "Resume" button.
+  async function downloadCV(item: BatchItem) {
     if (!item.analysis) return;
-    const format = profile.cvFormat;
-    const cvDoc = buildCVDocument(profile, item.analysis.tailoredCV);
-    const letterDoc = buildCoverLetterDocument(profile, item.job, item.analysis.coverLetter);
-    const slug = fileSlug(item.job);
-    const files: { blob: Blob; filename: string }[] = [];
+    const key = `resume:${item.job.id}`;
+    setBusy(key);
+    try {
+      const format = profile.cvFormat;
+      const doc = buildCVDocument(profile, item.analysis.tailoredCV);
+      const slug = fileSlug(item.job);
 
-    if (format !== "docx") {
-      const { generateCVPdfBlob, generateCoverLetterPdfBlob } = await import("@/lib/pdf/generate");
-      const [cvPdf, letterPdf] = await Promise.all([
-        generateCVPdfBlob(cvDoc),
-        generateCoverLetterPdfBlob(letterDoc),
-      ]);
-      files.push({ blob: cvPdf, filename: `${slug}-CV.pdf` }, { blob: letterPdf, filename: `${slug}-CoverLetter.pdf` });
+      if (format !== "docx") {
+        if (!printReactDocument(<CvHtmlTemplate doc={doc} />, `${slug}-CV`)) {
+          setActionError("Your browser blocked the print window — allow pop-ups for this site and try again.");
+        }
+      }
+      if (format !== "pdf") {
+        const { buildCVDocxBlob } = await import("@/lib/docx/buildCVDocx");
+        await downloadBlobsStaggered([{ blob: await buildCVDocxBlob(doc), filename: `${slug}-CV.docx` }]);
+      }
+    } catch (error) {
+      console.error("Resume generation failed", error);
+      setActionError("Could not generate the resume. Refresh the page and try again.");
+    } finally {
+      setBusy((b) => (b === key ? null : b));
     }
-    if (format !== "pdf") {
-      const [{ buildCVDocxBlob }, { buildCoverLetterDocxBlob }] = await Promise.all([
-        import("@/lib/docx/buildCVDocx"),
-        import("@/lib/docx/buildCoverLetterDocx"),
-      ]);
-      const [cvDocx, letterDocx] = await Promise.all([
-        buildCVDocxBlob(cvDoc),
-        buildCoverLetterDocxBlob(letterDoc),
-      ]);
-      files.push({ blob: cvDocx, filename: `${slug}-CV.docx` }, { blob: letterDocx, filename: `${slug}-CoverLetter.docx` });
-    }
-    await downloadBlobsStaggered(files);
   }
 
   async function downloadCoverLetter(item: BatchItem) {
@@ -238,45 +446,33 @@ export default function Home() {
       const format = profile.cvFormat;
       const doc = buildCoverLetterDocument(profile, item.job, item.analysis.coverLetter);
       const slug = fileSlug(item.job);
-      const files: { blob: Blob; filename: string }[] = [];
 
       if (format !== "docx") {
-        const { generateCoverLetterPdfBlob } = await import("@/lib/pdf/generate");
-        files.push({ blob: await generateCoverLetterPdfBlob(doc), filename: `${slug}-CoverLetter.pdf` });
+        if (!printReactDocument(<CoverLetterHtmlTemplate doc={doc} />, `${slug}-CoverLetter`)) {
+          setActionError("Your browser blocked the print window — allow pop-ups for this site and try again.");
+        }
       }
       if (format !== "pdf") {
         const { buildCoverLetterDocxBlob } = await import("@/lib/docx/buildCoverLetterDocx");
-        files.push({ blob: await buildCoverLetterDocxBlob(doc), filename: `${slug}-CoverLetter.docx` });
+        await downloadBlobsStaggered([{ blob: await buildCoverLetterDocxBlob(doc), filename: `${slug}-CoverLetter.docx` }]);
       }
-      await downloadBlobsStaggered(files);
+    } catch (error) {
+      console.error("Cover-letter generation failed", error);
+      setActionError("Could not generate the cover letter. Refresh the page and try again.");
     } finally {
       setBusy((b) => (b === key ? null : b));
     }
   }
 
-  // "Apply with this CV" now opens a confirm-then-download-then-go modal
-  // instead of firing everything at once: confirm → download CV + cover
-  // letter → only then offer the link to the posting.
-  const [applyItem, setApplyItem] = useState<BatchItem | null>(null);
-  const [applyStage, setApplyStage] = useState<"confirm" | "downloading" | "ready">("confirm");
-
+  // "Apply with this CV" opens a modal with three independent actions —
+  // download the resume, download the cover letter, and open the posting —
+  // so the user can pick whichever they need instead of a forced sequence.
   function openApplyModal(item: BatchItem) {
     setApplyItem(item);
-    setApplyStage("confirm");
   }
 
   function closeApplyModal() {
     setApplyItem(null);
-  }
-
-  async function confirmApplyDownload() {
-    if (!applyItem) return;
-    setApplyStage("downloading");
-    try {
-      await downloadCVAndCoverLetter(applyItem);
-    } finally {
-      setApplyStage("ready");
-    }
   }
 
   function goToPosting() {
@@ -322,7 +518,9 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto max-w-6xl px-5 pb-24">
+    <>
+      {tailoringBusy && <TailoringOverlay />}
+      <main ref={pageRootRef} className="mx-auto max-w-6xl px-5 pb-24">
       {/* Header */}
       <header className="flex items-center justify-between py-6">
         <div className="flex items-center gap-1">
@@ -478,6 +676,7 @@ export default function Home() {
             actionError={actionError}
             onApply={openApplyModal}
             onTailor={tailorJob}
+            onRewrite={(item) => tailorJob(item, true)}
             onDownloadLetter={downloadCoverLetter}
           />
         </div>
@@ -486,12 +685,14 @@ export default function Home() {
       {/* Employer directory drawer */}
       {showEmployers && <EmployerDirectory onClose={() => setShowEmployers(false)} />}
 
-      {/* Apply flow: confirm → download CV + cover letter → go to posting */}
+      {/* Apply flow: download resume, download cover letter, open posting —
+          three independent actions instead of a forced sequence */}
       {applyItem && (
         <ApplyModal
           item={applyItem}
-          stage={applyStage}
-          onConfirm={confirmApplyDownload}
+          busy={busy}
+          onDownloadResume={downloadCV}
+          onDownloadCoverLetter={downloadCoverLetter}
           onGoToPosting={goToPosting}
           onClose={closeApplyModal}
           formatLabel={formatLabel}
@@ -501,11 +702,34 @@ export default function Home() {
       <footer className="mt-16 border-t border-line pt-5 text-center font-mono text-xs text-soft/70">
         JobHunter — jobs via JSearch (Google for Jobs), scoring + tailoring via Claude.
       </footer>
-    </main>
+      </main>
+    </>
   );
 }
 
 /* ---------- components ---------- */
+
+function TailoringOverlay() {
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex cursor-wait items-center justify-center bg-ink/85 p-5 backdrop-blur-sm"
+      role="status"
+      aria-live="assertive"
+      aria-label="Tailoring CV with Claude"
+    >
+      <div className="flex min-w-[260px] flex-col items-center rounded-2xl border border-line bg-surface px-8 py-7 text-center shadow-2xl">
+        <span
+          className="h-10 w-10 animate-spin rounded-full border-4 border-beacon/20 border-t-beacon"
+          aria-hidden="true"
+        />
+        <p className="mt-4 font-display text-base font-semibold text-bright">
+          Tailoring with Claude…
+        </p>
+        <p className="mt-1 text-xs text-soft">Please wait while your CV is prepared.</p>
+      </div>
+    </div>
+  );
+}
 
 function Field({
   label,
@@ -651,7 +875,7 @@ function JobCard({
   active: boolean;
   onSelect: () => void;
 }) {
-  const { job, analysis, status } = item;
+  const { job, analysis } = item;
   return (
     <article
       onClick={onSelect}
@@ -678,16 +902,12 @@ function JobCard({
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
+        {analysis && (
+          <span className="rounded-md border border-good/30 bg-good/10 px-2 py-0.5 font-mono text-xs text-good">
+            CV tailored
+          </span>
+        )}
         {analysis && <TierBadge tier={analysis.tier} label={analysis.tierLabel} />}
-        {status === "pending" && (
-          <span className="font-mono text-xs text-soft/60">Queued…</span>
-        )}
-        {status === "analyzing" && (
-          <span className="font-mono text-xs text-beacon">Analyzing…</span>
-        )}
-        {status === "error" && (
-          <span className="font-mono text-xs text-weak">Analysis failed</span>
-        )}
         {job.salary && (
           <span className="rounded-md border border-good/30 bg-good/10 px-2 py-0.5 font-mono text-xs text-good">
             {job.salary}
@@ -727,6 +947,7 @@ function AnalysisPanel({
   actionError,
   onApply,
   onTailor,
+  onRewrite,
   onDownloadLetter,
 }: {
   item: BatchItem | null;
@@ -740,6 +961,7 @@ function AnalysisPanel({
   actionError: string | null;
   onApply: (item: BatchItem) => void;
   onTailor: (item: BatchItem) => void;
+  onRewrite: (item: BatchItem) => void;
   onDownloadLetter: (item: BatchItem) => void;
 }) {
   if (!item) {
@@ -754,7 +976,8 @@ function AnalysisPanel({
     );
   }
 
-  const { job, analysis, status, error } = item;
+  const { job, analysis } = item;
+  const tailoring = busy === `tailor:${job.id}`;
 
   return (
     <div className="rounded-2xl border border-line bg-surface p-5">
@@ -766,35 +989,59 @@ function AnalysisPanel({
       </h2>
       <p className="text-sm text-soft">{job.company}</p>
 
-      {(status === "pending" || status === "analyzing") && (
-        <div className="mt-6 flex items-center gap-3 text-soft">
-          <span className="relative flex h-2.5 w-2.5">
-            <span className="absolute inline-flex h-full w-full rounded-full bg-beacon animate-pulseDot" />
-            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-beacon" />
-          </span>
-          Reading the description, scoring fit, tailoring your CV…
+      {!analysis && (
+        <div className="mt-6">
+          <p className="text-sm leading-relaxed text-soft">
+            No score yet — run the real tailoring pass to see how this role actually matches your
+            background.
+          </p>
+          <button
+            onClick={() => onTailor(item)}
+            disabled={tailoring}
+            aria-busy={tailoring}
+            className="mt-4 inline-flex items-center gap-2 rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105 disabled:opacity-60"
+          >
+            {tailoring && (
+              <span
+                className="h-4 w-4 animate-spin rounded-full border-2 border-ink/25 border-t-ink"
+                aria-hidden="true"
+              />
+            )}
+            <span>
+              {tailoring ? "Tailoring with Claude…" : "Tailor CV for this job"}
+            </span>
+          </button>
+          <p className="mt-2 font-mono text-[10px] text-soft/60">
+            Runs one AI call to generate a precise, truthful CV, cover letter, and gap analysis for
+            this specific role.
+          </p>
         </div>
       )}
 
-      {status === "error" && (
-        <div className="mt-6 rounded-lg border border-weak/30 bg-weak/10 p-4 text-sm text-weak">
-          {error || "Analysis failed."}
-        </div>
-      )}
-
-      {analysis && status === "done" && (
+      {analysis && (
         <div className="mt-5">
-          {analysis.demo && (
-            <div className="d-none mb-4 rounded-lg border border-beacon/30 bg-beacon/10 px-3 py-2.5">
-              <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-beacon">
-                Simulated demo
-              </div>
-              <p className="mt-1 text-xs leading-relaxed text-soft">
-                {analysis.demoNote || "Preview output generated without an AI API call."}
-                {" "}Verify and edit before using it in an application.
+          <div className="mb-5 flex flex-col gap-3 rounded-lg border border-good/30 bg-good/10 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium text-good">
+                CV already tailored for this job
+              </p>
+              <p className="mt-0.5 font-mono text-[10px] text-soft">
+                Its saved analysis and documents are shown below
+                {Number.isFinite(item.tailoredAt)
+                  ? ` · tailored ${timeAgo(item.tailoredAt as number)}`
+                  : "."}
               </p>
             </div>
-          )}
+            <button
+              type="button"
+              onClick={() => onRewrite(item)}
+              disabled={tailoring}
+              className="shrink-0 rounded-md border border-good/40 px-3 py-1.5 font-mono text-[11px] text-good transition hover:bg-good/10 disabled:cursor-wait disabled:opacity-60"
+            >
+              {tailoring ? "Rewriting…" : "Rewrite CV again"}
+            </button>
+          </div>
+
           <div className="flex items-center gap-5">
             <ScoreRing score={analysis.score} />
             <div>
@@ -817,15 +1064,6 @@ function AnalysisPanel({
                 </li>
               ))}
             </ul>
-          )}
-
-          {analysis.gapAnalysis && (
-            <div className="mt-4 rounded-lg border border-line bg-ink/60 p-3">
-              <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">
-                Gap analysis
-              </div>
-              <p className="mt-1 text-sm leading-relaxed text-soft">{analysis.gapAnalysis}</p>
-            </div>
           )}
 
           {/* Tabs */}
@@ -886,36 +1124,18 @@ function AnalysisPanel({
             </details>
           )}
 
-          {analysis.demo ? (
-            <>
-              <button
-                onClick={() => onTailor(item)}
-                disabled={busy === `tailor:${job.id}`}
-                className="mt-4 inline-block rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105 disabled:opacity-60"
-              >
-                {busy === `tailor:${job.id}` ? "Tailoring with Claude…" : "Tailor CV for this job"}
-              </button>
-              <p className="mt-2 font-mono text-[10px] text-soft/60">
-                Runs one AI call to generate a precise, truthful CV, cover letter, and gap analysis
-                for this specific role.
-              </p>
-            </>
-          ) : (
-            <>
-              <button
-                onClick={() => onApply(item)}
-                className="mt-4 inline-block rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105"
-              >
-                Apply with this CV ↗
-              </button>
-              <p className="mt-2 font-mono text-[10px] text-soft/60">
-                Downloads a ready-to-attach CV + cover letter ({formatLabel}), then takes you to the posting.
-              </p>
-            </>
-          )}
-          {actionError && <p className="mt-2 text-xs text-weak">{actionError}</p>}
+          <button
+            onClick={() => onApply(item)}
+            className="mt-4 inline-block rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105"
+          >
+            Apply with this CV ↗
+          </button>
+          <p className="mt-2 font-mono text-[10px] text-soft/60">
+            Download your tailored resume, cover letter ({formatLabel}), and open the job posting.
+          </p>
         </div>
       )}
+      {actionError && <p className="mt-2 text-xs text-weak">{actionError}</p>}
     </div>
   );
 }
@@ -924,10 +1144,18 @@ function TailoredCVPreview({ cv }: { cv: TailoredCVContent }) {
   return (
     <div className="space-y-4">
       {cv.summary && (
-        <div>
-          <div className="font-mono text-[10px] uppercase tracking-[0.15em] text-soft">Summary</div>
-          <p className="mt-1">{cv.summary}</p>
-        </div>
+        <details className="group rounded-lg border border-line bg-surface/40">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 font-mono text-[10px] uppercase tracking-[0.15em] text-soft [&::-webkit-details-marker]:hidden">
+            <span>Summary</span>
+            <span
+              className="text-sm leading-none transition-transform group-open:rotate-180"
+              aria-hidden="true"
+            >
+             ⌄
+            </span>
+          </summary>
+          <p className="px-3 pb-3">{cv.summary}</p>
+        </details>
       )}
       {cv.skills.length > 0 && (
         <div>
@@ -1016,89 +1244,97 @@ function ScoreRing({ score, idle }: { score: number; idle?: boolean }) {
   );
 }
 
+function DownloadIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 3v12" />
+      <path d="m7 10 5 5 5-5" />
+      <path d="M4 21h16" />
+    </svg>
+  );
+}
+
+function ExternalLinkIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M7 17 17 7" />
+      <path d="M9 7h8v8" />
+    </svg>
+  );
+}
+
 function ApplyModal({
   item,
-  stage,
-  onConfirm,
+  busy,
+  onDownloadResume,
+  onDownloadCoverLetter,
   onGoToPosting,
   onClose,
   formatLabel,
 }: {
   item: BatchItem;
-  stage: "confirm" | "downloading" | "ready";
-  onConfirm: () => void;
+  busy: string | null;
+  onDownloadResume: (item: BatchItem) => void;
+  onDownloadCoverLetter: (item: BatchItem) => void;
   onGoToPosting: () => void;
   onClose: () => void;
   formatLabel: string;
 }) {
   const { job } = item;
+  const resumeBusy = busy === `resume:${job.id}`;
+  const letterBusy = busy === `letter:${job.id}`;
+
   return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4"
-      onClick={stage === "downloading" ? undefined : onClose}
-    >
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
       <div
-        className="w-full max-w-sm rounded-2xl border border-line bg-surface p-5"
+        className="w-full max-w-md rounded-2xl border border-line bg-surface p-5"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="font-display text-base font-semibold leading-snug text-bright">{job.title}</h3>
-        <p className="text-sm text-soft">{job.company}</p>
-
-        {stage === "confirm" && (
-          <>
-            <p className="mt-4 text-sm leading-relaxed text-soft">
-              This downloads a tailored CV and cover letter ({formatLabel}) for this role. Once they're
-              ready, you'll get a link to the posting to apply.
-            </p>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                onClick={onClose}
-                className="rounded-lg border border-line px-3.5 py-2 text-sm text-soft transition hover:text-bright"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={onConfirm}
-                className="rounded-lg bg-beacon px-3.5 py-2 text-sm font-medium text-ink transition hover:brightness-105"
-              >
-                Download CV + Cover Letter
-              </button>
-            </div>
-          </>
-        )}
-
-        {stage === "downloading" && (
-          <div className="mt-5 flex items-center gap-3 text-soft">
-            <span className="relative flex h-2.5 w-2.5 shrink-0">
-              <span className="absolute inline-flex h-full w-full rounded-full bg-beacon animate-pulseDot" />
-              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-beacon" />
-            </span>
-            <p className="text-sm">Preparing your CV and cover letter…</p>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="font-display text-base font-semibold leading-snug text-bright">{job.title}</h3>
+            <p className="text-sm text-soft">{job.company}</p>
           </div>
-        )}
+          <button
+            onClick={onClose}
+            className="shrink-0 text-soft transition hover:text-bright"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
 
-        {stage === "ready" && (
-          <>
-            <p className="mt-4 text-sm leading-relaxed text-soft">
-              Your CV and cover letter have been downloaded — check your Downloads folder. Ready to
-              apply?
-            </p>
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                onClick={onClose}
-                className="rounded-lg border border-line px-3.5 py-2 text-sm text-soft transition hover:text-bright"
-              >
-                Close
-              </button>
-              <button
-                onClick={onGoToPosting}
-                className="rounded-lg bg-beacon px-3.5 py-2 text-sm font-medium text-ink transition hover:brightness-105"
-              >
-                Go to job posting ↗
-              </button>
-            </div>
-          </>
-        )}
+        <p className="mt-4 text-sm leading-relaxed text-soft">
+          Download the tailored resume and cover letter for this role, then open the posting to apply.
+        </p>
+
+        <div className="mt-5 grid grid-cols-3 gap-2">
+          <button
+            onClick={() => onDownloadResume(item)}
+            disabled={resumeBusy}
+            className="flex justify-center flex-row items-center gap-1.5 rounded-lg border border-line px-2 py-3 text-xs text-soft transition hover:border-beacon/60 hover:text-bright disabled:opacity-50"
+          >
+            {resumeBusy ? "Preparing…" : "Resume"}
+            <DownloadIcon />
+          </button>
+          <button
+            onClick={() => onDownloadCoverLetter(item)}
+            disabled={letterBusy}
+            className="flex justify-center flex-row items-center gap-1.5 rounded-lg border border-line px-2 py-3 text-xs text-soft transition hover:border-beacon/60 hover:text-bright disabled:opacity-50"
+          >
+            {letterBusy ? "Preparing…" : "Cover Letter"}
+            <DownloadIcon />
+          </button>
+          <button
+            onClick={onGoToPosting}
+            disabled={!job.applyLink}
+            className="flex justify-center flex-row items-center gap-1.5 rounded-lg bg-beacon px-2 py-3 text-xs font-medium text-ink transition hover:brightness-105 disabled:opacity-50"
+          >
+            Job Post
+            <ExternalLinkIcon />
+          </button>
+        </div>
+        <p className="mt-3 text-center font-mono text-[10px] text-soft/60">Downloads as {formatLabel}.</p>
       </div>
     </div>
   );
@@ -1164,4 +1400,3 @@ function EmployerDirectory({ onClose }: { onClose: () => void }) {
     </div>
   );
 }
-

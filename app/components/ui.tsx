@@ -187,7 +187,7 @@ export function ConfirmDialog({
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" onClick={onCancel}>
       <div
-        className="w-full max-w-sm rounded-2xl border border-line bg-surface p-5"
+        className="w-full max-w-md rounded-2xl border border-line bg-surface p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="font-display text-base font-semibold text-bright">{title}</h3>

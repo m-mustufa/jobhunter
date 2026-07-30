@@ -54,6 +54,14 @@ export function buildMasterCVMarkdown(profile: Profile): string {
     lines.push("## Education", profile.education.join("\n"), "");
   }
 
+  if (profile.certifications.length) {
+    lines.push("## Certifications", profile.certifications.join("\n"), "");
+  }
+
+  if (profile.languages.length) {
+    lines.push("## Languages", profile.languages.join("\n"), "");
+  }
+
   return lines.join("\n").trim() + "\n";
 }
 

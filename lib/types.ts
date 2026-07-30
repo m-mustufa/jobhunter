@@ -51,6 +51,8 @@ export interface Profile {
   skills: string[];
   experience: ExperienceEntry[];
   education: string[];
+  certifications: string[];
+  languages: string[];
 }
 
 export interface Analysis {
@@ -61,7 +63,6 @@ export interface Analysis {
   reasons: string[];
   tailoredCV: TailoredCVContent;
   coverLetter: string;
-  gapAnalysis: string;
   auditTrail: AuditTrailEntry[];
   demo?: boolean;
   demoNote?: string;
@@ -70,6 +71,7 @@ export interface Analysis {
 export interface BatchItem {
   job: Job;
   analysis?: Analysis;
+  tailoredAt?: number;
   status: "pending" | "analyzing" | "done" | "error";
   error?: string;
 }

@@ -12,21 +12,25 @@ export function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
-// Downscales to at most `maxDim` on the longest side and re-encodes as
-// JPEG, regardless of the source format or resolution.
+// Center-crops to a square and downscales to `maxDim`, re-encoded as JPEG.
+// Cropping to square (not just downscaling) matters here specifically
+// because the CV templates place this photo in a fixed circular/square
+// frame with no object-fit — a non-square source would otherwise be
+// stretched to fit instead of cropped.
 export function resizeImageDataUrl(dataUrl: string, maxDim = 480, quality = 0.85): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-      const w = Math.max(1, Math.round(img.width * scale));
-      const h = Math.max(1, Math.round(img.height * scale));
+      const side = Math.min(img.width, img.height);
+      const sx = (img.width - side) / 2;
+      const sy = (img.height - side) / 2;
+      const out = Math.min(maxDim, side);
       const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
+      canvas.width = out;
+      canvas.height = out;
       const ctx = canvas.getContext("2d");
       if (!ctx) return reject(new Error("Canvas not supported."));
-      ctx.drawImage(img, 0, 0, w, h);
+      ctx.drawImage(img, sx, sy, side, side, 0, 0, out, out);
       resolve(canvas.toDataURL("image/jpeg", quality));
     };
     img.onerror = () => reject(new Error("Could not load that image."));

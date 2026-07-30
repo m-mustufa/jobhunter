@@ -2,6 +2,62 @@ import { Profile } from "./types";
 
 const VALID_CV_FORMATS: Profile["cvFormat"][] = ["pdf", "docx", "both"];
 
+export const IMMUTABLE_EXPERIENCE_COMPANY_NAMES = [
+  "Data Managment Team - Technical Center",
+  "Data Managment Team - Upper Zakum FD",
+  "UZFDRTS - DM",
+] as const;
+
+const IMMUTABLE_COMPANY_ALIASES = [
+  {
+    canonical: IMMUTABLE_EXPERIENCE_COMPANY_NAMES[0],
+    aliases: [
+      "Data Managment Team - Technical Center",
+      "Data Management Team - Technical Center",
+    ],
+  },
+  {
+    canonical: IMMUTABLE_EXPERIENCE_COMPANY_NAMES[1],
+    aliases: [
+      "Data Managment Team - Upper Zakum FD",
+      "Data Management Team - Upper Zakum FD",
+    ],
+  },
+  {
+    canonical: IMMUTABLE_EXPERIENCE_COMPANY_NAMES[2],
+    aliases: ["UZFDRTS - DM"],
+  },
+] as const;
+
+function companyNameKey(value: string): string {
+  return value
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\s*-\s*/g, " - ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function canonicalizeExperienceCompanyName(value: unknown): string {
+  const original = typeof value === "string" ? value.trim() : "";
+  const key = companyNameKey(original);
+
+  for (const entry of IMMUTABLE_COMPANY_ALIASES) {
+    for (const alias of entry.aliases) {
+      const aliasKey = companyNameKey(alias);
+      const knownKeys = [
+        aliasKey,
+        `adnoc - ${aliasKey}`,
+        `adnoc offshore - ${aliasKey}`,
+      ];
+      if (knownKeys.includes(key)) {
+        return entry.canonical;
+      }
+    }
+  }
+  return original;
+}
+
 // Coerces an arbitrary value (an API response, or something read back from
 // localStorage) into a fully-valid Profile — every array field guaranteed
 // to be an array, every string field guaranteed to be a string. Needed
@@ -23,13 +79,15 @@ export function sanitizeProfile(raw: any): Profile {
     skills: Array.isArray(raw?.skills) ? raw.skills.map(String) : [],
     experience: Array.isArray(raw?.experience)
       ? raw.experience.map((e: any) => ({
-          company: typeof e?.company === "string" ? e.company : "",
+          company: canonicalizeExperienceCompanyName(e?.company),
           role: typeof e?.role === "string" ? e.role : "",
           dates: typeof e?.dates === "string" ? e.dates : "",
           bullets: Array.isArray(e?.bullets) ? e.bullets.map(String) : [],
         }))
       : [],
     education: Array.isArray(raw?.education) ? raw.education.map(String) : [],
+    certifications: Array.isArray(raw?.certifications) ? raw.certifications.map(String) : [],
+    languages: Array.isArray(raw?.languages) ? raw.languages.map(String) : [],
   };
 }
 
@@ -98,4 +156,6 @@ export const DEFAULT_PROFILE: Profile = {
     },
   ],
   education: ["Started as a UI intern in 2014; grew into senior full-stack work over a decade."],
+  certifications: [],
+  languages: ["English (Fluent)"],
 };

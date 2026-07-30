@@ -1,11 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ExperienceEntry, Profile } from "@/lib/types";
 import { DEFAULT_PROFILE, sanitizeProfile } from "@/lib/profile";
 import { DEFAULT_MASTER_CV, buildMasterCVMarkdown } from "@/lib/masterCV";
 import { loadJSON, saveJSON, MASTER_CV_KEY, PROFILE_KEY } from "@/lib/persist";
+import { fetchStoredProfile, pushStoredProfile } from "@/lib/profileStore";
 import { fileToDataUrl, resizeImageDataUrl } from "@/lib/image";
 import { TabBtn, TextField, TextAreaField, ListField, ConfirmDialog, Toast } from "@/app/components/ui";
 
@@ -16,26 +17,63 @@ export default function ProfilePage() {
   const [pendingImport, setPendingImport] = useState<File | null>(null);
   const [importing, setImporting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [photoBusy, setPhotoBusy] = useState(false);
   const [resumeFileName, setResumeFileName] = useState<string | null>(null);
 
-  // Same hydrate-then-gate-on-`hydrated` pattern as app/page.tsx, so a
-  // save effect firing on the very first (pre-hydration) render can't
-  // clobber what's actually in storage.
+  // Server (Vercel Blob, via /api/profile) is now the source of truth — it
+  // survives incognito windows and other browsers/devices, which
+  // localStorage structurally can't. Load order: server first; if that's
+  // empty/unreachable, fall back to this browser's local copy; if that's
+  // empty too, DEFAULT_PROFILE. localStorage stays populated afterward
+  // purely as a fast local cache/offline fallback, not the authority.
   const [hydrated, setHydrated] = useState(false);
   useEffect(() => {
-    setProfile(sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE)));
-    setMasterCV(loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV));
-    setHydrated(true);
+    (async () => {
+      const remote = await fetchStoredProfile();
+      if (remote) {
+        setProfile(sanitizeProfile(remote.profile));
+        setMasterCV(remote.masterCV);
+      } else {
+        setProfile(sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE)));
+        setMasterCV(loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV));
+      }
+      setHydrated(true);
+    })();
   }, []);
 
+  // Debounced so rapid edits (typing) coalesce into one save + one status
+  // message instead of firing on every keystroke. Skips announcing the very
+  // first run after hydration — that one is just re-saving what was just
+  // loaded, not a real edit — but still performs it so a genuinely failed
+  // write is caught immediately rather than only surfacing later. Saves to
+  // both the server (durable) and localStorage (fast local cache); the
+  // server outcome drives the status message since that's the copy that
+  // actually needs to survive.
+  const justHydratedRef = useRef(true);
   useEffect(() => {
-    if (hydrated) saveJSON(PROFILE_KEY, profile);
-  }, [profile, hydrated]);
-  useEffect(() => {
-    if (hydrated) saveJSON(MASTER_CV_KEY, masterCV);
-  }, [masterCV, hydrated]);
+    if (!hydrated) return;
+    const t = setTimeout(async () => {
+      saveJSON(PROFILE_KEY, profile);
+      saveJSON(MASTER_CV_KEY, masterCV);
+      const remoteOk = await pushStoredProfile({ profile, masterCV });
+
+      if (justHydratedRef.current) {
+        justHydratedRef.current = false;
+        return;
+      }
+      if (remoteOk) {
+        setSaveError(null);
+        setToast("Saved");
+      } else {
+        setSaveError(
+          "Couldn't save to the server — your changes are only in this browser for now and won't survive incognito/another device. Check your connection and Vercel Blob setup, then try editing again."
+        );
+      }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [profile, masterCV, hydrated]);
 
   useEffect(() => {
     if (!toast) return;
@@ -143,7 +181,14 @@ export default function ProfilePage() {
         </TabBtn>
       </div>
 
-      {tab === "profile" ? (
+      {!hydrated ? (
+        // Gated on the async server fetch resolving — editing before this
+        // completes and loses the race would otherwise get silently
+        // overwritten the moment the (older) server copy arrives.
+        <div className="mt-5 rounded-2xl border border-line bg-surface p-8 text-center text-soft">
+          Loading your profile…
+        </div>
+      ) : tab === "profile" ? (
         <div className="mt-5 space-y-6">
           <div className="rounded-2xl border border-line bg-surface p-5">
             <div className="grid gap-5 sm:grid-cols-[auto_1fr_auto]">
@@ -334,6 +379,26 @@ export default function ProfilePage() {
               />
             </div>
           </div>
+
+          <div className="rounded-2xl border border-line bg-surface p-5">
+            <h2 className="font-display text-sm font-semibold text-bright">Certifications & Languages</h2>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <ListField
+                label="Certifications"
+                items={profile.certifications}
+                onChange={(certifications) => updateField("certifications", certifications)}
+                placeholder="e.g. PMP, NEBOSH"
+                addLabel="+ Add certification"
+              />
+              <ListField
+                label="Languages"
+                items={profile.languages}
+                onChange={(languages) => updateField("languages", languages)}
+                placeholder="e.g. Arabic (Fluent)"
+                addLabel="+ Add language"
+              />
+            </div>
+          </div>
         </div>
       ) : (
         <div className="mt-5 rounded-2xl border border-line bg-surface p-5">
@@ -365,6 +430,20 @@ export default function ProfilePage() {
       )}
 
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}
+      {saveError && (
+        <div className="fixed bottom-20 right-5 z-[70] max-w-sm animate-fadeIn rounded-lg border border-weak/40 bg-weak/10 px-4 py-3 shadow-lg shadow-black/40">
+          <div className="flex items-start gap-3">
+            <p className="text-sm leading-relaxed text-weak">{saveError}</p>
+            <button
+              onClick={() => setSaveError(null)}
+              className="shrink-0 text-weak/80 transition hover:text-weak"
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

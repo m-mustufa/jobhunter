@@ -6,6 +6,7 @@
 export const MASTER_CV_KEY = "jobhunter:masterCV";
 export const PROFILE_KEY = "jobhunter:profile";
 export const JOBS_CACHE_KEY = "jobhunter:jobsCache";
+export const TAILORED_ANALYSES_KEY = "jobhunter:tailoredAnalyses:v1";
 
 export function loadJSON<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -17,11 +18,18 @@ export function loadJSON<T>(key: string, fallback: T): T {
   }
 }
 
-export function saveJSON(key: string, value: unknown) {
-  if (typeof window === "undefined") return;
+// Returns whether the write actually succeeded — callers that need the user
+// to know about data loss (e.g. the Profile page) should check this instead
+// of assuming a save always works. Quota-exceeded and private-browsing
+// failures throw synchronously from setItem, so this is the only place that
+// can detect them.
+export function saveJSON(key: string, value: unknown): boolean {
+  if (typeof window === "undefined") return false;
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Storage full or unavailable (private browsing) — not critical, skip.
+    return true;
+  } catch (err) {
+    console.error(`saveJSON: failed to write "${key}"`, err);
+    return false;
   }
 }

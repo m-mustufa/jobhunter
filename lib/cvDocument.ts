@@ -1,4 +1,5 @@
 import { ExperienceEntry, Job, Profile, TailoredCVContent } from "./types";
+import { canonicalizeExperienceCompanyName } from "./profile";
 
 export interface CVDocument {
   profile: Profile;
@@ -16,7 +17,10 @@ export function buildCVDocument(profile: Profile, tailored: TailoredCVContent): 
     profile,
     summary: tailored.summary,
     skills: tailored.skills,
-    experience: tailored.experience,
+    experience: tailored.experience.map((entry) => ({
+      ...entry,
+      company: canonicalizeExperienceCompanyName(entry.company),
+    })),
     education: tailored.education,
   };
 }
@@ -40,7 +44,8 @@ export function serializeCVText(profile: Profile, tailored: TailoredCVContent): 
   if (tailored.experience.length) {
     lines.push("EXPERIENCE");
     for (const e of tailored.experience) {
-      lines.push([e.role, e.company].filter(Boolean).join(" — ") + (e.dates ? ` (${e.dates})` : ""));
+      const company = canonicalizeExperienceCompanyName(e.company);
+      lines.push([e.role, company].filter(Boolean).join(" — ") + (e.dates ? ` (${e.dates})` : ""));
       for (const b of e.bullets) lines.push(`- ${b}`);
       lines.push("");
     }
