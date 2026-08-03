@@ -5,7 +5,10 @@ import { getMatchTier } from "./matchTier";
 import { canonicalizeExperienceCompanyName, sanitizeProfile } from "./profile";
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
-const TRANSIENT_PROVIDER_STATUSES = new Set([500, 502, 503, 529]);
+// 429 (rate-limited) is retried too, not just 5xx/529 — a rate-limit
+// response is exactly the kind of transient condition retrying resolves,
+// and previously it went straight to failure with no retry at all.
+const TRANSIENT_PROVIDER_STATUSES = new Set([429, 500, 502, 503, 529]);
 const SUMMARY_MIN_CHARS = 1050;
 const SUMMARY_MAX_CHARS = 1100;
 const MODEL_PERFORMANCE_OPTIONS = MODEL.startsWith("claude-sonnet-5")
@@ -98,7 +101,7 @@ Do the following and return a single JSON object with exactly these keys:
   "experienceRewrites": [
     {
       "company": "<copy one employer label exactly as listed above; never prepend, expand, translate, or correct it>",
-      "role": "<optional concise, truthful rephrasing of that employer's existing position using only the original role and documented duties; use an empty string to keep it unchanged>",
+      "role": "<optional concise, truthful rephrasing of that employer's existing position, replacing it entirely — never combine, append, or slash-join the original and new title together; use an empty string to keep the original role text unchanged>",
       "bulletsToRewrite": [<0-based indices for no more than 2 of that employer's bullets, choosing only the bullets most relevant to this job>],
       "rewrittenBullets": ["<replacement text for each index above, same order, same count>"]
     }
@@ -207,6 +210,19 @@ function ensureTailoredSummaryLength(summary: unknown, profile: Profile): string
   return fitted;
 }
 
+// Occasionally the model ignores the "replace, don't combine" instruction
+// and glues the original role onto the new one — sometimes verbatim
+// ("Senior HSE Engineer / HSE Systems Lead"), sometimes with the original
+// paraphrased too ("HSE Engineer / Safety Systems Lead", dropping
+// "Senior"), in whatever order/separator it picks that call. A verbatim
+// substring check misses the paraphrased case, so instead reject any
+// rewrite containing a combining character at all — a genuine single job
+// title essentially never needs "/", "(", or ")", and the prompt already
+// tells the model never to combine titles that way.
+function isCleanRoleRewrite(rewrittenRole: string): boolean {
+  return !/[/()]/.test(rewrittenRole);
+}
+
 // Applies the model's chosen bullet rewrites onto a verbatim copy of the
 // candidate's real experience — company/role/dates/bullet-count/order can
 // never change here, only the text of specifically-indexed bullets.
@@ -214,15 +230,15 @@ function applyExperienceRewrites(profile: Profile, raw: any): TailoredCVContent[
   const rewrites: ExperienceRewrite[] = Array.isArray(raw?.experienceRewrites)
     ? raw.experienceRewrites
         .filter((r: any) => typeof r?.company === "string")
-        .map((r: any) => ({
-          company: canonicalizeExperienceCompanyName(r.company),
-          role:
-            typeof r?.role === "string"
-              ? r.role.replace(/\s+/g, " ").trim().slice(0, 120)
-              : "",
-          bulletsToRewrite: Array.isArray(r?.bulletsToRewrite) ? r.bulletsToRewrite.map(Number) : [],
-          rewrittenBullets: Array.isArray(r?.rewrittenBullets) ? r.rewrittenBullets.map(String) : [],
-        }))
+        .map((r: any) => {
+          const rawRole = typeof r?.role === "string" ? r.role.replace(/\s+/g, " ").trim().slice(0, 120) : "";
+          return {
+            company: canonicalizeExperienceCompanyName(r.company),
+            role: rawRole && isCleanRoleRewrite(rawRole) ? rawRole : "",
+            bulletsToRewrite: Array.isArray(r?.bulletsToRewrite) ? r.bulletsToRewrite.map(Number) : [],
+            rewrittenBullets: Array.isArray(r?.rewrittenBullets) ? r.rewrittenBullets.map(String) : [],
+          };
+        })
     : [];
 
   return profile.experience.map((entry) => {
@@ -323,7 +339,10 @@ export async function analyzeJobForCandidate(
     const timeout = setTimeout(() => controller.abort(), 50_000);
     let r: Response | null = null;
     try {
-      for (let attempt = 0; attempt < 2; attempt++) {
+      // 3 attempts, not 2 — a rate-limit/5xx response comes back fast (not
+      // after a full generation), so the extra attempt costs little time
+      // but meaningfully improves resilience against transient blips.
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
           r = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
@@ -342,14 +361,14 @@ export async function analyzeJobForCandidate(
             signal: controller.signal,
           });
         } catch (error: any) {
-          if (attempt === 0 && error?.name !== "AbortError") {
+          if (attempt < 2 && error?.name !== "AbortError") {
             await new Promise((resolve) => setTimeout(resolve, 500));
             continue;
           }
           throw error;
         }
 
-        if (r.ok || attempt === 1 || !TRANSIENT_PROVIDER_STATUSES.has(r.status)) break;
+        if (r.ok || attempt === 2 || !TRANSIENT_PROVIDER_STATUSES.has(r.status)) break;
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
     } finally {
