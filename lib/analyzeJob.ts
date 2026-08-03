@@ -379,6 +379,17 @@ export async function analyzeJobForCandidate(
       const providerStatus = r?.status || 502;
       const providerDetail = r ? (await r.text()).slice(0, 500) : "No response";
       console.error("Claude tailoring request failed", providerStatus, providerDetail);
+
+      // A billing/credit failure isn't transient — "try again" is actively
+      // misleading here, since retrying can't fix it. Surface the real cause
+      // so whoever's watching knows to add credit rather than keep clicking.
+      if (providerStatus === 400 && /credit balance is too low/i.test(providerDetail)) {
+        throw new LiveAnalysisError(
+          "The AI service has run out of credit. Add credit in the Anthropic Console (Plans & Billing), then try again.",
+          402
+        );
+      }
+
       throw new LiveAnalysisError("Live tailoring is temporarily unavailable. Please try again.", 502);
     }
 
