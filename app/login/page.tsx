@@ -40,7 +40,7 @@ export default function LoginPage() {
             <span className="absolute inline-flex h-full w-full rounded-full bg-beacon animate-pulseDot" />
             <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-beacon" />
           </span>
-          <div className="font-display text-lg font-semibold tracking-tight text-bright">
+          <div className="font-display text-xl font-semibold tracking-tight text-bright">
             Job<span className="text-beacon">Hunter</span>
           </div>
         </div>

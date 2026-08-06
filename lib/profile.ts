@@ -1,6 +1,16 @@
 import { Profile } from "./types";
 
 const VALID_CV_FORMATS: Profile["cvFormat"][] = ["pdf", "docx", "both"];
+// Kept as a plain literal (not imported from lib/pdf/cvTemplates.ts) so this
+// module doesn't pull React CV-template components into every place that
+// imports sanitizeProfile — an unknown/stale value here just falls back to
+// the default template at render time regardless.
+export const DEFAULT_CV_TEMPLATE = "sidebar-v1";
+// "sidebar-blue-v1" (Template 2) is temporarily hidden from selection — see
+// lib/pdf/cvTemplates.ts. Left out here too so any profile that already has
+// it saved self-heals back to the default on next load instead of silently
+// rendering a template the UI no longer offers.
+const VALID_CV_TEMPLATES = ["sidebar-v1"];
 
 export const IMMUTABLE_EXPERIENCE_COMPANY_NAMES = [
   "Data Managment Team - Technical Center",
@@ -75,6 +85,14 @@ export function sanitizeProfile(raw: any): Profile {
     links: Array.isArray(raw?.links) ? raw.links.map(String) : [],
     photo: typeof raw?.photo === "string" ? raw.photo : "",
     cvFormat: VALID_CV_FORMATS.includes(raw?.cvFormat) ? raw.cvFormat : "both",
+    cvTemplate: VALID_CV_TEMPLATES.includes(raw?.cvTemplate) ? raw.cvTemplate : DEFAULT_CV_TEMPLATE,
+    resumeFile:
+      raw?.resumeFile &&
+      typeof raw.resumeFile.name === "string" &&
+      typeof raw.resumeFile.type === "string" &&
+      typeof raw.resumeFile.dataUrl === "string"
+        ? { name: raw.resumeFile.name, type: raw.resumeFile.type, dataUrl: raw.resumeFile.dataUrl }
+        : null,
     summary: typeof raw?.summary === "string" ? raw.summary : "",
     skills: Array.isArray(raw?.skills) ? raw.skills.map(String) : [],
     experience: Array.isArray(raw?.experience)
@@ -103,6 +121,8 @@ export const DEFAULT_PROFILE: Profile = {
   links: ["mustcode.netlify.app", "linkedin.com/in/muhammad-mustafa-16477a99"],
   photo: "",
   cvFormat: "both",
+  cvTemplate: DEFAULT_CV_TEMPLATE,
+  resumeFile: null,
   summary:
     "Senior full-stack engineer with 10+ years of experience building and shipping " +
     "production SaaS. Comfortable owning features end to end — from database design " +

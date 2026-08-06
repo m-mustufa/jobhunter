@@ -4,7 +4,7 @@ import { useState } from "react";
 import { buildCVDocument } from "@/lib/cvDocument";
 import { fileToDataUrl, resizeImageDataUrl } from "@/lib/image";
 import { printReactDocument } from "@/lib/print/printHtml";
-import { CvHtmlTemplate } from "@/lib/pdf/CvHtmlTemplate";
+import { DEFAULT_CV_TEMPLATE, getCvTemplateComponent } from "@/lib/pdf/cvTemplates";
 import { Profile, TailoredCVContent } from "@/lib/types";
 
 const MOCK_PROFILE: Omit<Profile, "photo"> = {
@@ -15,6 +15,8 @@ const MOCK_PROFILE: Omit<Profile, "photo"> = {
   phone: "+971 52 100 0409",
   links: ["linkedin.com/in/muhammad-mustafa-16477a99"],
   cvFormat: "both",
+  cvTemplate: DEFAULT_CV_TEMPLATE,
+  resumeFile: null,
   summary: "",
   skills: [],
   experience: [],
@@ -66,8 +68,9 @@ export default function PdfPreviewClient() {
   const [photo, setPhoto] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const profile: Profile = { ...MOCK_PROFILE, photo };
+  const profile: Profile = { ...MOCK_PROFILE, photo, cvTemplate: DEFAULT_CV_TEMPLATE };
   const doc = buildCVDocument(profile, MOCK_TAILORED_CV);
+  const Template = getCvTemplateComponent(DEFAULT_CV_TEMPLATE);
 
   async function selectPhoto(file: File) {
     setBusy(true);
@@ -80,7 +83,7 @@ export default function PdfPreviewClient() {
   }
 
   function testPrint() {
-    printReactDocument(<CvHtmlTemplate doc={doc} />, "dev-preview-cv");
+    printReactDocument(<Template doc={doc} />, "dev-preview-cv");
   }
 
   return (
@@ -121,7 +124,7 @@ export default function PdfPreviewClient() {
       </div>
       <div style={{ flex: 1, display: "flex", justifyContent: "center", padding: "24px 0" }}>
         <div style={{ boxShadow: "0 4px 24px rgba(0,0,0,0.35)" }}>
-          <CvHtmlTemplate doc={doc} />
+          <Template doc={doc} />
         </div>
       </div>
     </main>

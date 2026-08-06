@@ -183,9 +183,8 @@ export function matchFunctionalDomain(postingTitle: string): string | null {
   return title ? DOMAIN_BY_TITLE.get(title) || null : null;
 }
 
-// Related titles grouped into OR-queries so one search click costs a
-// handful of JSearch calls instead of one per title. Kept to ~3-6 terms per
-// group, consistent with the original groups below.
+// Legacy OR-query groups retained for the disabled public LinkedIn crawler
+// and easy rollback. Hirebase receives TARGET_ROLE_TITLES directly.
 export const QUERY_GROUPS = [
   "Vice President OR Assistant Vice President OR General Manager OR Deputy General Manager Abu Dhabi",
   "Business Unit Head OR Division Head OR Department Head Abu Dhabi",

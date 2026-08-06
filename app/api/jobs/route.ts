@@ -1,158 +1,234 @@
 import { NextResponse } from "next/server";
-import { Job, JobsResponse } from "@/lib/types";
+import { JobsResponse } from "@/lib/types";
 import { SAMPLE_JOBS } from "@/lib/sampleJobs";
-import { QUERY_GROUPS } from "@/lib/targetRoles";
+import {
+  clearHirebaseJobsMemoryCache,
+  fetchHirebaseJobs,
+} from "@/lib/hirebaseJobs.server";
+import { clearJobListingSnapshots } from "@/lib/jobListingStore.server";
+// Legacy public LinkedIn guest-page crawler is intentionally disabled while
+// we compare the licensed TheirStack feed. Keep this line for easy rollback:
+// import { fetchLinkedInJobDescription, fetchLinkedInJobs } from "@/lib/linkedinJobs.server";
+import {
+  clearLinkedInJobsMemoryCache,
+  fetchLinkedInJobs,
+} from "@/lib/theirStackLinkedInJobs.server";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const CONCURRENCY = 3;
-const MAX_RESULTS = 30;
-
-function formatSalary(job: any): string | null {
-  const min = job.job_min_salary;
-  const max = job.job_max_salary;
-  const cur = job.job_salary_currency || "";
-  const period = job.job_salary_period ? `/ ${String(job.job_salary_period).toLowerCase()}` : "";
-  if (min && max) return `${cur} ${Math.round(min).toLocaleString()} – ${Math.round(max).toLocaleString()} ${period}`.trim();
-  if (min) return `${cur} ${Math.round(min).toLocaleString()}+ ${period}`.trim();
-  return null;
+function sampleJobs(keyword: string) {
+  return keyword
+    ? SAMPLE_JOBS.filter((job) =>
+        `${job.title} ${job.company} ${job.description}`.toLowerCase().includes(keyword)
+      )
+    : SAMPLE_JOBS;
 }
 
-function isAbuDhabi(job: any): boolean {
-  const haystack = [job.job_city, job.job_state, job.job_country, job.job_location]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes("abu dhabi");
+function formatSyncWait(nextSyncAt: number | null): string {
+  if (!nextSyncAt) return "later";
+  const remainingMinutes = Math.max(
+    1,
+    Math.ceil((nextSyncAt - Date.now()) / 60_000)
+  );
+  const hours = Math.floor(remainingMinutes / 60);
+  const minutes = remainingMinutes % 60;
+  if (!hours) return `${minutes}m`;
+  return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
 }
 
-function toJob(j: any): Job {
-  return {
-    id: j.job_id,
-    title: j.job_title,
-    company: j.employer_name,
-    // job_city is frequently null for UAE listings — job_state (e.g.
-    // "Abu Dhabi") is where the useful value actually lives here.
-    location: [j.job_city || j.job_state, "UAE"].filter(Boolean).join(", ") || "Abu Dhabi, UAE",
-    salary: formatSalary(j),
-    description: j.job_description || "",
-    applyLink: j.job_apply_link || null,
-    source: j.job_publisher || null,
-    postedAt: j.job_posted_at_datetime_utc
-      ? new Date(j.job_posted_at_datetime_utc).toLocaleDateString()
-      : null,
-  };
-}
-
-async function fetchQueryGroup(query: string, key: string): Promise<any[]> {
-  // JSearch's endpoint is /search-v2 (renamed from /search at some point
-  // after this integration was first built — /search now 404s).
-  const url = `https://jsearch.p.rapidapi.com/search-v2?query=${encodeURIComponent(query)}&num_pages=1&country=ae&date_posted=all&language=en`;
-  const r = await fetch(url, {
-    headers: {
-      "X-RapidAPI-Key": key,
-      "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
-    },
-    cache: "no-store",
-  });
-  if (!r.ok) throw new Error(`JSearch responded ${r.status}`);
-  const data = await r.json();
-  // /search-v2 nests results at data.data.jobs (the old /search endpoint
-  // had them directly at data.data — different response shape).
-  return data.data?.jobs || [];
-}
-
-// Runs the query groups with limited concurrency so we don't fire all
-// requests at once against the RapidAPI rate limit.
-async function runGroupsWithConcurrency(key: string): Promise<any[]> {
-  const results: any[] = [];
-  const queue = [...QUERY_GROUPS];
-
-  async function worker() {
-    while (queue.length) {
-      const query = queue.shift();
-      if (!query) return;
-      try {
-        const jobs = await fetchQueryGroup(query, key);
-        results.push(...jobs);
-      } catch (err: any) {
-        // Fail soft per group — other groups still contribute — but log
-        // so a systemic issue (bad endpoint, bad key) doesn't go silent.
-        console.error(`JSearch query group failed ("${query}"):`, err.message);
-      }
-    }
+export async function DELETE(req: Request) {
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Type Confirm to clear saved listings." }, { status: 400 });
   }
 
-  await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
-  return results;
-}
-
-function dedupe(rawJobs: any[]): any[] {
-  const seen = new Set<string>();
-  const out: any[] = [];
-  for (const j of rawJobs) {
-    const key = j.job_id || `${j.job_title}::${j.employer_name}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(j);
+  const confirmation =
+    body && typeof body === "object" && "confirmation" in body
+      ? (body as { confirmation?: unknown }).confirmation
+      : null;
+  if (confirmation !== "Confirm") {
+    return NextResponse.json({ error: "Type Confirm exactly to clear saved listings." }, { status: 400 });
   }
-  return out;
+
+  // Invalidate process memory before deleting the durable snapshots so an
+  // already-running refresh cannot repopulate the store after this reset.
+  try {
+    await Promise.all([
+      clearHirebaseJobsMemoryCache(),
+      clearLinkedInJobsMemoryCache(),
+    ]);
+    await clearJobListingSnapshots();
+    return NextResponse.json({
+      ok: true,
+      note: "Saved listings cleared. Click Refresh listings to fetch fresh jobs; the LinkedIn 12-hour credit cooldown still applies.",
+    });
+  } catch (error) {
+    console.error("Could not clear saved job listings", error);
+    return NextResponse.json(
+      { error: "Saved listings could not be cleared. Please try again." },
+      { status: 500 }
+    );
+  }
 }
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const keyword = (searchParams.get("keyword") || "").trim().toLowerCase();
-  const key = process.env.JSEARCH_API_KEY;
+  const source = searchParams.get("source");
+  const forceRefresh = searchParams.get("refresh") === "1";
 
-  // No key configured, or DEMO_MODE forces it — return sample data so
-  // local/demo use never burns paid JSearch quota.
-  if (!key || process.env.DEMO_MODE === "true") {
-    let jobs = SAMPLE_JOBS;
-    if (keyword) jobs = jobs.filter((j) => `${j.title} ${j.description}`.toLowerCase().includes(keyword));
+  if (source === "linkedin" && searchParams.has("jobId")) {
+    return NextResponse.json(
+      { error: "TheirStack listings already include the full job description. Refresh the listing first." },
+      { status: 400 }
+    );
+  }
+
+  // LinkedIn mode is deliberately isolated from the existing Hirebase/sample
+  // path. If LinkedIn is unavailable, never put mixed-source results under a
+  // "LinkedIn only" toggle.
+  if (source === "linkedin") {
+    try {
+      const result = await fetchLinkedInJobs(forceRefresh);
+      const jobs = keyword
+        ? result.jobs.filter((job) =>
+            `${job.title} ${job.company} ${job.description}`.toLowerCase().includes(keyword)
+          )
+        : result.jobs;
+
+      const notes: string[] = [];
+      if (result.syncMode === "stale") {
+        notes.push(
+          `TheirStack sync failed — showing ${result.jobs.length} saved LinkedIn listings. Nothing was removed, but credit use for the failed attempt could not be confirmed.`
+        );
+      } else if (result.syncMode === "cooldown") {
+        notes.push(
+          `Already synced or attempted recently — 0 credits used. Next live LinkedIn sync in ${formatSyncWait(result.nextSyncAt)}. ${result.jobs.length} saved listings are available.`
+        );
+      } else if (result.syncMode === "empty") {
+        notes.push(
+          "No saved LinkedIn listings. Click Refresh listings to run the first sync (up to 70 credits)."
+        );
+      } else if (result.syncMode === "saved") {
+        notes.push(
+          `Showing ${result.jobs.length} saved LinkedIn listings — 0 credits used.`
+        );
+      } else if (result.failedSearches > 0) {
+        notes.push(
+          `Synced ${result.apiRecordsReturned ?? 0} returned LinkedIn records and added ${result.newJobsCount ?? 0} new. ${result.failedSearches} of ${result.attemptedSearches} requests failed, so final credit use could not be confirmed. ${result.jobs.length} listings are saved.`
+        );
+      } else {
+        const creditsUsed = result.apiRecordsReturned ?? 0;
+        notes.push(
+          `Synced ${creditsUsed} LinkedIn records (${creditsUsed} credits used), added ${result.newJobsCount ?? 0} new, and kept ${result.jobs.length} saved listings.`
+        );
+      }
+      if (result.descriptionFailures > 0) {
+        notes.push(`${result.descriptionFailures} TheirStack records without descriptions were skipped.`);
+      }
+      if (keyword && jobs.length === 0) {
+        notes.push("No LinkedIn jobs matched the current keyword.");
+      }
+
+      const response: JobsResponse = {
+        jobs,
+        sample: false,
+        note: notes.join(" "),
+        ...(result.syncedAt ? { providerSyncedAt: result.syncedAt } : {}),
+        ...(result.nextSyncAt
+          ? { nextProviderSyncAt: result.nextSyncAt }
+          : {}),
+      };
+      return NextResponse.json(response);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "TheirStack could not be reached";
+      const providerWasNotContacted =
+        message.includes("no provider request was made") ||
+        message.includes("THEIRSTACK_API_KEY is not configured") ||
+        message.includes("TheirStack is disabled while DEMO_MODE is on");
+      const response: JobsResponse = {
+        jobs: [],
+        sample: false,
+        error: message,
+        note: providerWasNotContacted
+          ? `LinkedIn jobs via TheirStack could not be loaded (${message}). Existing listings were not changed; no provider request was sent and 0 credits were used.`
+          : `LinkedIn jobs via TheirStack could not be loaded (${message}). Existing listings were not changed, and credit use for this failed attempt could not be confirmed.`,
+      };
+      return NextResponse.json(response, { status: 502 });
+    }
+  }
+
+  // DEMO_MODE is the only unconditional sample path. Without a provider key,
+  // fetchHirebaseJobs still gets the chance to restore a private snapshot;
+  // samples are used only when neither a key nor saved real data exists.
+  if (process.env.DEMO_MODE === "true") {
     const res: JobsResponse = {
-      jobs,
+      jobs: sampleJobs(keyword),
       sample: true,
-      note:
-        process.env.DEMO_MODE === "true"
-          ? "Showing sample jobs — DEMO_MODE is on."
-          : "Showing sample jobs. Add JSEARCH_API_KEY to pull live listings.",
+      note: "Showing sample jobs — DEMO_MODE is on.",
     };
     return NextResponse.json(res);
   }
 
   try {
-    const raw = await runGroupsWithConcurrency(key);
-    const deduped = dedupe(raw).filter(isAbuDhabi);
-    let jobs: Job[] = deduped.slice(0, MAX_RESULTS).map(toJob);
-    if (keyword) jobs = jobs.filter((j) => `${j.title} ${j.description}`.toLowerCase().includes(keyword));
+    const result = await fetchHirebaseJobs(forceRefresh);
+    let jobs = result.jobs;
+    if (keyword) {
+      jobs = jobs.filter((job) =>
+        `${job.title} ${job.company} ${job.description}`.toLowerCase().includes(keyword)
+      );
+    }
 
-    // Every query group can fail individually (e.g. JSearch rate-limited)
-    // without runGroupsWithConcurrency itself throwing, since failures are
-    // caught per-group there — so a total outage looks like a clean, empty
-    // result rather than an error. Fall back to samples here too, same as
-    // the catch block below, so that case degrades gracefully instead of
-    // silently showing "no listings found."
-    if (jobs.length === 0) {
-      let sample = SAMPLE_JOBS;
-      if (keyword) sample = sample.filter((j) => `${j.title} ${j.description}`.toLowerCase().includes(keyword));
+    if (result.jobs.length === 0) {
+      throw new Error("Hirebase returned no usable Abu Dhabi jobs");
+    }
+
+    const notes: string[] = [];
+    if (result.stale) {
+      notes.push(
+        `Hirebase is temporarily unavailable — showing ${result.jobs.length} saved listings.`
+      );
+    } else if (result.fromCache) {
+      notes.push(`Showing ${result.jobs.length} saved Abu Dhabi listings.`);
+    } else {
+      notes.push(
+        `Refresh checked ${result.fetchedJobsCount ?? 0} current Hirebase jobs and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} saved listings are available.`
+      );
+    }
+    if (result.failedSearches > 0) {
+      notes.push(
+        `${result.failedSearches} of ${result.attemptedSearches} Hirebase title groups could not be completed.`
+      );
+    }
+    if (keyword && jobs.length === 0) {
+      notes.push("No Hirebase jobs matched the current keyword.");
+    }
+
+    const res: JobsResponse = {
+      jobs,
+      sample: false,
+      note: notes.join(" "),
+    };
+    return NextResponse.json(res);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Hirebase could not be reached";
+    if (message === "HIREBASE_API_KEY is not configured") {
       const res: JobsResponse = {
-        jobs: sample,
+        jobs: sampleJobs(keyword),
         sample: true,
-        note: "Live search returned no results right now (JSearch may be rate-limited) — showing sample jobs.",
+        note: "Showing sample jobs. Add HIREBASE_API_KEY to pull live listings.",
       };
       return NextResponse.json(res);
     }
-
-    const res: JobsResponse = { jobs, sample: false };
-    return NextResponse.json(res);
-  } catch (err: any) {
-    // Fail soft to sample data so a demo is never dead.
     const res: JobsResponse = {
-      jobs: SAMPLE_JOBS,
-      sample: true,
-      note: `Live fetch failed (${err.message}). Showing sample jobs.`,
+      jobs: [],
+      sample: false,
+      error: message,
+      note: `Hirebase jobs could not be loaded (${message}). Your last saved live listings were not changed.`,
     };
-    return NextResponse.json(res);
+    return NextResponse.json(res, { status: 502 });
   }
 }

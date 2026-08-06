@@ -1,6 +1,6 @@
 import { Job } from "./types";
 
-// Used only when JSEARCH_API_KEY is not set, so the demo still runs.
+// Used only when HIREBASE_API_KEY is not set, so the demo still runs.
 // Spans the target role list and all four match tiers against the sample
 // software-engineer master CV; the real API replaces these live.
 export const SAMPLE_JOBS: Job[] = [

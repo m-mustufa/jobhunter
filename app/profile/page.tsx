@@ -5,22 +5,36 @@ import { useEffect, useRef, useState } from "react";
 import { ExperienceEntry, Profile } from "@/lib/types";
 import { DEFAULT_PROFILE, sanitizeProfile } from "@/lib/profile";
 import { DEFAULT_MASTER_CV, buildMasterCVMarkdown } from "@/lib/masterCV";
-import { loadJSON, saveJSON, MASTER_CV_KEY, PROFILE_KEY } from "@/lib/persist";
+import {
+  loadJSON,
+  markSavedJobListingsCleared,
+  saveJSON,
+  MASTER_CV_KEY,
+  PROFILE_KEY,
+} from "@/lib/persist";
 import { fetchStoredProfile, pushStoredProfile } from "@/lib/profileStore";
 import { fileToDataUrl, resizeImageDataUrl } from "@/lib/image";
-import { TabBtn, TextField, TextAreaField, ListField, ConfirmDialog, Toast } from "@/app/components/ui";
+import { downloadSampleCV, PopupBlockedError } from "@/lib/cvActions";
+import { TextField, TextAreaField, ListField, Toast } from "@/app/components/ui";
 
 export default function ProfilePage() {
   const [profile, setProfile] = useState<Profile>(DEFAULT_PROFILE);
+  // Still generated and persisted alongside Profile (lib/masterCV.ts) — it
+  // backs the offline demo-mode fallback (lib/demoAnalysis.ts) when no
+  // ANTHROPIC_API_KEY is configured — but real tailoring (buildPrompt in
+  // lib/analyzeJob.ts) reads the structured fields below directly, never
+  // this markdown. So there's no UI for it: editing it separately would
+  // just be editing something tailoring doesn't use.
   const [masterCV, setMasterCV] = useState(DEFAULT_MASTER_CV);
-  const [tab, setTab] = useState<"profile" | "cv">("profile");
-  const [pendingImport, setPendingImport] = useState<File | null>(null);
-  const [importing, setImporting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [photoBusy, setPhotoBusy] = useState(false);
-  const [resumeFileName, setResumeFileName] = useState<string | null>(null);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [sampleBusy, setSampleBusy] = useState(false);
+  const [clearListingsOpen, setClearListingsOpen] = useState(false);
+  const [clearListingsConfirmation, setClearListingsConfirmation] = useState("");
+  const [clearingListings, setClearingListings] = useState(false);
+  const [clearListingsError, setClearListingsError] = useState<string | null>(null);
 
   // Server (Vercel Blob, via /api/profile) is now the source of truth — it
   // survives incognito windows and other browsers/devices, which
@@ -81,10 +95,8 @@ export default function ProfilePage() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // Every Profile edit regenerates Master CV from it — the two can't
-  // drift apart, which is the whole point of this page. Direct edits to
-  // the Master CV tab (below) don't call this, so they aren't touched
-  // unless Profile changes again.
+  // Every Profile edit regenerates the (UI-less, demo-mode-only) Master CV
+  // markdown alongside it, so the persisted bundle stays consistent.
   function updateProfile(next: Profile) {
     setProfile(next);
     setMasterCV(buildMasterCVMarkdown(next));
@@ -94,46 +106,31 @@ export default function ProfilePage() {
     updateProfile({ ...profile, [key]: value });
   }
 
-  function selectResumeFile(file: File) {
-    if (profile.name.trim() || profile.summary.trim() || profile.experience.length) {
-      setPendingImport(file); // ask before overwriting existing content
-    } else {
-      importResumeFile(file);
+  // Stores the raw file for preview/reference only — no AI call, no
+  // structured-field extraction. Tailoring reads the fields below directly,
+  // which this upload doesn't touch.
+  async function selectResumeFile(file: File) {
+    setResumeBusy(true);
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      updateField("resumeFile", { name: file.name, type: file.type, dataUrl });
+      setToast("CV uploaded.");
+    } catch {
+      setToast("Could not read that file.");
+    } finally {
+      setResumeBusy(false);
     }
   }
 
-  async function importResumeFile(file: File) {
-    setImporting(true);
-    setDemoNotice(null);
-    const form = new FormData();
-    form.append("file", file);
+  async function downloadSample() {
+    setSampleBusy(true);
     try {
-      const r = await fetch("/api/parse-resume", { method: "POST", body: form });
-      const data = await r.json();
-      if (!r.ok) {
-        setToast(data.error || "Could not read that file.");
-        return;
-      }
-      let incoming = data.profile as Profile;
-      let gotPhoto = false;
-      if (incoming.photo) {
-        try {
-          incoming = { ...incoming, photo: await resizeImageDataUrl(incoming.photo) };
-          gotPhoto = true;
-        } catch {
-          incoming = { ...incoming, photo: "" };
-        }
-      }
-      updateProfile(incoming);
-      if (data.demo) {
-        setDemoNotice(data.demoNote || "Only contact details could be extracted automatically.");
-      } else {
-        setToast(gotPhoto ? "Profile updated from the uploaded CV — photo detected." : "Profile updated from the uploaded CV.");
-      }
-    } catch {
-      setToast("Could not reach the resume-parsing service.");
+      await downloadSampleCV(profile);
+    } catch (error) {
+      console.error("Sample CV generation failed", error);
+      setToast(error instanceof PopupBlockedError ? error.message : "Could not generate the sample CV. Try again.");
     } finally {
-      setImporting(false);
+      setSampleBusy(false);
     }
   }
 
@@ -150,8 +147,49 @@ export default function ProfilePage() {
     }
   }
 
+  function closeClearListingsDialog() {
+    if (clearingListings) return;
+    setClearListingsOpen(false);
+    setClearListingsConfirmation("");
+    setClearListingsError(null);
+  }
+
+  async function clearSavedListings() {
+    if (clearListingsConfirmation !== "Confirm" || clearingListings) return;
+    setClearingListings(true);
+    setClearListingsError(null);
+    try {
+      const response = await fetch("/api/jobs", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmation: clearListingsConfirmation }),
+      });
+      const data = (await response.json().catch(() => null)) as
+        | { note?: string; error?: string }
+        | null;
+      if (!response.ok) {
+        throw new Error(data?.error || "Saved listings could not be cleared.");
+      }
+
+      const browserCleared = markSavedJobListingsCleared();
+      setClearListingsOpen(false);
+      setClearListingsConfirmation("");
+      setToast(
+        browserCleared
+          ? data?.note || "Saved listings cleared. Click Refresh listings to fetch fresh jobs."
+          : "Server listings were cleared, but this browser cache could not be removed. Click Refresh listings on the search page."
+      );
+    } catch (error) {
+      setClearListingsError(
+        error instanceof Error ? error.message : "Saved listings could not be cleared."
+      );
+    } finally {
+      setClearingListings(false);
+    }
+  }
+
   return (
-    <main className="mx-auto max-w-4xl px-5 pb-24">
+    <main className="mx-auto max-w-7xl px-5 pb-24">
       <header className="flex items-center justify-between py-6">
         <Link
           href="/"
@@ -167,19 +205,10 @@ export default function ProfilePage() {
           Your resume, structured.
         </h1>
         <p className="mt-2 max-w-xl text-soft">
-          Edit Summary, Skills, Experience, and Education here — every change regenerates
-          your Master CV automatically, so the two never drift apart.
+          Edit Summary, Skills, Experience, and Education here — this is what tailoring
+          actually reads from for every generated CV.
         </p>
       </section>
-
-      <div className="flex gap-1 rounded-lg border border-line bg-ink p-1">
-        <TabBtn active={tab === "profile"} onClick={() => setTab("profile")}>
-          Profile
-        </TabBtn>
-        <TabBtn active={tab === "cv"} onClick={() => setTab("cv")}>
-          Master CV
-        </TabBtn>
-      </div>
 
       {!hydrated ? (
         // Gated on the async server fetch resolving — editing before this
@@ -188,7 +217,7 @@ export default function ProfilePage() {
         <div className="mt-5 rounded-2xl border border-line bg-surface p-8 text-center text-soft">
           Loading your profile…
         </div>
-      ) : tab === "profile" ? (
+      ) : (
         <div className="mt-5 space-y-6">
           <div className="rounded-2xl border border-line bg-surface p-5">
             <div className="grid gap-5 sm:grid-cols-[auto_1fr_auto]">
@@ -244,31 +273,26 @@ export default function ProfilePage() {
                 <div className="rounded-xl border border-dashed border-line px-3 py-3">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="flex shrink-0 cursor-pointer items-center gap-2 rounded-lg border border-beacon/40 bg-beacon/10 px-3 py-2 text-sm font-medium text-beacon transition hover:bg-beacon/20">
-                      <span className="h-4 w-4">
-                        <UploadIcon />
-                      </span>
+                      <span className="h-4 w-4">{resumeBusy ? "…" : <UploadIcon />}</span>
                       Choose file
                     </span>
                     <span className="min-w-0 break-words text-sm text-soft/70">
-                      {resumeFileName || "No file chosen"}
+                      {profile.resumeFile?.name || "No file chosen"}
                     </span>
                     <input
                       type="file"
                       accept=".pdf,.docx"
-                      disabled={importing}
+                      disabled={resumeBusy}
                       onChange={(e) => {
                         const f = e.target.files?.[0];
-                        if (f) {
-                          setResumeFileName(f.name);
-                          selectResumeFile(f);
-                        }
+                        if (f) selectResumeFile(f);
                         e.target.value = "";
                       }}
                       className="sr-only"
                     />
                   </div>
                   <span className="mt-2 block text-xs text-soft/70">
-                    .pdf or .docx (e.g. LinkedIn's "Save to PDF" export) — prefills everything below.
+                    .pdf or .docx (e.g. LinkedIn's "Save to PDF" export) — kept below for reference.
                   </span>
                 </div>
               </label>
@@ -291,26 +315,50 @@ export default function ProfilePage() {
                     <option value="docx">DOCX only</option>
                   </select>
                 </div>
+                <button
+                  type="button"
+                  onClick={downloadSample}
+                  disabled={sampleBusy}
+                  className="mt-2 font-mono text-xs text-soft hover:text-beacon disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {sampleBusy ? "Generating…" : "Download sample"}
+                </button>
               </label>
             </div>
+          </div>
 
-            {importing && (
-              <div className="mt-4 flex items-center gap-3 rounded-lg border border-beacon/30 bg-beacon/10 px-4 py-3">
-                <span className="relative flex h-3 w-3 shrink-0">
-                  <span className="absolute inline-flex h-full w-full animate-pulseDot rounded-full bg-beacon" />
-                  <span className="relative inline-flex h-3 w-3 rounded-full bg-beacon" />
+          <div className="rounded-2xl border border-line bg-surface p-5 d-none">
+            <div className="flex items-center justify-between">
+              <h2 className="font-display text-sm font-semibold text-bright">Uploaded CV</h2>
+              {profile.resumeFile && (
+                <button
+                  onClick={() => updateField("resumeFile", null)}
+                  className="font-mono text-xs text-soft transition hover:text-weak"
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            {!profile.resumeFile ? (
+              <p className="mt-3 text-sm text-soft">No CV uploaded yet — use "Import from CV" above.</p>
+            ) : profile.resumeFile.type === "application/pdf" ? (
+              <iframe
+                src={profile.resumeFile.dataUrl}
+                title="Uploaded CV"
+                className="mt-4 h-[600px] w-full rounded-lg border border-line bg-white"
+              />
+            ) : (
+              <a
+                href={profile.resumeFile.dataUrl}
+                download={profile.resumeFile.name}
+                className="mt-4 flex items-center gap-3 rounded-lg border border-line bg-ink px-4 py-3 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
+              >
+                <span className="h-5 w-5 shrink-0">
+                  <FileIcon />
                 </span>
-                <p className="text-sm font-medium text-beacon">Reading and extracting your resume…</p>
-              </div>
-            )}
-
-            {demoNotice && !importing && (
-              <div className="mt-4 rounded-lg border border-beacon/30 bg-beacon/10 px-4 py-3">
-                <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-beacon">
-                  Limited extraction
-                </div>
-                <p className="mt-1 text-xs leading-relaxed text-soft">{demoNotice}</p>
-              </div>
+                <span className="min-w-0 flex-1 truncate">{profile.resumeFile.name}</span>
+                <span className="shrink-0 font-mono text-xs text-soft/70">Download</span>
+              </a>
             )}
           </div>
 
@@ -399,34 +447,91 @@ export default function ProfilePage() {
               />
             </div>
           </div>
-        </div>
-      ) : (
-        <div className="mt-5 rounded-2xl border border-line bg-surface p-5">
-          <p className="mb-3 text-sm text-soft">
-            Generated from your Profile above. You can tweak it directly — edits here stick
-            until you next change something in the Profile tab, which regenerates this text.
-          </p>
-          <textarea
-            value={masterCV}
-            onChange={(e) => setMasterCV(e.target.value)}
-            rows={24}
-            className="scroll-thin w-full resize-none rounded-lg border border-line bg-ink p-4 font-mono text-sm leading-relaxed text-bright/90 outline-none focus:border-beacon/60"
-          />
+
+          <div className="rounded-2xl border border-weak/30 bg-surface p-5">
+            <h2 className="font-display text-sm font-semibold text-bright">Saved listings</h2>
+            <p className="mt-2 max-w-2xl text-sm leading-relaxed text-soft">
+              Refresh listings adds newly found jobs at the front while older jobs remain available
+              in pagination. Nothing is removed automatically. After clearing, return to search and
+              click Refresh listings to fetch fresh jobs. LinkedIn live syncs are limited to once
+              every 12 hours to protect API credits.
+            </p>
+            <p className="mt-2 text-xs leading-relaxed text-soft/70">
+              This removes only saved Hirebase and LinkedIn listings. Applied Jobs, your profile,
+              CVs, and tailored documents are not affected.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setClearListingsConfirmation("");
+                setClearListingsError(null);
+                setClearListingsOpen(true);
+              }}
+              className="mt-4 rounded-lg border border-weak/50 bg-weak/10 px-4 py-2.5 text-sm font-medium text-weak transition hover:bg-weak/20"
+            >
+              Clear saved listings
+            </button>
+          </div>
         </div>
       )}
 
-      {pendingImport && (
-        <ConfirmDialog
-          title="Replace your Profile?"
-          message="This will overwrite your current Profile details — and regenerate your Master CV to match — with what's extracted from this file."
-          confirmLabel="Replace"
-          cancelLabel="Cancel"
-          onConfirm={() => {
-            importResumeFile(pendingImport);
-            setPendingImport(null);
+      {clearListingsOpen && (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/70 px-5 backdrop-blur-sm"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeClearListingsDialog();
           }}
-          onCancel={() => setPendingImport(null)}
-        />
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="clear-listings-title"
+            className="w-full max-w-md rounded-2xl border border-line bg-surface p-6 shadow-2xl shadow-black/60"
+          >
+            <h2 id="clear-listings-title" className="font-display text-lg font-semibold text-bright">
+              Clear saved listings?
+            </h2>
+            <p className="mt-2 text-sm leading-relaxed text-soft">
+              All saved Hirebase and LinkedIn listings will be removed. Applied Jobs and CV data
+              will stay unchanged. Clearing does not bypass the LinkedIn 12-hour credit cooldown.
+              Type <span className="font-semibold text-bright">Confirm</span> to continue.
+            </p>
+            <input
+              autoFocus
+              value={clearListingsConfirmation}
+              onChange={(event) => setClearListingsConfirmation(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void clearSavedListings();
+                if (event.key === "Escape") closeClearListingsDialog();
+              }}
+              placeholder="Confirm"
+              aria-label="Type Confirm to clear saved listings"
+              disabled={clearingListings}
+              className="mt-5 w-full rounded-lg border border-line bg-ink px-3.5 py-3 text-bright outline-none transition placeholder:text-soft/40 focus:border-weak/70 disabled:opacity-60"
+            />
+            {clearListingsError && (
+              <p className="mt-3 text-sm text-weak">{clearListingsError}</p>
+            )}
+            <div className="mt-5 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={closeClearListingsDialog}
+                disabled={clearingListings}
+                className="rounded-lg border border-line px-4 py-2.5 text-sm text-soft transition hover:text-bright disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void clearSavedListings()}
+                disabled={clearListingsConfirmation !== "Confirm" || clearingListings}
+                className="rounded-lg bg-weak px-4 py-2.5 text-sm font-medium text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {clearingListings ? "Clearing…" : "Clear saved listings"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}

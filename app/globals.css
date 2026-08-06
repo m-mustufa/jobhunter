@@ -38,6 +38,10 @@ body {
   background: transparent;
 }
 
+.d-none {
+  display: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

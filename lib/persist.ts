@@ -5,8 +5,15 @@
 // read/write the same persisted state.
 export const MASTER_CV_KEY = "jobhunter:masterCV";
 export const PROFILE_KEY = "jobhunter:profile";
-export const JOBS_CACHE_KEY = "jobhunter:jobsCache";
+// Provider-versioned so an old JSearch snapshot cannot be mistaken for a
+// Hirebase response after the normal listing provider is switched.
+export const JOBS_CACHE_KEY = "jobhunter:jobsCache:hirebase:v1";
+// Provider-versioned so a failed TheirStack comparison never silently falls
+// back to stale cards from the retired public LinkedIn crawler.
+export const LINKEDIN_JOBS_CACHE_KEY = "jobhunter:linkedinJobsCache:theirstack:v1";
+export const JOB_LISTINGS_CLEARED_KEY = "jobhunter:jobListingsCleared:v1";
 export const TAILORED_ANALYSES_KEY = "jobhunter:tailoredAnalyses:v1";
+export const APPLIED_JOBS_KEY = "jobhunter:appliedJobs:v1";
 
 export function loadJSON<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -30,6 +37,31 @@ export function saveJSON(key: string, value: unknown): boolean {
     return true;
   } catch (err) {
     console.error(`saveJSON: failed to write "${key}"`, err);
+    return false;
+  }
+}
+
+export function removeJSON(key: string): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    window.localStorage.removeItem(key);
+    return true;
+  } catch (err) {
+    console.error(`removeJSON: failed to remove "${key}"`, err);
+    return false;
+  }
+}
+
+export function markSavedJobListingsCleared(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    window.localStorage.removeItem(JOBS_CACHE_KEY);
+    window.localStorage.removeItem(LINKEDIN_JOBS_CACHE_KEY);
+    window.localStorage.removeItem("jobhunter:jobsCache");
+    window.localStorage.setItem(JOB_LISTINGS_CLEARED_KEY, JSON.stringify(Date.now()));
+    return true;
+  } catch (err) {
+    console.error("Could not clear the browser job-listing caches", err);
     return false;
   }
 }

@@ -12,8 +12,11 @@ export interface Job {
 
 export interface JobsResponse {
   jobs: Job[];
-  sample: boolean; // true when returned from local sample data (no JSearch key)
+  sample: boolean; // true when returned from local sample data (no live-jobs key)
   note?: string;
+  error?: string;
+  providerSyncedAt?: number;
+  nextProviderSyncAt?: number;
 }
 
 export interface AuditTrailEntry {
@@ -35,6 +38,15 @@ export interface TailoredCVContent {
   education: string[];
 }
 
+// A raw uploaded resume file kept for reference/preview on the Profile page
+// — the Master CV tab (a Markdown string) is the actual source tailoring
+// reads from; this is just "what did I last upload" for the user to check.
+export interface ResumeFile {
+  name: string;
+  type: string; // MIME type, e.g. "application/pdf"
+  dataUrl: string;
+}
+
 // The candidate's full structured resume — contact info plus content.
 // Master CV (a Markdown string) is generated FROM this via
 // lib/masterCV.ts's buildMasterCVMarkdown, so the two can't drift apart.
@@ -47,6 +59,8 @@ export interface Profile {
   links: string[];
   photo: string; // JPEG data URL, or "" if none set
   cvFormat: "pdf" | "docx" | "both"; // which files "Apply with this CV" downloads
+  cvTemplate: string; // key into lib/pdf/cvTemplates.ts's CV_TEMPLATES registry
+  resumeFile: ResumeFile | null;
   summary: string;
   skills: string[];
   experience: ExperienceEntry[];

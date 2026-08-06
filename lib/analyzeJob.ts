@@ -35,11 +35,15 @@ export class LiveAnalysisError extends Error {
 // copied from the candidate's Profile. The model may lightly rephrase a role
 // label and a chosen subset of its bullets, but it cannot replace the real
 // employer, chronology, or underlying work.
-const SYSTEM = `You are an expert technical recruiter and CV writer running a strict, repeatable pipeline for one candidate against one vacancy.
+// Exported so the free "tailor via claude.ai" flow (app/api/analyze/prompt)
+// can build the exact same prompt without duplicating it — the only
+// difference between the paid and free paths is who sends this text to
+// Claude and how the JSON response comes back.
+export const SYSTEM = `You are an expert technical recruiter and CV writer running a strict, repeatable pipeline for one candidate against one vacancy.
 
 You are given the candidate's fixed CV data (employers, dates, skills, and education are NOT yours to change) and must produce only:
 1. A tailored professional summary for this specific role.
-2. For each employer, an optional truthful rephrasing of the existing position label plus a small subset of that employer's existing bullets rewritten to sharpen their relevance to this role.
+2. For every employer, an optional truthful rephrasing of the existing position label, the 3-4 strongest existing bullets rewritten for this role and placed first, then every remaining original bullet ranked by relevance.
 3. A score/verdict/reasons/audit-trail assessment of fit.
 4. A cover letter body.
 
@@ -51,17 +55,24 @@ be lightly rephrased using the original role and documented duties. If the
 candidate lacks something the job wants, do not fabricate it — reflect that
 honestly in the reasons instead.
 
+Optimize for earning an interview. Use confident, specific language, mirror the
+vacancy's terminology where the candidate's evidence supports it, and foreground
+transferable scope, ownership, outcomes, and stakeholder impact. Do not weaken
+the CV with unnecessary caveats; keep unsupported requirements in the reasons.
+
 Company/department names are immutable labels. Never prepend a parent
 organization (including ADNOC or ADNOC Offshore), expand abbreviations,
 translate them, or correct their spelling.
 
 Return ONLY a valid JSON object. No markdown fences, no preamble.`;
 
-function buildPrompt(job: Pick<Job, "title" | "company" | "location" | "description">, profile: Profile) {
+export function buildPrompt(job: Pick<Job, "title" | "company" | "location" | "description">, profile: Profile) {
   const experienceBlock = profile.experience
     .map((e, i) => {
-      const bulletsList = e.bullets.map((b, bi) => `    [${bi}] ${b}`).join("\n");
-      return `${i + 1}. ${e.company} — ${e.role}${e.dates ? ` (${e.dates})` : ""}\n${bulletsList}`;
+      const bulletsList = e.bullets
+        .map((bullet, bulletIndex) => `    [bulletIndex=${bulletIndex}] ${bullet}`)
+        .join("\n");
+      return `[experienceIndex=${i}] ${e.company} — ${e.role}${e.dates ? ` (${e.dates})` : ""}\n${bulletsList}`;
     })
     .join("\n\n");
 
@@ -97,27 +108,32 @@ Do the following and return a single JSON object with exactly these keys:
   "score": <integer 0-100, how well the candidate fits this job>,
   "verdict": "<one short sentence, e.g. 'Strong fit — lead with SaaS + React'>",
   "reasons": ["<exactly 3 concise reasons behind the score, covering the strongest matches and most important gap>"],
-  "tailoredSummary": "<one cohesive professional profile of 1050-1100 characters INCLUDING spaces, targeting about 1075 characters; use 7-9 concise sentences tailored to THIS job and drawn only from the candidate's real background; count the characters before returning and never return fewer than 1050 or more than 1100>",
+  "tailoredSummary": "<one cohesive, confident and interview-focused professional profile of 1050-1100 characters INCLUDING spaces, targeting about 1075 characters; use 7-9 concise sentences tailored to THIS job; lead with the strongest direct and transferable evidence, use vacancy terminology where supported, and draw every claim from the candidate's real background; count the characters before returning and never return fewer than 1050 or more than 1100>",
+  "experienceRewriteVersion": 2,
   "experienceRewrites": [
     {
+      "experienceIndex": <copy the employer's 0-based position in the experience list above>,
       "company": "<copy one employer label exactly as listed above; never prepend, expand, translate, or correct it>",
       "role": "<optional concise, truthful rephrasing of that employer's existing position, replacing it entirely — never combine, append, or slash-join the original and new title together; use an empty string to keep the original role text unchanged>",
-      "bulletsToRewrite": [<0-based indices for no more than 2 of that employer's bullets, choosing only the bullets most relevant to this job>],
-      "rewrittenBullets": ["<replacement text for each index above, same order, same count>"]
+      "bulletsToRewrite": [<3-4 UNIQUE 0-based bullet indices, or every available index when the employer has fewer than 3 bullets; list the strongest job-relevant evidence first>],
+      "rewrittenBullets": ["<confident, specific replacement for each selected bullet, using vacancy language where the source bullet supports it; same order and count as bulletsToRewrite>"],
+      "remainingBulletOrder": [<every unselected 0-based bullet index exactly once, ordered from most to least relevant to this job>]
     }
   ],
   "coverLetter": "<a short, specific cover-letter BODY (100-140 words, 2-3 paragraphs) in a natural human voice, no clichés — do NOT include a greeting/salutation or a sign-off, those are added separately>",
   "auditTrail": [{"statement": "<one of at most 3 important claims made in the tailored summary or a rewritten bullet>", "source": "<the CV section/line/experience it is drawn from>"}]
 }
 
-The tailoredSummary length requirement is strict: 1050-1100 characters including spaces. Include experienceRewrites only where a position label or bullets genuinely benefit from tailoring. Copy every company/department label character-for-character and keep every date unchanged. Do not add, remove, or reorder employers, skills, or education — those are fixed and applied automatically. Keep every other field concise and return only the JSON object.`;
+The tailoredSummary length requirement is strict: 1050-1100 characters including spaces. Include exactly one experienceRewrites entry for EVERY employer, even when its role stays unchanged. For each employer with at least 3 bullets, rewrite 3-4 of its strongest existing bullets. If it has fewer than 3, rewrite every available bullet; use empty arrays when it has none. Base each replacement only on its selected source bullet, preserve every supported number and level of ownership, and never transfer evidence between employers. Put selected indices in descending job relevance, followed by every unselected index in descending relevance; for equal relevance retain original index order. Never create, omit, merge, split, or duplicate a bullet or claim. Copy every company/department label character-for-character and keep every date unchanged. Do not add, remove, or reorder employers, skills, or education — those are fixed and applied automatically. Keep every other field concise and return only the JSON object.`;
 }
 
 interface ExperienceRewrite {
+  experienceIndex: number | null;
   company: string;
   role: string;
   bulletsToRewrite: number[];
   rewrittenBullets: string[];
+  remainingBulletOrder: number[];
 }
 
 function normalizeSummaryText(value: unknown): string {
@@ -223,47 +239,180 @@ function isCleanRoleRewrite(rewrittenRole: string): boolean {
   return !/[/()]/.test(rewrittenRole);
 }
 
-// Applies the model's chosen bullet rewrites onto a verbatim copy of the
-// candidate's real experience — company/role/dates/bullet-count/order can
-// never change here, only the text of specifically-indexed bullets.
+// Applies the model's chosen bullet rewrites onto a protected copy of the
+// candidate's real experience. Employer order, company, dates and bullet count
+// stay fixed; version 2 deliberately ranks bullets by vacancy relevance.
 function applyExperienceRewrites(profile: Profile, raw: any): TailoredCVContent["experience"] {
-  const rewrites: ExperienceRewrite[] = Array.isArray(raw?.experienceRewrites)
-    ? raw.experienceRewrites
-        .filter((r: any) => typeof r?.company === "string")
-        .map((r: any) => {
-          const rawRole = typeof r?.role === "string" ? r.role.replace(/\s+/g, " ").trim().slice(0, 120) : "";
-          return {
-            company: canonicalizeExperienceCompanyName(r.company),
-            role: rawRole && isCleanRoleRewrite(rawRole) ? rawRole : "",
-            bulletsToRewrite: Array.isArray(r?.bulletsToRewrite) ? r.bulletsToRewrite.map(Number) : [],
-            rewrittenBullets: Array.isArray(r?.rewrittenBullets) ? r.rewrittenBullets.map(String) : [],
-          };
-        })
-    : [];
+  const rawRewrites = Array.isArray(raw?.experienceRewrites) ? raw.experienceRewrites : [];
 
-  return profile.experience.map((entry) => {
-    const entryCompany = canonicalizeExperienceCompanyName(entry.company);
-    const rewrite = rewrites.find(
-      (r) => r.company.trim().toLowerCase() === entryCompany.trim().toLowerCase()
-    );
-    const bullets = [...entry.bullets];
-    if (rewrite) {
-      rewrite.bulletsToRewrite.forEach((bulletIndex, i) => {
-        if (Number.isInteger(bulletIndex) && bulletIndex >= 0 && bulletIndex < bullets.length && rewrite.rewrittenBullets[i]) {
-          bullets[bulletIndex] = rewrite.rewrittenBullets[i];
+  // Older saved/manual responses did not include an explicit schema version.
+  // Keep accepting them without changing their original in-place behavior.
+  if (Number(raw?.experienceRewriteVersion) !== 2) {
+    const rewrites: ExperienceRewrite[] = rawRewrites
+      .filter((rewrite: any) => typeof rewrite?.company === "string")
+      .map((rewrite: any) => {
+        const rawRole =
+          typeof rewrite?.role === "string"
+            ? rewrite.role.replace(/\s+/g, " ").trim().slice(0, 120)
+            : "";
+        return {
+          experienceIndex: null,
+          company: canonicalizeExperienceCompanyName(rewrite.company),
+          role: rawRole && isCleanRoleRewrite(rawRole) ? rawRole : "",
+          bulletsToRewrite: Array.isArray(rewrite?.bulletsToRewrite)
+            ? rewrite.bulletsToRewrite.map(Number)
+            : [],
+          rewrittenBullets: Array.isArray(rewrite?.rewrittenBullets)
+            ? rewrite.rewrittenBullets.map(String)
+            : [],
+          remainingBulletOrder: [],
+        };
+      });
+    const usedRewriteIndexes = new Set<number>();
+
+    return profile.experience.map((entry) => {
+      const entryCompany = canonicalizeExperienceCompanyName(entry.company);
+      const rewriteIndex = rewrites.findIndex(
+        (rewrite, index) =>
+          !usedRewriteIndexes.has(index) &&
+          rewrite.company.trim().toLowerCase() === entryCompany.trim().toLowerCase()
+      );
+      const rewrite = rewriteIndex >= 0 ? rewrites[rewriteIndex] : undefined;
+      if (rewriteIndex >= 0) usedRewriteIndexes.add(rewriteIndex);
+
+      const bullets = [...entry.bullets];
+      rewrite?.bulletsToRewrite.forEach((bulletIndex, index) => {
+        const replacement = normalizeSummaryText(rewrite.rewrittenBullets[index]);
+        if (
+          Number.isInteger(bulletIndex) &&
+          bulletIndex >= 0 &&
+          bulletIndex < bullets.length &&
+          replacement
+        ) {
+          bullets[bulletIndex] = replacement;
         }
       });
+      return {
+        company: entryCompany,
+        role: rewrite?.role || entry.role,
+        dates: entry.dates,
+        bullets,
+      };
+    });
+  }
+
+  const invalidRewrite = (): never => {
+    throw new LiveAnalysisError(
+      "Claude did not return a complete per-employer experience rewrite. Please try again.",
+      502
+    );
+  };
+
+  if (rawRewrites.length !== profile.experience.length) invalidRewrite();
+  const rewritesByIndex = new Map<number, ExperienceRewrite>();
+
+  for (const rawRewrite of rawRewrites) {
+    const experienceIndex = Number(rawRewrite?.experienceIndex);
+    if (
+      !Number.isInteger(experienceIndex) ||
+      experienceIndex < 0 ||
+      experienceIndex >= profile.experience.length ||
+      rewritesByIndex.has(experienceIndex)
+    ) {
+      invalidRewrite();
     }
-    return {
+
+    const entry = profile.experience[experienceIndex];
+    const entryCompany = canonicalizeExperienceCompanyName(entry.company);
+    const rewriteCompany = canonicalizeExperienceCompanyName(String(rawRewrite?.company || ""));
+    if (rewriteCompany.trim().toLowerCase() !== entryCompany.trim().toLowerCase()) invalidRewrite();
+
+    const bulletsToRewrite: number[] = Array.isArray(rawRewrite?.bulletsToRewrite)
+      ? rawRewrite.bulletsToRewrite.map(Number)
+      : [];
+    const rewrittenBullets: string[] = Array.isArray(rawRewrite?.rewrittenBullets)
+      ? rawRewrite.rewrittenBullets.map(normalizeSummaryText)
+      : [];
+    const remainingBulletOrder: number[] = Array.isArray(rawRewrite?.remainingBulletOrder)
+      ? rawRewrite.remainingBulletOrder.map(Number)
+      : [];
+    const bulletCount = entry.bullets.length;
+    const minimumRewrites = Math.min(3, bulletCount);
+    const maximumRewrites = Math.min(4, bulletCount);
+
+    if (
+      bulletsToRewrite.length < minimumRewrites ||
+      bulletsToRewrite.length > maximumRewrites ||
+      rewrittenBullets.length !== bulletsToRewrite.length ||
+      rewrittenBullets.some((bullet) => !bullet)
+    ) {
+      invalidRewrite();
+    }
+
+    const selectedIndexes = new Set<number>();
+    for (const bulletIndex of bulletsToRewrite) {
+      if (
+        !Number.isInteger(bulletIndex) ||
+        bulletIndex < 0 ||
+        bulletIndex >= bulletCount ||
+        selectedIndexes.has(bulletIndex)
+      ) {
+        invalidRewrite();
+      }
+      selectedIndexes.add(bulletIndex);
+    }
+
+    if (remainingBulletOrder.length !== bulletCount - selectedIndexes.size) invalidRewrite();
+    const remainingIndexes = new Set<number>();
+    for (const bulletIndex of remainingBulletOrder) {
+      if (
+        !Number.isInteger(bulletIndex) ||
+        bulletIndex < 0 ||
+        bulletIndex >= bulletCount ||
+        selectedIndexes.has(bulletIndex) ||
+        remainingIndexes.has(bulletIndex)
+      ) {
+        invalidRewrite();
+      }
+      remainingIndexes.add(bulletIndex);
+    }
+    if (selectedIndexes.size + remainingIndexes.size !== bulletCount) invalidRewrite();
+
+    const rawRole =
+      typeof rawRewrite?.role === "string"
+        ? rawRewrite.role.replace(/\s+/g, " ").trim().slice(0, 120)
+        : "";
+    rewritesByIndex.set(experienceIndex, {
+      experienceIndex,
       company: entryCompany,
-      role: rewrite?.role || entry.role,
+      role: rawRole && isCleanRoleRewrite(rawRole) ? rawRole : "",
+      bulletsToRewrite,
+      rewrittenBullets,
+      remainingBulletOrder,
+    });
+  }
+
+  return profile.experience.map((entry, experienceIndex) => {
+    const rewrite = rewritesByIndex.get(experienceIndex) ?? invalidRewrite();
+
+    const replacements = new Map<number, string>();
+    rewrite.bulletsToRewrite.forEach((bulletIndex, index) => {
+      replacements.set(bulletIndex, rewrite.rewrittenBullets[index]);
+    });
+    const finalOrder = [...rewrite.bulletsToRewrite, ...rewrite.remainingBulletOrder];
+
+    return {
+      company: canonicalizeExperienceCompanyName(entry.company),
+      role: rewrite.role || entry.role,
       dates: entry.dates,
-      bullets,
+      bullets: finalOrder.map(
+        (bulletIndex) => replacements.get(bulletIndex) || entry.bullets[bulletIndex]
+      ),
     };
   });
 }
 
-function toAnalysis(parsed: any, profile: Profile): Analysis {
+export function toAnalysis(parsed: any, profile: Profile): Analysis {
   const score = Math.max(0, Math.min(100, Number(parsed.score) || 0));
   const tier = getMatchTier(score);
   const tailoredCV: TailoredCVContent = {
@@ -289,7 +438,7 @@ function toAnalysis(parsed: any, profile: Profile): Analysis {
   };
 }
 
-function parseModelResponse(text: string) {
+export function parseModelResponse(text: string) {
   const withoutFence = text
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/i, "")

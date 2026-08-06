@@ -154,11 +154,12 @@ export const CV_TEMPLATE_CSS = `
 .cvtpl-entry-role { margin: 2px 0 0; font-family: var(--font-meta); font-weight: 400; font-size: 14.7px; line-height: 1.3; color: var(--ink); }
 .cvtpl-entry-dates { flex-shrink: 0; margin: 0; font-family: var(--font-meta); font-weight: 400; font-size: 13.3px; color: var(--ink); white-space: nowrap; text-transform: uppercase; }
 
-.cvtpl-bullets { list-style: none; margin: 24px 0 0; padding: 0; font-size: 16px; line-height: 1.34; }
+.cvtpl-bullets { list-style: none; margin: 0; padding: 0; font-size: 16px; line-height: 1.34; }
 .cvtpl-bullets--continued { margin-top: 0; }
+
 .cvtpl-bullets li {
   position: relative;
-  margin: 0;
+  margin-top: 8px;
   break-inside: avoid;
   page-break-inside: avoid;
 }

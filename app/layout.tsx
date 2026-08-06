@@ -3,7 +3,7 @@ import "./globals.css";
 
 const TITLE = "JobHunter — AI application agent";
 const DESCRIPTION =
-  "An AI agent that finds real jobs, scores your fit, and tailors your CV to each one.";
+  "An AI agent that finds recommended jobs and tailors your CV to each one.";
 const BANNER_PATH = "/jobhunter-ai-job-search-agent-banner.png";
 
 export const metadata: Metadata = {

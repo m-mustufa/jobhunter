@@ -1,25 +1,29 @@
 # JobHunter
 
 An AI job-hunting agent for Abu Dhabi: one click searches every open vacancy
-across ~65 senior/functional titles (VP down to Team Lead), scores your fit
-against each one instantly for free, then generates a truthful, AI-tailored
-CV + cover letter for any single role you choose to apply to.
+across ~65 senior/functional titles (VP down to Team Lead), highlights locally
+recommended roles, then generates an AI-tailored CV + cover letter for any
+single role you choose to apply to.
 
 ## What it does
 
-- Searches **JSearch** (Google for Jobs — covers LinkedIn, Indeed, Glassdoor,
-  company pages) across the target-role query list, filters results to Abu
-  Dhabi, and dedupes them. Results are cached locally with a timestamp — a
-  page reload restores them instantly with no new API calls; a "Refresh
-  listings" button re-fetches on demand.
-- Every result is scored **instantly and for free** with a local
-  keyword-based heuristic (no AI call) — no waiting, no cost, just to help
-  you triage which vacancies are worth a closer look.
+- Searches **Hirebase** across the complete target-role title list, filters
+  results to Abu Dhabi, removes duplicates, and keeps only the past 30 days.
+  Successful results are accumulated in a private server snapshot as well as
+  the browser cache. A refresh puts genuinely new jobs first, updates matching
+  jobs in place, and keeps older saved jobs available through pagination.
+- The **LinkedIn only** toggle uses **TheirStack** to retrieve LinkedIn-source
+  vacancies posted in Abu Dhabi during the past 30 days, including the full
+  job description. Normal reads never contact TheirStack. Live LinkedIn syncs
+  have a durable 12-hour cooldown and subsequently request only records
+  discovered since the previous successful sync, excluding already-seen IDs.
+- A local **Recommended** marker and filter help surface promising vacancies
+  without an AI call. The UI intentionally avoids showing a percentage score
+  that could underestimate the candidate or imply a guaranteed outcome.
 - Click **"Tailor CV for this job"** on any single result to run one real
-  **Claude** call for that job, which returns a 0–100 match score (bucketed
-  into Strong / Good / Partial / Limited match tiers), the reasons, a
-  tailored CV, a cover letter, a short gap analysis, and an audit trail
-  showing which master-CV statement backs each tailored-CV claim.
+  **Claude** call for that job, which returns a tailored profile, reordered
+  and rewritten experience bullets, a cover letter, a short gap analysis,
+  and an audit trail showing which master-CV statement backs each claim.
 - Tailoring is **truthful by design**: Claude only re-orders, re-emphasizes,
   and rephrases what's already in your master CV. It never invents
   experience — gaps are called out explicitly instead.
@@ -48,17 +52,26 @@ npm run dev                  # http://localhost:3000
 
 | Variable | Needed? | What it's for |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes (for tailoring) | Per-job scoring + CV/cover-letter generation, and CV-upload extraction. Get it at console.anthropic.com. |
-| `JSEARCH_API_KEY` | Optional | Live jobs. Without it, the app serves realistic sample listings. Get it on RapidAPI (JSearch). |
+| `ANTHROPIC_API_KEY` | Required for production tailoring | Per-job CV/cover-letter generation and CV-upload extraction. Get it at console.anthropic.com. |
+| `HIREBASE_API_KEY` | Required for live general listings | Powers the normal Abu Dhabi jobs listing and the Employers directory through Hirebase. |
+| `THEIRSTACK_API_KEY` | Required for LinkedIn mode | Powers LinkedIn-only listings through TheirStack. |
+| `BLOB_READ_WRITE_TOKEN` | Required for durable data | Private durable storage for profiles and saved listings plus the restart-safe 12-hour TheirStack credit guard. |
 | `ANTHROPIC_MODEL` | Optional | Defaults to `claude-sonnet-5`. |
-| `SITE_PASSWORD` | Recommended | Password-gates the whole site so public/bot traffic can't burn paid API usage. Unset = no gate. |
-| `DEMO_MODE` | Optional | Set to `true` to block all real Claude/JSearch calls and use sample data + a free heuristic preview everywhere — useful for local dev. |
+| `SITE_PASSWORD` | Required for a public deployment | Password-gates the site so public/bot traffic cannot access private CV data or burn paid API usage. Use a strong unique value. |
+| `DEMO_MODE` | Optional | Set to `true` to block all real Claude/Hirebase/TheirStack calls and use sample data — useful for local dev. Leave unset in production. |
 
-**RapidAPI quota note**: each search/refresh runs ~16 JSearch calls (one per
-grouped title query) to cover all ~65 target titles. JSearch's free RapidAPI
-tier has a limited monthly request quota — heavy use may need a paid tier.
-Scoring itself is free and local; only the on-demand "Tailor CV for this job"
-action and CV-upload extraction use paid Claude calls.
+**Jobs cache note**: the server keeps each provider's successful snapshot in
+memory and private Blob storage. Normal searches reuse saved data. Hirebase
+can be refreshed explicitly; TheirStack live syncs are limited to once every
+12 hours and incremental refreshes return only newly discovered records where
+possible. A cached LinkedIn refresh uses zero credits and reports when the next
+live sync is available. Saved jobs are never removed automatically. Profile &
+CV includes a **Clear saved listings** action protected by an exact `Confirm`
+entry; clearing does not bypass the LinkedIn credit cooldown.
+TheirStack live refreshes are refused when Blob storage is not configured, so a
+server restart cannot silently bypass the paid-request cooldown.
+The Recommended marker/filter is local; only the on-demand "Tailor CV for this
+job" action and CV-upload extraction use paid Claude calls.
 
 ## Deploy to Vercel (public link in ~5 min)
 
@@ -87,13 +100,13 @@ Manager, Sustainability/ESG Manager, Investment/Treasury/Portfolio Manager,
 Category/Facilities/Program Manager) — see
 [lib/targetRoles.ts](lib/targetRoles.ts).
 
-These are grouped into ~16 combined queries (`lib/targetRoles.ts` →
-`QUERY_GROUPS`) to keep API usage bounded, then every result is filtered to
-Abu Dhabi server-side, deduped, and capped at 30 vacancies per search.
+The titles are split into bounded Hirebase groups, then every result is checked
+again for an Abu Dhabi location and matching target title, deduped, and capped
+at 70 vacancies per refresh.
 
-The **Employers** panel (top right) is a browsable reference list of major
-Abu Dhabi government, GRE, and private-sector employers from the agent spec —
-informational only, not wired into the automated search.
+The dedicated **Employers** page loads its Abu Dhabi company directory from
+Hirebase only when opened, reuses the saved result for 24 hours, and falls back
+to the bundled reference directory if the live provider is unavailable.
 
 ## Notes
 

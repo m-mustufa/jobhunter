@@ -1,5 +1,5 @@
 import { Profile } from "./types";
-import { sanitizeProfile } from "./profile";
+import { sanitizeProfile, DEFAULT_CV_TEMPLATE } from "./profile";
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 
@@ -68,6 +68,8 @@ function buildDemoProfileExtraction(rawText: string, note: string): ExtractedPro
       links: linkedin ? [linkedin] : [],
       photo: "",
       cvFormat: "both",
+      cvTemplate: DEFAULT_CV_TEMPLATE,
+      resumeFile: null,
       summary: "",
       skills: [],
       experience: [],
