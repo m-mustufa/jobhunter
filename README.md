@@ -1,9 +1,10 @@
 # JobHunter
 
-An AI job-hunting agent for Abu Dhabi: one click searches every open vacancy
-across ~65 senior/functional titles (VP down to Team Lead), highlights locally
-recommended roles, then generates an AI-tailored CV + cover letter for any
-single role you choose to apply to.
+An AI job-hunting agent for Abu Dhabi: one click searches executive,
+managerial, government, technical-leadership, and senior-specialist roles
+across hundreds of title and spelling variants, highlights locally recommended
+roles, then generates an AI-tailored CV + cover letter for any single role you
+choose to apply to.
 
 ## What it does
 
@@ -57,6 +58,9 @@ npm run dev                  # http://localhost:3000
 | `THEIRSTACK_API_KEY` | Required for LinkedIn mode | Powers LinkedIn-only listings through TheirStack. |
 | `BLOB_READ_WRITE_TOKEN` | Required for durable data | Private durable storage for profiles and saved listings plus the restart-safe 12-hour TheirStack credit guard. |
 | `ANTHROPIC_MODEL` | Optional | Defaults to `claude-sonnet-5`. |
+| `HIREBASE_MAX_RESULTS` | Optional | Saved-result cap per Hirebase refresh. Defaults to `250`. |
+| `HIREBASE_SYNC_JOB_BUDGET` | Optional | Maximum provider records requested by one Hirebase refresh. Defaults to `250`. |
+| `THEIRSTACK_MAX_RESULTS` | Optional | Maximum LinkedIn records returned by an eligible live sync (`25`-`250`). Defaults to `150`. |
 | `SITE_PASSWORD` | Required for a public deployment | Password-gates the site so public/bot traffic cannot access private CV data or burn paid API usage. Use a strong unique value. |
 | `DEMO_MODE` | Optional | Set to `true` to block all real Claude/Hirebase/TheirStack calls and use sample data — useful for local dev. Leave unset in production. |
 
@@ -84,6 +88,11 @@ That URL is what you share with the client.
 
 ## How search works
 
+The shared taxonomy now covers hundreds of executive, managerial, government,
+oil-and-gas, technical-leadership, and senior-professional title variants. It
+includes common abbreviations and reversed word orders such as `Head of X`,
+`X Head`, `X Director`, `X Manager`, and `X Lead`.
+
 Job titles searched: the original spec list (VP, AVP, GM, DGM, Business Unit
 Head, Division Head, Department Head, Senior Manager, Department Manager,
 Area Manager, Senior Project Manager, Project Director, Engineering Manager,
@@ -100,9 +109,14 @@ Manager, Sustainability/ESG Manager, Investment/Treasury/Portfolio Manager,
 Category/Facilities/Program Manager) — see
 [lib/targetRoles.ts](lib/targetRoles.ts).
 
-The titles are split into bounded Hirebase groups, then every result is checked
-again for an Abu Dhabi location and matching target title, deduped, and capped
-at 70 vacancies per refresh.
+The titles are split into bounded Hirebase groups and paged within a configured
+provider-record budget. TheirStack reserves most of each paid sync for
+executive, government, director, and explicitly senior roles before using the
+remaining capacity for broad manager/lead discovery. Every record is checked
+again for Abu Dhabi and a matching managerial title, deduplicated, sorted
+newest first, and merged into durable saved listing history. Defaults allow up
+to 250 Hirebase results and 150 LinkedIn records per eligible live sync without
+weakening the existing cache or 12-hour LinkedIn credit guard.
 
 The dedicated **Employers** page loads its Abu Dhabi company directory from
 Hirebase only when opened, reuses the saved result for 24 hours, and falls back
