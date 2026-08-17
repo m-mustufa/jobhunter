@@ -84,7 +84,7 @@ Your objective is to make the CV visibly and specifically relevant to this vacan
 
 Never invent or upgrade an employer, date, metric, tool, qualification, certification, responsibility, seniority, team size, budget, client, industry, or outcome. Never imply ownership when the evidence only shows participation. Requirements without evidence belong in the fit reasons, not the CV. Employer/department labels, role labels, dates, education, and skill values are immutable; skills may only be reordered.
 
-Candidate-facing text means tailoredSummary, experienceRewrites[].tailoredHighlights[].text, and coverLetter. Candidate-facing text may use a vacancy acronym, standard, tool, industry term, or responsibility only when it is supported by the candidate's fixed evidence. The cover letter may name the exact target role and employer only as neutral application context, never as candidate experience. Unsupported vacancy/research terminology belongs only in rankedRequirements, roleResearch, verdict, reasons, or gaps. On a corrective pass, remove the whole unsupported claim; never hide it by spelling out an acronym or replacing it with a synonym.
+Candidate-facing text means tailoredSummary, experienceRewrites[].tailoredHighlights[].text, and coverLetter. Candidate-facing text may use a vacancy acronym, standard, tool, industry term, or responsibility only when it is supported by the candidate's fixed evidence. The cover letter may name the exact target role and employer only as neutral application context, never as candidate experience. Unsupported vacancy/research terminology belongs only in rankedRequirements, roleResearch, verdict, reasons, or gaps. On a corrective pass, remove the whole unsupported claim; never hide it by spelling out an acronym or replacing it with a synonym. This applies even when disclosing a gap: never write a sentence like "does not have experience with X" or "lacks X" in candidate-facing text if X is an unsupported tool, standard, or qualification — omit it by name entirely and put it in reasons/gaps instead. Naming an unsupported term to deny it still counts as adding it.
 
 Treat the vacancy description as the primary source. General role research is secondary context only and must never become candidate evidence. Return ONLY one valid JSON object, with no markdown fence or commentary.`;
 
@@ -206,6 +206,7 @@ Rules for rankedRequirements:
 Rules for every employer:
 - Return exactly one experienceRewrites entry per employer, in input order, copying company exactly. Never rewrite role/date/company.
 - If this employer has enough evidence for the vacancy, set supported=true and create 2 strong tailoredHighlights FIRST. Add a third only when it supports a distinct atomic requirement and is substantially rewritten rather than restating the source. Each highlight may synthesize one or more source bullets, but all indices must belong to this SAME employer.
+- EVERY highlight, not just the third, must be a substantial rewrite of its source bullet(s) — restructure sentence order and phrasing, lead with a different word, combine or split clauses differently. Swapping punctuation (dashes to commas), reordering only two words, or changing a single word while keeping the same sentence structure is NOT a rewrite and will be rejected. If you cannot substantially restructure a bullet while keeping every fact exact, select different source bullets instead.
 - Select the strongest, most relevant evidence. Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
 - Preserve the evidence's participation level for each activity: participated, supported, contributed, or collaborated must never become executed, conducted, led, managed, directed, or owned.
 - Every selected source bullet is replaced by its highlight and therefore MUST NOT appear in remainingBulletOrder. remainingBulletOrder must contain every unselected original index exactly once, ranked by vacancy relevance. This prevents duplication and CV growth.
@@ -382,20 +383,37 @@ function parseRankedRequirements(raw: any, profile: Profile): RankedRequirement[
     const requirement = normalizeSummaryText(item?.requirement);
     const requirementKey = [...comparableTokens(requirement)].sort().join(" ");
     const source = item?.source;
-    if (
-      !/^R\d+$/.test(id) ||
-      ids.has(id) ||
-      !requirement ||
-      !requirementKey ||
-      requirementTexts.has(requirementKey) ||
-      !Number.isInteger(priority) ||
-      priorities.has(priority) ||
-      !["mandatory", "preferred", "context"].includes(importance) ||
-      source !== "job_description"
-    ) {
-      invalid(
-        `Ranked requirement ${itemIndex + 1} must have a unique id/priority, valid importance, and job_description source.`
-      );
+    // Each condition gets its own specific message (instead of one bundled
+    // check) so a corrective pass is told exactly what's wrong with this
+    // requirement rather than having to guess which of six possible
+    // problems it has.
+    const label = `Ranked requirement ${itemIndex + 1}${id ? ` (${id})` : ""}`;
+    if (!/^R\d+$/.test(id)) {
+      invalid(`${label} has an invalid id "${item?.id ?? ""}" — id must match the pattern R<number>, e.g. "R5".`);
+    }
+    if (ids.has(id)) {
+      invalid(`${label} reuses id "${id}", which is already used by an earlier requirement — every id must be unique.`);
+    }
+    if (!requirement) {
+      invalid(`${label} is missing its "requirement" text.`);
+    }
+    if (!requirementKey) {
+      invalid(`${label} ("${requirement}") has no meaningful, comparable content — write a more specific requirement.`);
+    }
+    if (requirementTexts.has(requirementKey)) {
+      invalid(`${label} ("${requirement}") duplicates another requirement's meaning — merge them into one, or rewrite this one to be distinct.`);
+    }
+    if (!Number.isInteger(priority)) {
+      invalid(`${label} has an invalid "priority" value "${item?.priority ?? ""}" — priority must be an integer.`);
+    }
+    if (priorities.has(priority)) {
+      invalid(`${label} reuses priority ${priority}, which is already used by an earlier requirement — every priority must be unique.`);
+    }
+    if (!["mandatory", "preferred", "context"].includes(importance)) {
+      invalid(`${label} has an invalid "importance" value "${importance ?? ""}" — importance must be exactly "mandatory", "preferred", or "context".`);
+    }
+    if (source !== "job_description") {
+      invalid(`${label} has an invalid "source" value "${source ?? ""}" — source must be exactly "job_description".`);
     }
     ids.add(id);
     priorities.add(priority);
@@ -495,6 +513,38 @@ function unsupportedAcronyms(
   );
 }
 
+// A vacancy often defines its own shorthand for the employer, e.g. "Abu
+// Dhabi International Airport (ADIA)" when job.company is "Abu Dhabi
+// Airports" — the cover letter is explicitly allowed to name the target
+// employer as neutral context, and that should cover the employer's own
+// acronym too, not just the literal company string. Deliberately
+// conservative: only trusts a parenthetical acronym when its letters are
+// exactly the preceding phrase's initials AND that phrase shares real
+// wording with the company name — so unrelated JD acronyms defined nearby
+// (e.g. "Air Operations Committee (AOC)" in the same posting) are never
+// swept in just for sharing a generic word like "Air"/"Airport".
+function extractEmployerAcronyms(description: string, company: string): string[] {
+  const companyTokens = comparableTokens(company);
+  if (!companyTokens.size) return [];
+  const found: string[] = [];
+  const pattern = /([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,5})\s*\(([A-Z]{2,6})\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(description))) {
+    const [, phrase, acronym] = match;
+    const initials = phrase
+      .split(/\s+/)
+      .map((word) => word[0])
+      .join("")
+      .toUpperCase();
+    if (initials !== acronym) continue;
+    const phraseTokens = comparableTokens(phrase);
+    if ([...phraseTokens].some((token) => companyTokens.has(token))) {
+      found.push(acronym);
+    }
+  }
+  return found;
+}
+
 function removeUnsupportedAcronymSentences(
   value: unknown,
   sourceText: string,
@@ -529,6 +579,17 @@ function completeProfileEvidence(profile: Profile): string {
   ].join(" ");
 }
 
+// Quotes the exact sentence containing `needle` back into an issue message,
+// so a corrective pass can locate and delete the precise offending text
+// instead of having to search a whole field for a category of problem.
+// Falls back to the full text when sentence-splitting can't isolate it.
+function quoteOffendingSentence(text: string, needle: string | RegExp): string {
+  const sentences = text.match(/[^.!?]+(?:[.!?]+|$)/g) || [text];
+  const pattern = typeof needle === "string" ? new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") : needle;
+  const sentence = sentences.find((candidate) => pattern.test(candidate));
+  return (sentence || text).trim();
+}
+
 function evidenceGuardIssues(
   highlight: string,
   sourceText: string,
@@ -547,23 +608,37 @@ function evidenceGuardIssues(
     (token) => !sourceNumbers.has(normalizedFactToken(token))
   );
   if (addedNumbers.length) {
-    issues.push(`${label} adds unsupported numeric evidence (${addedNumbers.join(", ")}).`);
+    const quoted = quoteOffendingSentence(highlight, addedNumbers[0]);
+    issues.push(
+      `${label} adds unsupported numeric evidence (${addedNumbers.join(", ")}) in: "${quoted}" — delete this whole sentence, do not just remove the number.`
+    );
   }
 
   for (const term of SENSITIVE_FACT_TERMS) {
     const termPattern = new RegExp(`\\b${term.replace(/\s+/g, "\\s+")}\\b`, "i");
     if (termPattern.test(highlight) && !termPattern.test(sourceText)) {
-      issues.push(`${label} adds unsupported tool, framework, or qualification ${term}.`);
+      const quoted = quoteOffendingSentence(highlight, termPattern);
+      issues.push(
+        `${label} adds unsupported tool, framework, or qualification ${term} in: "${quoted}" — delete this whole sentence entirely, even if it only names ${term} to disclaim it; unsupported terms cannot appear in candidate-facing text at all.`
+      );
     }
   }
 
+  // "direct" is deliberately excluded in its bare form (unlike the other
+  // verbs here) — in natural resume writing it's overwhelmingly an adjective
+  // ("direct collaboration", "direct involvement", "direct contact"), not a
+  // management claim, and the source evidence often has "directly"
+  // (adverb) for the same fact — which the word-boundary \b never matches
+  // against bare "direct" anyway, so a harmless directly->direct rewrite
+  // was tripping this as a false "ownership upgrade". directs/directed/
+  // directing are unambiguous verb forms and still count.
   const ownership =
-    /\b(?:lead|leads|leading|led|manage|manages|managed|managing|own|owns|owned|owning|direct|directs|directed|directing|supervise|supervises|supervised|supervising|oversee|oversees|overseeing|oversaw|head|heads|headed|heading|accountable for)\b/i;
+    /\b(?:lead|leads|leading|led|manage|manages|managed|managing|own|owns|owned|owning|directs|directed|directing|supervise|supervises|supervised|supervising|oversee|oversees|overseeing|oversaw|head|heads|headed|heading|accountable for)\b/i;
   if (ownership.test(highlight) && !ownership.test(evidenceScope)) {
     issues.push(`${label} upgrades ownership beyond its same-employer evidence.`);
   }
   const auditOwnership =
-    /\b(?:execut(?:e|es|ed|ing)|conduct(?:s|ed|ing)?|perform(?:s|ed|ing)?|lead(?:s|ing)?|led|manage(?:s|d|ment|ing)?|direct(?:s|ed|ing)?)\b[^.]{0,60}\baudits?\b/i;
+    /\b(?:execut(?:e|es|ed|ing)|conduct(?:s|ed|ing)?|perform(?:s|ed|ing)?|lead(?:s|ing)?|led|manage(?:s|d|ment|ing)?|direct(?:s|ed|ing))\b[^.]{0,60}\baudits?\b/i;
   if (auditOwnership.test(highlight) && !auditOwnership.test(evidenceText)) {
     issues.push(`${label} upgrades participation in audits into audit ownership.`);
   }
@@ -674,7 +749,12 @@ function applyExperienceHighlightsV3(
         // A near-copy is not a tailored highlight. Preserve its original
         // source bullets in the remaining list instead of rejecting an
         // otherwise usable manual response or presenting unchanged text as
-        // newly tailored content.
+        // newly tailored content. Surfaced explicitly (not just a silent
+        // drop) so a corrective pass knows exactly which highlight and text
+        // needs a substantive rewrite, not just punctuation changes.
+        qualityIssues.push(
+          `${label} ("${text}") is a near-verbatim copy of its source bullet ("${sourceText}") — substantially rephrase the sentence structure and wording while preserving every fact exactly.`
+        );
         restoredSourceIndexes.push(...sourceBulletIndices);
         continue;
       }
@@ -682,6 +762,7 @@ function applyExperienceHighlightsV3(
         qualityIssues.push(`${label} references an unknown ranked requirement.`);
       }
       const validatedRequirementIds: string[] = [];
+      const failedRequirements: string[] = [];
       for (const requirementId of requirementIds) {
         const requirement = requirementById.get(requirementId);
         if (!requirement) continue;
@@ -697,11 +778,13 @@ function applyExperienceHighlightsV3(
           requirementLinkIsSupported(requirement.requirement, text, sourceText, entry.role)
         ) {
           validatedRequirementIds.push(requirementId);
+        } else {
+          failedRequirements.push(`${requirementId} ("${requirement.requirement}")`);
         }
       }
       if (validatedRequirementIds.length === 0) {
         qualityIssues.push(
-          `${label} must visibly connect its selected evidence to at least one atomic job requirement.`
+          `${label} ("${text}") must visibly connect its selected evidence to at least one atomic job requirement — it is tagged to ${failedRequirements.join(", ") || "no valid requirement"} but shares no concrete wording with ${failedRequirements.length === 1 ? "it" : "any of them"}. Rewrite the highlight to explicitly reflect that requirement's language, or retag it to a requirement it actually supports.`
         );
       }
       qualityIssues.push(...evidenceGuardIssues(text, sourceText, entry.role, label));
@@ -1276,7 +1359,7 @@ function validateTailoringQuality(
       completeProfileEvidenceText,
       profile.title,
       "Cover letter",
-      `${job.title} ${job.company}`
+      `${job.title} ${job.company} ${extractEmployerAcronyms(job.description, job.company).join(" ")}`
     )
   );
   if (analysis.reasons.length !== 3) {
@@ -1288,7 +1371,7 @@ function validateTailoringQuality(
 function rawNarrativeEvidenceIssues(
   raw: any,
   profile: Profile,
-  job: Pick<Job, "title" | "company">
+  job: Pick<Job, "title" | "company" | "description">
 ): string[] {
   const completeProfileEvidenceText = completeProfileEvidence(profile);
   const summary = trimSummaryToMaximum(raw?.tailoredSummary || "");
@@ -1305,7 +1388,7 @@ function rawNarrativeEvidenceIssues(
       completeProfileEvidenceText,
       profile.title,
       "Cover letter",
-      `${job.title} ${job.company}`
+      `${job.title} ${job.company} ${extractEmployerAcronyms(job.description, job.company).join(" ")}`
     ),
   ];
 }
