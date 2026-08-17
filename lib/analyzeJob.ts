@@ -19,6 +19,7 @@ const TRANSIENT_PROVIDER_STATUSES = new Set([429, 500, 502, 503, 529]);
 const SUMMARY_MIN_CHARS = 1050;
 const SUMMARY_MAX_CHARS = 1100;
 const EXPERIENCE_REWRITE_VERSION = 3;
+const PROMPT_SCHEMA_REVISION = "cv-tailoring-v3.1";
 const MIN_FULL_JOB_DESCRIPTION_CHARS = 240;
 const MAX_MODEL_TOKENS = 6000;
 const WEB_SEARCH_TOOL = {
@@ -83,6 +84,8 @@ Your objective is to make the CV visibly and specifically relevant to this vacan
 
 Never invent or upgrade an employer, date, metric, tool, qualification, certification, responsibility, seniority, team size, budget, client, industry, or outcome. Never imply ownership when the evidence only shows participation. Requirements without evidence belong in the fit reasons, not the CV. Employer/department labels, role labels, dates, education, and skill values are immutable; skills may only be reordered.
 
+Candidate-facing text means tailoredSummary, experienceRewrites[].tailoredHighlights[].text, and coverLetter. Candidate-facing text may use a vacancy acronym, standard, tool, industry term, or responsibility only when it is supported by the candidate's fixed evidence. The cover letter may name the exact target role and employer only as neutral application context, never as candidate experience. Unsupported vacancy/research terminology belongs only in rankedRequirements, roleResearch, verdict, reasons, or gaps. On a corrective pass, remove the whole unsupported claim; never hide it by spelling out an acronym or replacing it with a synonym.
+
 Treat the vacancy description as the primary source. General role research is secondary context only and must never become candidate evidence. Return ONLY one valid JSON object, with no markdown fence or commentary.`;
 
 interface BuildPromptOptions {
@@ -116,7 +119,9 @@ export function buildPrompt(
     ? `\nCORRECTIVE PASS: The previous response failed these checks. Fix every item without changing protected facts:\n${options.correctionIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}\n`
     : "";
 
-  return `TARGET VACANCY (analyze the entire description, not only keywords)
+  return `PROMPT_SCHEMA_REVISION: ${PROMPT_SCHEMA_REVISION}
+
+TARGET VACANCY (analyze the entire description, not only keywords)
 TITLE: ${job.title}
 COMPANY: ${job.company}
 LOCATION: ${job.location || "n/a"}
@@ -150,6 +155,7 @@ ${experienceBlock || "(none)"}
 ${correction}
 Return this exact schema:
 {
+  "promptSchemaRevision": "${PROMPT_SCHEMA_REVISION}",
   "score": <integer 0-100>,
   "verdict": "<one concise fit sentence>",
   "reasons": ["<exactly 3 concise evidence/gap reasons>"],
@@ -467,6 +473,62 @@ function normalizedFactToken(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9%]+/g, "");
 }
 
+const BENIGN_NARRATIVE_ACRONYMS = new Set(["CV", "JD"]);
+
+function extractAcronyms(value: string): Set<string> {
+  return new Set(
+    (value.match(/\b[A-Z][A-Z0-9]{1,9}(?:s|es)?\b/g) || [])
+      // CV prose commonly pluralizes acronyms (KPIs, SLAs, APIs, NCRs).
+      .map((token) => token.replace(/(?:es|s)$/, "").toUpperCase())
+      .filter((token) => !/^\d+$/.test(token))
+  );
+}
+
+function unsupportedAcronyms(
+  value: string,
+  sourceText: string,
+  allowedContext = ""
+): string[] {
+  const supported = extractAcronyms(`${sourceText} ${allowedContext}`);
+  return [...extractAcronyms(value)].filter(
+    (token) => !BENIGN_NARRATIVE_ACRONYMS.has(token) && !supported.has(token)
+  );
+}
+
+function removeUnsupportedAcronymSentences(
+  value: unknown,
+  sourceText: string,
+  allowedContext = ""
+): string {
+  const text = normalizeSummaryText(value);
+  if (!text) return "";
+  const sentences = text.match(/[^.!?]+(?:[.!?]+|$)/g) || [text];
+  return normalizeSummaryText(
+    sentences
+      .filter((sentence) => unsupportedAcronyms(sentence, sourceText, allowedContext).length === 0)
+      .join(" ")
+  );
+}
+
+function completeProfileEvidence(profile: Profile): string {
+  return [
+    profile.name,
+    profile.title,
+    profile.location,
+    profile.summary,
+    ...profile.skills,
+    ...profile.education,
+    ...profile.certifications,
+    ...profile.languages,
+    ...profile.experience.flatMap((entry) => [
+      entry.company,
+      entry.role,
+      entry.dates,
+      ...entry.bullets,
+    ]),
+  ].join(" ");
+}
+
 function evidenceGuardIssues(
   highlight: string,
   sourceText: string,
@@ -526,23 +588,10 @@ function evidenceGuardIssues(
   // Catch arbitrary acronyms that a fixed allow-list cannot anticipate. Target
   // company/title acronyms are allowed only where explicitly passed as context;
   // tools, frameworks and qualifications still need to exist in CV evidence.
-  const acronyms = (value: string): Set<string> =>
-    new Set(
-      (value.match(/\b[A-Z][A-Z0-9]{1,9}(?:s|es)?\b/g) || [])
-        // CV prose commonly pluralizes acronyms (KPIs, SLAs, APIs, NCRs).
-        // Normalize that grammatical suffix before comparing evidence so a
-        // singular rewrite is not mistaken for a newly invented acronym.
-        .map((token) => token.replace(/(?:es|s)$/, "").toUpperCase())
-        .filter((token) => !/^\d+$/.test(token))
-    );
-  const supportedAcronyms = acronyms(`${evidenceText} ${allowedContext}`);
-  const benignAcronyms = new Set(["CV", "JD"]);
-  const unsupportedAcronyms = [...acronyms(highlight)].filter(
-    (token) => !benignAcronyms.has(token) && !supportedAcronyms.has(token)
-  );
-  if (unsupportedAcronyms.length) {
+  const addedAcronyms = unsupportedAcronyms(highlight, evidenceText, allowedContext);
+  if (addedAcronyms.length) {
     issues.push(
-      `${label} adds unsupported acronym${unsupportedAcronyms.length === 1 ? "" : "s"} (${unsupportedAcronyms.join(", ")}).`
+      `${label} adds unsupported acronym${addedAcronyms.length === 1 ? "" : "s"} (${addedAcronyms.join(", ")}).`
     );
   }
   return issues;
@@ -1134,26 +1183,16 @@ function validateTailoringQuality(
       "The raw tailoredSummary itself must be a complete rewrite of at least 1050 characters; do not rely on appended original CV text."
     );
   }
-  const completeProfileEvidence = [
-    profile.title,
-    profile.location,
-    profile.summary,
-    ...profile.skills,
-    ...profile.education,
-    ...profile.certifications,
-    ...profile.languages,
-    ...profile.experience.flatMap((entry) => [entry.role, ...entry.bullets]),
-  ].join(" ");
+  const completeProfileEvidenceText = completeProfileEvidence(profile);
   if (summary.length < SUMMARY_MIN_CHARS || summary.length > SUMMARY_MAX_CHARS) {
     issues.push("Rewrite the profile to exactly 1050-1100 characters including spaces.");
   }
   issues.push(
     ...evidenceGuardIssues(
       summary,
-      completeProfileEvidence,
+      completeProfileEvidenceText,
       profile.title,
-      "Tailored profile",
-      `${job.title} ${job.company}`
+      "Tailored profile"
     )
   );
   if (profile.summary && tokenJaccard(summary, profile.summary) > 0.72) {
@@ -1234,7 +1273,7 @@ function validateTailoringQuality(
   issues.push(
     ...evidenceGuardIssues(
       analysis.coverLetter,
-      completeProfileEvidence,
+      completeProfileEvidenceText,
       profile.title,
       "Cover letter",
       `${job.title} ${job.company}`
@@ -1251,29 +1290,19 @@ function rawNarrativeEvidenceIssues(
   profile: Profile,
   job: Pick<Job, "title" | "company">
 ): string[] {
-  const completeProfileEvidence = [
-    profile.title,
-    profile.location,
-    profile.summary,
-    ...profile.skills,
-    ...profile.education,
-    ...profile.certifications,
-    ...profile.languages,
-    ...profile.experience.flatMap((entry) => [entry.role, ...entry.bullets]),
-  ].join(" ");
+  const completeProfileEvidenceText = completeProfileEvidence(profile);
   const summary = trimSummaryToMaximum(raw?.tailoredSummary || "");
   const coverLetter = normalizeSummaryText(raw?.coverLetter);
   return [
     ...evidenceGuardIssues(
       summary,
-      completeProfileEvidence,
+      completeProfileEvidenceText,
       profile.title,
-      "Tailored profile",
-      `${job.title} ${job.company}`
+      "Tailored profile"
     ),
     ...evidenceGuardIssues(
       coverLetter,
-      completeProfileEvidence,
+      completeProfileEvidenceText,
       profile.title,
       "Cover letter",
       `${job.title} ${job.company}`
@@ -1307,15 +1336,122 @@ export function toAnalysis(parsed: any, profile: Profile): Analysis {
   };
 }
 
+function hasUnmistakableV3Shape(raw: any, profile: Profile): boolean {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  if (raw.experienceRewriteVersion !== undefined && raw.experienceRewriteVersion !== null) {
+    return false;
+  }
+  const requirements = Array.isArray(raw.rankedRequirements) ? raw.rankedRequirements : [];
+  if (requirements.length < 6 || requirements.length > 10) return false;
+
+  const skillsOrder = Array.isArray(raw.skillsOrder) ? raw.skillsOrder.map(Number) : [];
+  if (
+    skillsOrder.length !== profile.skills.length ||
+    new Set(skillsOrder).size !== skillsOrder.length ||
+    skillsOrder.some(
+      (index: number) =>
+        !Number.isInteger(index) || index < 0 || index >= profile.skills.length
+    )
+  ) {
+    return false;
+  }
+
+  const rewrites = Array.isArray(raw.experienceRewrites) ? raw.experienceRewrites : [];
+  if (rewrites.length !== profile.experience.length) return false;
+  const seenExperienceIndexes = new Set<number>();
+  return rewrites.every((rewrite: any) => {
+    if (!rewrite || typeof rewrite !== "object") return false;
+    if ("bulletsToRewrite" in rewrite || "rewrittenBullets" in rewrite) return false;
+    const experienceIndex = Number(rewrite.experienceIndex);
+    const entry = profile.experience[experienceIndex];
+    if (
+      !Number.isInteger(experienceIndex) ||
+      !entry ||
+      seenExperienceIndexes.has(experienceIndex) ||
+      normalizeSummaryText(rewrite.company) !== canonicalizeExperienceCompanyName(entry.company) ||
+      typeof rewrite.supported !== "boolean" ||
+      !Array.isArray(rewrite.tailoredHighlights) ||
+      !Array.isArray(rewrite.remainingBulletOrder)
+    ) {
+      return false;
+    }
+    seenExperienceIndexes.add(experienceIndex);
+    return rewrite.tailoredHighlights.every(
+      (highlight: any) =>
+        highlight &&
+        typeof highlight === "object" &&
+        Boolean(normalizeSummaryText(highlight.text)) &&
+        Array.isArray(highlight.sourceBulletIndices) &&
+        highlight.sourceBulletIndices.length > 0 &&
+        Array.isArray(highlight.requirementIds) &&
+        highlight.requirementIds.length > 0
+    );
+  });
+}
+
+function prepareValidationPayload(
+  parsed: any,
+  profile: Profile,
+  job: Pick<Job, "title" | "company">
+): any {
+  const prepared = hasUnmistakableV3Shape(parsed, profile)
+    ? { ...parsed, experienceRewriteVersion: EXPERIENCE_REWRITE_VERSION }
+    : { ...parsed };
+  if (Number(prepared.experienceRewriteVersion) !== EXPERIENCE_REWRITE_VERSION) {
+    throw new TailoringQualityError([
+      "Use experienceRewriteVersion 3 and return the complete evidence-linked tailoring schema.",
+    ]);
+  }
+  const evidence = completeProfileEvidence(profile);
+  const rawSummary = normalizeSummaryText(prepared.tailoredSummary);
+  const cleanedSummary = removeUnsupportedAcronymSentences(
+    rawSummary,
+    evidence
+  );
+  const summaryRetainedEnough =
+    rawSummary.length >= SUMMARY_MIN_CHARS &&
+    cleanedSummary.length >= 850 &&
+    cleanedSummary.length / rawSummary.length >= 0.7;
+  if (cleanedSummary !== rawSummary && summaryRetainedEnough) {
+    prepared.tailoredSummary = ensureTailoredSummaryLength(
+      cleanedSummary,
+      profile,
+      preferredRequirementFacts(prepared, profile)
+    );
+  }
+
+  const rawCoverLetter = normalizeSummaryText(prepared.coverLetter);
+  const cleanedCoverLetter = removeUnsupportedAcronymSentences(
+    rawCoverLetter,
+    evidence,
+    `${job.title} ${job.company}`
+  );
+  const rawCoverWordCount = rawCoverLetter.split(/\s+/).filter(Boolean).length;
+  const cleanedCoverWordCount = cleanedCoverLetter.split(/\s+/).filter(Boolean).length;
+  // A mostly contaminated cover letter should be corrected by Claude instead
+  // of being silently reduced to a fragment. A single unsupported sentence in
+  // an otherwise complete letter can be removed deterministically and safely.
+  if (
+    cleanedCoverLetter !== rawCoverLetter &&
+    cleanedCoverWordCount >= 60 &&
+    rawCoverWordCount > 0 &&
+    cleanedCoverWordCount / rawCoverWordCount >= 0.7
+  ) {
+    prepared.coverLetter = cleanedCoverLetter;
+  }
+  return prepared;
+}
+
 export function toValidatedAnalysis(
   parsed: any,
   profile: Profile,
   job: Pick<Job, "title" | "company" | "description">
 ): Analysis {
-  const narrativeIssues = rawNarrativeEvidenceIssues(parsed, profile, job);
+  const prepared = prepareValidationPayload(parsed, profile, job);
+  const narrativeIssues = rawNarrativeEvidenceIssues(prepared, profile, job);
   let analysis: Analysis;
   try {
-    analysis = toAnalysis(parsed, profile);
+    analysis = toAnalysis(prepared, profile);
   } catch (error) {
     if (error instanceof TailoringQualityError && narrativeIssues.length) {
       throw new TailoringQualityError([...new Set([...error.issues, ...narrativeIssues])]);
@@ -1323,7 +1459,7 @@ export function toValidatedAnalysis(
     throw error;
   }
   try {
-    validateTailoringQuality(parsed, profile, analysis, job);
+    validateTailoringQuality(prepared, profile, analysis, job);
   } catch (error) {
     if (error instanceof TailoringQualityError && narrativeIssues.length) {
       throw new TailoringQualityError([...new Set([...error.issues, ...narrativeIssues])]);
@@ -1520,7 +1656,7 @@ export async function analyzeJobForCandidate(
   const key = process.env.ANTHROPIC_API_KEY;
   const masterCV = buildMasterCVMarkdown(candidateProfile);
 
-  if (process.env.DEMO_MODE === "true" || !key) {
+  if (process.env.DEMO_MODE === "true") {
     const demo = buildDemoAnalysis(job as Job, masterCV, "Simulated preview - Claude was not called.");
     return {
       ...demo,
@@ -1530,6 +1666,12 @@ export async function analyzeJobForCandidate(
       },
     };
   }
+  if (!key) {
+    throw new LiveAnalysisError(
+      "Live tailoring is not configured. Add ANTHROPIC_API_KEY or explicitly enable demo mode.",
+      503
+    );
+  }
   if (normalizeSummaryText(job.description).length < MIN_FULL_JOB_DESCRIPTION_CHARS) {
     throw new LiveAnalysisError(
       "This listing does not include a complete job description. Open the posting or paste the full description before tailoring.",
@@ -1537,7 +1679,7 @@ export async function analyzeJobForCandidate(
     );
   }
 
-  const deadline = Date.now() + 52_000;
+  const deadline = Date.now() + 54_000;
   let researchBrief: RoleResearchBrief | null = await settleWithin(
     loadRoleResearchBrief(job),
     1_500,
@@ -1550,7 +1692,7 @@ export async function analyzeJobForCandidate(
 
   try {
     try {
-      const firstResult = await callClaude(job, candidateProfile, key, firstOptions, 34_000);
+      const firstResult = await callClaude(job, candidateProfile, key, firstOptions, 28_000);
       if (!researchBrief && firstResult.webSearchRequests > 0) {
         researchBrief = await settleWithin(
           saveRoleResearchBrief(job, firstResult.parsed?.roleResearch, firstResult.researchSources),
@@ -1592,7 +1734,7 @@ export async function analyzeJobForCandidate(
         requestWebResearch: false,
         correctionIssues,
       },
-      Math.min(remainingMs, 18_000)
+      Math.min(remainingMs, 24_000)
     );
     const correctedAnalysis = toValidatedAnalysis(correctedResult.parsed, candidateProfile, job);
     return correctedAnalysis;
