@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import {
   LiveAnalysisError,
+  SYSTEM,
+  TailoringQualityError,
+  buildPrompt,
   parseModelResponse,
   toValidatedAnalysis,
 } from "@/lib/analyzeJob";
@@ -48,6 +51,7 @@ export async function POST(req: Request) {
   const targetJob = {
     title: job.title.trim(),
     company: typeof job.company === "string" ? job.company.trim() : "",
+    location: typeof job.location === "string" ? job.location.trim() : "",
     description: job.description.trim(),
   };
   try {
@@ -56,6 +60,22 @@ export async function POST(req: Request) {
     return NextResponse.json(analysis);
   } catch (error: any) {
     console.error("Failed to import a pasted claude.ai response", error);
+    if (error instanceof TailoringQualityError) {
+      const visibleIssues = error.issues.slice(0, 3);
+      const remainingIssueCount = Math.max(0, error.issues.length - visibleIssues.length);
+      const correctionPrompt = `${SYSTEM}\n\n${buildPrompt(targetJob, candidateProfile, {
+        requestWebResearch: false,
+        correctionIssues: error.issues.slice(0, 10),
+      })}`;
+      return NextResponse.json(
+        {
+          error: `Claude's JSON is valid, but it needs ${error.issues.length} evidence correction${error.issues.length === 1 ? "" : "s"}: ${visibleIssues.join(" ")}${remainingIssueCount ? ` Plus ${remainingIssueCount} more in the prepared correction prompt.` : ""}`,
+          issues: error.issues,
+          correctionPrompt,
+        },
+        { status: 422 }
+      );
+    }
     const status = error instanceof LiveAnalysisError ? error.status : 400;
     const message =
       error instanceof LiveAnalysisError

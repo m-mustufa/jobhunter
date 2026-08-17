@@ -779,7 +779,20 @@ export default function Home() {
         body: JSON.stringify({ text: pasteText, profile: analysisProfile, job: analysisJob }),
       });
       const data = await r.json().catch(() => null);
-      if (!r.ok) throw new Error(data?.error || "Could not import that response.");
+      if (!r.ok) {
+        const correctionPrompt =
+          typeof data?.correctionPrompt === "string" ? data.correctionPrompt : "";
+        patchFreeTailor({
+          importing: false,
+          importError: correctionPrompt
+            ? `${data?.error || "That response failed the evidence checks."} A correction prompt is ready above — reopen Claude Desktop, then paste its corrected reply.`
+            : data?.error || "Could not import that response.",
+          ...(correctionPrompt
+            ? { prompt: correctionPrompt, promptError: null, pasteText: "", copied: false }
+            : {}),
+        });
+        return;
+      }
       const analysis = data as Analysis;
       const tailoredAt = Date.now();
       const completedItem: BatchItem = { ...item, analysis, tailoredAt, status: "done" };

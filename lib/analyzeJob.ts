@@ -53,7 +53,7 @@ export class LiveAnalysisError extends Error {
   }
 }
 
-class TailoringQualityError extends Error {
+export class TailoringQualityError extends Error {
   issues: string[];
 
   constructor(issues: string[]) {
@@ -194,15 +194,17 @@ Return this exact schema:
 Rules for rankedRequirements:
 - Return 6-10 requirements ranked by importance after reading the COMPLETE job description. Every item must use source "job_description"; role research is context only and stays in roleResearch.
 - Set importance to "mandatory", "preferred", or "context" based only on how the vacancy itself presents the requirement. Rank mandatory requirements first.
+- Keep each requirement atomic. Do not combine a supported duty with a separate unsupported duty, tool, qualification, or scope in one requirement.
 - Evidence must point only to bullet indices that genuinely support the requirement. Use an empty evidence array for unsupported requirements; never manufacture a link.
 
 Rules for every employer:
 - Return exactly one experienceRewrites entry per employer, in input order, copying company exactly. Never rewrite role/date/company.
-- If this employer has enough evidence for the vacancy, set supported=true and create 2-3 strong tailoredHighlights FIRST. Each highlight may synthesize one or more source bullets, but all indices must belong to this SAME employer.
+- If this employer has enough evidence for the vacancy, set supported=true and create 2 strong tailoredHighlights FIRST. Add a third only when it supports a distinct atomic requirement and is substantially rewritten rather than restating the source. Each highlight may synthesize one or more source bullets, but all indices must belong to this SAME employer.
 - Select the strongest, most relevant evidence. Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
+- Preserve the evidence's participation level for each activity: participated, supported, contributed, or collaborated must never become executed, conducted, led, managed, directed, or owned.
 - Every selected source bullet is replaced by its highlight and therefore MUST NOT appear in remainingBulletOrder. remainingBulletOrder must contain every unselected original index exactly once, ranked by vacancy relevance. This prevents duplication and CV growth.
 - If fewer than two defensible highlights exist, set supported=false, return no highlights, and put every original bullet index once in remainingBulletOrder, still ranked by relevance.
-- A requirementIds value must identify a ranked requirement actually supported by that highlight's source bullets.
+- Give each highlight only 1-2 requirementIds. Each id must identify an atomic ranked requirement directly supported by that highlight's selected source bullets. Do not tag a requirement merely because it is generally related or transferable.
 
 The final CV must look specifically written for this vacancy, but every claim must remain traceable to the fixed candidate evidence. Count tailoredSummary characters before returning. Return JSON only.`;
 }
@@ -493,9 +495,15 @@ function evidenceGuardIssues(
     }
   }
 
-  const ownership = /\b(led|lead|managed|owned|directed|supervised|oversaw|headed|accountable for)\b/i;
+  const ownership =
+    /\b(?:lead|leads|leading|led|manage|manages|managed|managing|own|owns|owned|owning|direct|directs|directed|directing|supervise|supervises|supervised|supervising|oversee|oversees|overseeing|oversaw|head|heads|headed|heading|accountable for)\b/i;
   if (ownership.test(highlight) && !ownership.test(evidenceScope)) {
     issues.push(`${label} upgrades ownership beyond its same-employer evidence.`);
+  }
+  const auditOwnership =
+    /\b(?:execut(?:e|es|ed|ing)|conduct(?:s|ed|ing)?|perform(?:s|ed|ing)?|lead(?:s|ing)?|led|manage(?:s|d|ment|ing)?|direct(?:s|ed|ing)?)\b[^.]{0,60}\baudits?\b/i;
+  if (auditOwnership.test(highlight) && !auditOwnership.test(evidenceText)) {
+    issues.push(`${label} upgrades participation in audits into audit ownership.`);
   }
   const qualification = /\b(certified|certification|degree|bachelor(?:'s)?|master(?:'s)?|chartered)\b/i;
   if (qualification.test(highlight) && !qualification.test(sourceLower)) {
@@ -520,8 +528,11 @@ function evidenceGuardIssues(
   // tools, frameworks and qualifications still need to exist in CV evidence.
   const acronyms = (value: string): Set<string> =>
     new Set(
-      (value.match(/\b[A-Z][A-Z0-9]{1,9}\b/g) || [])
-        .map((token) => token.toUpperCase())
+      (value.match(/\b[A-Z][A-Z0-9]{1,9}(?:s|es)?\b/g) || [])
+        // CV prose commonly pluralizes acronyms (KPIs, SLAs, APIs, NCRs).
+        // Normalize that grammatical suffix before comparing evidence so a
+        // singular rewrite is not mistaken for a newly invented acronym.
+        .map((token) => token.replace(/(?:es|s)$/, "").toUpperCase())
         .filter((token) => !/^\d+$/.test(token))
     );
   const supportedAcronyms = acronyms(`${evidenceText} ${allowedContext}`);
@@ -575,7 +586,9 @@ function applyExperienceHighlightsV3(
       );
     }
 
+    const seenSourceIndexes = new Set<number>();
     const usedSourceIndexes = new Set<number>();
+    const restoredSourceIndexes: number[] = [];
     const highlights: TailoredHighlight[] = [];
     for (let highlightIndex = 0; highlightIndex < rawHighlights.length; highlightIndex += 1) {
       const rawHighlight = rawHighlights[highlightIndex];
@@ -598,60 +611,71 @@ function applyExperienceHighlightsV3(
             !Number.isInteger(bulletIndex) ||
             bulletIndex < 0 ||
             bulletIndex >= entry.bullets.length ||
-            usedSourceIndexes.has(bulletIndex)
+            seenSourceIndexes.has(bulletIndex)
         )
       ) {
         qualityIssues.push(`${label} must use valid, non-reused bullets from the same employer.`);
         continue;
       }
+      sourceBulletIndices.forEach((index: number) => seenSourceIndexes.add(index));
       const sourceText = sourceBulletIndices
         .map((index: number) => entry.bullets[index])
         .join(" ");
+      if (tokenJaccard(text, sourceText) > 0.9) {
+        // A near-copy is not a tailored highlight. Preserve its original
+        // source bullets in the remaining list instead of rejecting an
+        // otherwise usable manual response or presenting unchanged text as
+        // newly tailored content.
+        restoredSourceIndexes.push(...sourceBulletIndices);
+        continue;
+      }
       if (requirementIds.some((id: string) => !requirementById.has(id))) {
         qualityIssues.push(`${label} references an unknown ranked requirement.`);
       }
+      const validatedRequirementIds: string[] = [];
       for (const requirementId of requirementIds) {
         const requirement = requirementById.get(requirementId);
-        const evidenceForEmployer = requirement?.evidence.find(
-          (reference) => reference.experienceIndex === experienceIndex
-        );
+        if (!requirement) continue;
+        const tracesDeclaredEvidence = requirement.evidence
+          .filter((reference) => reference.experienceIndex === experienceIndex)
+          .some((reference) =>
+            sourceBulletIndices.some((bulletIndex: number) =>
+              reference.bulletIndices.includes(bulletIndex)
+            )
+          );
         if (
-          !evidenceForEmployer ||
-          !sourceBulletIndices.some((bulletIndex: number) =>
-            evidenceForEmployer.bulletIndices.includes(bulletIndex)
-          )
+          tracesDeclaredEvidence &&
+          requirementLinkIsSupported(requirement.requirement, text, sourceText, entry.role)
         ) {
-          qualityIssues.push(`${label} does not trace ${requirementId} to its declared evidence.`);
+          validatedRequirementIds.push(requirementId);
         }
-        if (requirement) {
-          const requirementTokens = comparableTokens(requirement.requirement);
-          const highlightTokens = comparableTokens(text);
-          const evidenceTokens = comparableTokens(`${sourceText} ${entry.role}`);
-          const minimumDirectLinks = 1;
-          const highlightLinks = [...requirementTokens].filter((token) =>
-            highlightTokens.has(token)
-          ).length;
-          const evidenceLinks = [...requirementTokens].filter((token) =>
-            evidenceTokens.has(token)
-          ).length;
-          if (requirementTokens.size && highlightLinks < minimumDirectLinks) {
-            qualityIssues.push(`${label} does not visibly address ${requirementId}.`);
-          }
-          if (requirementTokens.size && evidenceLinks < minimumDirectLinks) {
-            qualityIssues.push(
-              `${label} links ${requirementId} to source bullets that do not directly support it.`
-            );
-          }
-        }
+      }
+      if (validatedRequirementIds.length === 0) {
+        qualityIssues.push(
+          `${label} must visibly connect its selected evidence to at least one atomic job requirement.`
+        );
       }
       qualityIssues.push(...evidenceGuardIssues(text, sourceText, entry.role, label));
       sourceBulletIndices.forEach((index: number) => usedSourceIndexes.add(index));
-      highlights.push({ text, sourceBulletIndices, requirementIds });
+      highlights.push({
+        text,
+        sourceBulletIndices,
+        requirementIds: validatedRequirementIds.slice(0, 2),
+      });
     }
 
-    const remainingBulletOrder = Array.isArray(rawRewrite?.remainingBulletOrder)
-      ? rawRewrite.remainingBulletOrder.map(Number)
-      : [];
+    if (supported && highlights.length < 2) {
+      qualityIssues.push(
+        `${expectedCompany}: at least two highlights must be substantially rewritten and job-relevant.`
+      );
+    }
+
+    const remainingBulletOrder = [
+      ...restoredSourceIndexes,
+      ...(Array.isArray(rawRewrite?.remainingBulletOrder)
+        ? rawRewrite.remainingBulletOrder.map(Number)
+        : []),
+    ];
     const expectedRemaining = entry.bullets
       .map((_, bulletIndex) => bulletIndex)
       .filter((bulletIndex) => !usedSourceIndexes.has(bulletIndex));
@@ -935,6 +959,7 @@ function buildEvidenceAuditTrail(raw: any, profile: Profile): Analysis["auditTra
       const statement = normalizeSummaryText(highlight?.text);
       const sourceBullets = sourceIndices.map((index: number) => employer.bullets[index]);
       if (!statement || !sourceBullets.length) continue;
+      if (tokenJaccard(statement, sourceBullets.join(" ")) > 0.9) continue;
       entries.push({
         statement,
         source: `${employer.company}: ${sourceBullets.join(" | ")}`,
@@ -978,6 +1003,97 @@ function comparableTokens(value: string): Set<string> {
   );
 }
 
+const GENERIC_REQUIREMENT_TOKENS = new Set([
+  "experience",
+  "manager",
+  "manage",
+  "manag",
+  "management",
+  "lead",
+  "led",
+  "own",
+  "ownership",
+  "accountable",
+  "direct",
+  "oversee",
+  "supervis",
+  "head",
+  "senior",
+  "director",
+  "department",
+  "departmental",
+  "responsibility",
+  "responsibilities",
+  "role",
+  "strong",
+]);
+
+function canonicalRequirementConcept(token: string): string {
+  if (/^technolog/.test(token) || /^(software|hardware|automation|tools?)$/.test(token)) {
+    return "technology";
+  }
+  if (
+    /^(stakeholders?|partners?|partnerships?|customers?|clients?|relationships?|liaison)$/.test(token)
+  ) {
+    return "stakeholder";
+  }
+  if (/^(collaborat\w*|coordinat\w*|engag\w*|negotiat\w*)$/.test(token)) {
+    return "stakeholder";
+  }
+  if (/^(reports?|reporting|dashboards?|presentations?)$/.test(token)) {
+    return "report";
+  }
+  if (/^(teams?|people|staff|employees?|workforce|emirati[sz]ation)$/.test(token)) {
+    return "people";
+  }
+  if (/^(kpis?|slas?|targets?|objectives?|performance)$/.test(token)) {
+    return "performance";
+  }
+  if (/^(strateg\w*|plans?|planning)$/.test(token)) {
+    return "strategy";
+  }
+  if (/^(govern\w*|polic\w*|procedures?)$/.test(token)) {
+    return "governance";
+  }
+  if (/^(complian\w*|regulat\w*|safety|security|hse|audits?)$/.test(token)) {
+    return "compliance";
+  }
+  if (/^(budget\w*|expenditure|costs?|financial)$/.test(token)) {
+    return "budget";
+  }
+  if (/^(represent\w*|advoca\w*|committees?|forums?)$/.test(token)) {
+    return "representation";
+  }
+  if (/^(organis\w*|organiz\w*)$/.test(token)) {
+    return "organization";
+  }
+  return token
+    .replace(/(?:ies)$/, "y")
+    .replace(/(?:ing|ed|es|s)$/, "");
+}
+
+function requirementConceptTokens(value: string): Set<string> {
+  return new Set(
+    [...comparableTokens(value)]
+      .map(canonicalRequirementConcept)
+      .filter((token) => token.length > 2 && !GENERIC_REQUIREMENT_TOKENS.has(token))
+  );
+}
+
+function requirementLinkIsSupported(
+  requirement: string,
+  highlight: string,
+  sourceText: string,
+  originalRole: string
+): boolean {
+  const requirementTokens = requirementConceptTokens(requirement);
+  const highlightTokens = requirementConceptTokens(highlight);
+  const evidenceTokens = requirementConceptTokens(`${sourceText} ${originalRole}`);
+  return [...requirementTokens].some(
+    (token) => highlightTokens.has(token) && evidenceTokens.has(token)
+  );
+}
+
 function tokenJaccard(left: string, right: string): number {
   const leftTokens = comparableTokens(left);
   const rightTokens = comparableTokens(right);
@@ -1001,6 +1117,7 @@ function validateTailoringQuality(
     ]);
   }
   const requirements = parseRankedRequirements(raw, profile);
+  const requirementById = new Map(requirements.map((requirement) => [requirement.id, requirement]));
   const issues: string[] = [];
   const jobDescriptionTokens = comparableTokens(job.description);
   requirements.forEach((requirement) => {
@@ -1012,9 +1129,9 @@ function validateTailoringQuality(
   });
   const rawSummary = normalizeSummaryText(raw?.tailoredSummary);
   const summary = analysis.tailoredCV.summary;
-  if (rawSummary.length < SUMMARY_MIN_CHARS || rawSummary.length > SUMMARY_MAX_CHARS) {
+  if (rawSummary.length < SUMMARY_MIN_CHARS) {
     issues.push(
-      "The raw tailoredSummary itself must be a complete 1050-1100 character rewrite; do not rely on appended original CV text."
+      "The raw tailoredSummary itself must be a complete rewrite of at least 1050 characters; do not rely on appended original CV text."
     );
   }
   const completeProfileEvidence = [
@@ -1060,7 +1177,6 @@ function validateTailoringQuality(
     const highlights = Array.isArray(rewrite?.tailoredHighlights)
       ? rewrite.tailoredHighlights
       : [];
-    totalHighlights += highlights.length;
     const evidenceIndexes = new Set<number>();
     requirements.forEach((requirement) => {
       requirement.evidence
@@ -1076,11 +1192,25 @@ function validateTailoringQuality(
         : [];
       const sourceText = sourceIndices.map((index: number) => employer.bullets[index] || "").join(" ");
       const text = normalizeSummaryText(highlight?.text);
-      if (sourceText && tokenJaccard(text, sourceText) > 0.9) {
-        issues.push(`${employer.company} includes a highlight that is nearly unchanged from its source.`);
-      }
-      (Array.isArray(highlight?.requirementIds) ? highlight.requirementIds : []).forEach((id: unknown) =>
-        coveredRequirementIds.add(normalizeSummaryText(id).toUpperCase())
+      if (sourceText && tokenJaccard(text, sourceText) > 0.9) return;
+      totalHighlights += 1;
+      (Array.isArray(highlight?.requirementIds) ? highlight.requirementIds : []).forEach(
+        (rawId: unknown) => {
+          const id = normalizeSummaryText(rawId).toUpperCase();
+          const requirement = requirementById.get(id);
+          if (!requirement) return;
+          const tracesDeclaredEvidence = requirement.evidence
+            .filter((reference) => reference.experienceIndex === experienceIndex)
+            .some((reference) =>
+              sourceIndices.some((index: number) => reference.bulletIndices.includes(index))
+            );
+          if (
+            tracesDeclaredEvidence &&
+            requirementLinkIsSupported(requirement.requirement, text, sourceText, employer.role)
+          ) {
+            coveredRequirementIds.add(id);
+          }
+        }
       );
     });
   }
@@ -1116,6 +1246,41 @@ function validateTailoringQuality(
   if (issues.length) throw new TailoringQualityError([...new Set(issues)]);
 }
 
+function rawNarrativeEvidenceIssues(
+  raw: any,
+  profile: Profile,
+  job: Pick<Job, "title" | "company">
+): string[] {
+  const completeProfileEvidence = [
+    profile.title,
+    profile.location,
+    profile.summary,
+    ...profile.skills,
+    ...profile.education,
+    ...profile.certifications,
+    ...profile.languages,
+    ...profile.experience.flatMap((entry) => [entry.role, ...entry.bullets]),
+  ].join(" ");
+  const summary = trimSummaryToMaximum(raw?.tailoredSummary || "");
+  const coverLetter = normalizeSummaryText(raw?.coverLetter);
+  return [
+    ...evidenceGuardIssues(
+      summary,
+      completeProfileEvidence,
+      profile.title,
+      "Tailored profile",
+      `${job.title} ${job.company}`
+    ),
+    ...evidenceGuardIssues(
+      coverLetter,
+      completeProfileEvidence,
+      profile.title,
+      "Cover letter",
+      `${job.title} ${job.company}`
+    ),
+  ];
+}
+
 export function toAnalysis(parsed: any, profile: Profile): Analysis {
   const score = Math.max(0, Math.min(100, Number(parsed.score) || 0));
   const tier = getMatchTier(score);
@@ -1147,8 +1312,24 @@ export function toValidatedAnalysis(
   profile: Profile,
   job: Pick<Job, "title" | "company" | "description">
 ): Analysis {
-  const analysis = toAnalysis(parsed, profile);
-  validateTailoringQuality(parsed, profile, analysis, job);
+  const narrativeIssues = rawNarrativeEvidenceIssues(parsed, profile, job);
+  let analysis: Analysis;
+  try {
+    analysis = toAnalysis(parsed, profile);
+  } catch (error) {
+    if (error instanceof TailoringQualityError && narrativeIssues.length) {
+      throw new TailoringQualityError([...new Set([...error.issues, ...narrativeIssues])]);
+    }
+    throw error;
+  }
+  try {
+    validateTailoringQuality(parsed, profile, analysis, job);
+  } catch (error) {
+    if (error instanceof TailoringQualityError && narrativeIssues.length) {
+      throw new TailoringQualityError([...new Set([...error.issues, ...narrativeIssues])]);
+    }
+    throw error;
+  }
   return analysis;
 }
 
