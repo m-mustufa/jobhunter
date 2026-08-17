@@ -6,6 +6,7 @@ import { Analysis, BatchItem, Job, JobsResponse, Profile, TailoredCVContent } fr
 import { DEFAULT_MASTER_CV } from "@/lib/masterCV";
 import { DEFAULT_PROFILE, sanitizeProfile } from "@/lib/profile";
 import { getJobRecommendation } from "@/lib/jobRecommendation";
+import { getEmployerPriority, getJobFreshnessRank } from "@/lib/employerPriority";
 import { FUNCTIONAL_DOMAINS, matchFunctionalDomain, matchTargetTitle } from "@/lib/targetRoles";
 import {
   loadJSON,
@@ -63,8 +64,15 @@ interface TailoredAnalysisCache {
   entries: Record<string, SavedTailoredAnalysis>;
 }
 
-const TAILORED_ANALYSIS_CACHE_VERSION = 1;
+const TAILORED_ANALYSIS_CACHE_VERSION = 2;
 const MAX_SAVED_ANALYSES = 30;
+
+const EMPLOYER_TIER_RANK = {
+  "government-gre": 4,
+  "large-established": 3,
+  established: 2,
+  other: 1,
+} as const;
 
 function createAnalysisSignature(value: unknown): string {
   return JSON.stringify(value);
@@ -142,7 +150,7 @@ function toBatchItems(jobs: Job[], profile: Profile): BatchItem[] {
   const savedAnalyses =
     savedCache?.profileSignature === profileSignature ? savedCache.entries : {};
 
-  return jobs.map((job) => {
+  const items = jobs.map((job) => {
     const saved = savedAnalyses[job.id];
     if (
       isUsableSavedAnalysis(saved) &&
@@ -156,6 +164,77 @@ function toBatchItems(jobs: Job[], profile: Profile): BatchItem[] {
       };
     }
     return { job, status: "pending" as const };
+  });
+
+  return rankBatchItems(items, profile);
+}
+
+function postedTimestamp(value: string | null, now: number): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  if (Number.isFinite(parsed)) return parsed;
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "just now" || normalized === "today") return now;
+  if (normalized === "yesterday") return now - 86_400_000;
+
+  const relative = normalized.match(
+    /(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago/
+  );
+  if (!relative) return 0;
+  const unitMs: Record<string, number> = {
+    minute: 60_000,
+    hour: 3_600_000,
+    day: 86_400_000,
+    week: 604_800_000,
+    month: 2_592_000_000,
+    year: 31_536_000_000,
+  };
+  return now - Number(relative[1]) * unitMs[relative[2]];
+}
+
+function rankBatchItems(
+  items: BatchItem[],
+  profile: Profile,
+  cachedRecommendations?: Map<string, ReturnType<typeof getJobRecommendation>>
+): BatchItem[] {
+  const recommendations =
+    cachedRecommendations ||
+    new Map(
+      items.map((item) => [item.job.id, getJobRecommendation(profile, item.job)] as const)
+    );
+  const now = Date.now();
+
+  return [...items].sort((a, b) => {
+    const freshnessDifference =
+      getJobFreshnessRank(b.job, now) - getJobFreshnessRank(a.job, now);
+    if (freshnessDifference) return freshnessDifference;
+
+    const employerTierDifference =
+      EMPLOYER_TIER_RANK[getEmployerPriority(b.job).tier] -
+      EMPLOYER_TIER_RANK[getEmployerPriority(a.job).tier];
+    if (employerTierDifference) return employerTierDifference;
+
+    const recommendationA = recommendations.get(a.job.id);
+    const recommendationB = recommendations.get(b.job.id);
+    const recommendedDifference =
+      Number(recommendationB?.recommended === true) -
+      Number(recommendationA?.recommended === true);
+    if (recommendedDifference) return recommendedDifference;
+
+    const recommendationScoreDifference =
+      (recommendationB?.score || 0) - (recommendationA?.score || 0);
+    if (recommendationScoreDifference) return recommendationScoreDifference;
+
+    const recencyDifference =
+      postedTimestamp(b.job.postedAt, now) - postedTimestamp(a.job.postedAt, now);
+    if (recencyDifference) return recencyDifference;
+
+    return (
+      a.job.company.localeCompare(b.job.company) ||
+      a.job.title.localeCompare(b.job.title) ||
+      a.job.id.localeCompare(b.job.id)
+    );
   });
 }
 
@@ -686,10 +765,18 @@ export default function Home() {
     const { item, pasteText } = freeTailor;
     patchFreeTailor({ importing: true, importError: null });
     try {
+      const analysisProfile = { ...profile, photo: "" };
+      const analysisJob = {
+        id: item.job.id,
+        title: item.job.title,
+        company: item.job.company,
+        location: item.job.location,
+        description: item.job.description,
+      };
       const r = await fetch("/api/analyze/import", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: pasteText, profile }),
+        body: JSON.stringify({ text: pasteText, profile: analysisProfile, job: analysisJob }),
       });
       const data = await r.json().catch(() => null);
       if (!r.ok) throw new Error(data?.error || "Could not import that response.");
@@ -793,7 +880,7 @@ export default function Home() {
   }, [items, profile]);
 
   const filteredItems = useMemo(() => {
-    return items.filter((item) => {
+    const filtered = items.filter((item) => {
       const recommendation = recommendations.get(item.job.id);
       const titleOk =
         titleFilter === "all" ||
@@ -804,7 +891,8 @@ export default function Home() {
       const recommendedOk = !recommendedOnly || recommendation?.recommended === true;
       return titleOk && fieldOk && recommendedOk;
     });
-  }, [items, titleFilter, fieldFilter, recommendedOnly, recommendations]);
+    return rankBatchItems(filtered, profile, recommendations);
+  }, [items, profile, titleFilter, fieldFilter, recommendedOnly, recommendations]);
 
   useEffect(() => {
     if (!recommendedOnly) return;

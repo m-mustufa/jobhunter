@@ -3,6 +3,13 @@ import { buildDemoAnalysis } from "./demoAnalysis";
 import { buildMasterCVMarkdown } from "./masterCV";
 import { getMatchTier } from "./matchTier";
 import { canonicalizeExperienceCompanyName, sanitizeProfile } from "./profile";
+import {
+  formatRoleResearchBrief,
+  loadRoleResearchBrief,
+  RoleResearchBrief,
+  RoleResearchSource,
+  saveRoleResearchBrief,
+} from "./roleResearch.server";
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 // 429 (rate-limited) is retried too, not just 5xx/529 — a rate-limit
@@ -11,6 +18,21 @@ const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
 const TRANSIENT_PROVIDER_STATUSES = new Set([429, 500, 502, 503, 529]);
 const SUMMARY_MIN_CHARS = 1050;
 const SUMMARY_MAX_CHARS = 1100;
+const EXPERIENCE_REWRITE_VERSION = 3;
+const MIN_FULL_JOB_DESCRIPTION_CHARS = 240;
+const MAX_MODEL_TOKENS = 6000;
+const WEB_SEARCH_TOOL = {
+  type: "web_search_20250305",
+  name: "web_search",
+  max_uses: 1,
+  user_location: {
+    type: "approximate",
+    city: "Abu Dhabi",
+    region: "Abu Dhabi",
+    country: "AE",
+    timezone: "Asia/Dubai",
+  },
+} as const;
 const MODEL_PERFORMANCE_OPTIONS = MODEL.startsWith("claude-sonnet-5")
   ? {
       // CV tailoring is a bounded rewriting task. Medium effort with thinking
@@ -31,100 +53,158 @@ export class LiveAnalysisError extends Error {
   }
 }
 
-// Conservative by design: skills, education, company labels, and dates are
-// copied from the candidate's Profile. The model may lightly rephrase a role
-// label and a chosen subset of its bullets, but it cannot replace the real
-// employer, chronology, or underlying work.
-// Exported so the free "tailor via claude.ai" flow (app/api/analyze/prompt)
-// can build the exact same prompt without duplicating it — the only
-// difference between the paid and free paths is who sends this text to
-// Claude and how the JSON response comes back.
-export const SYSTEM = `You are an expert technical recruiter and CV writer running a strict, repeatable pipeline for one candidate against one vacancy.
+class TailoringQualityError extends Error {
+  issues: string[];
 
-You are given the candidate's fixed CV data (employers, dates, skills, and education are NOT yours to change) and must produce only:
-1. A tailored professional summary for this specific role.
-2. For every employer, an optional truthful rephrasing of the existing position label, the 3-4 strongest existing bullets rewritten for this role and placed first, then every remaining original bullet ranked by relevance.
-3. A score/verdict/reasons/audit-trail assessment of fit.
-4. A cover letter body.
-
-You tailor TRUTHFULLY. You may rephrase and re-emphasize the candidate's real
-achievements to match a specific job. You must NEVER invent employers, job
-functions, seniority, dates, degrees, skills, responsibilities, or achievements
-that are not present in the candidate's data below. A position label may only
-be lightly rephrased using the original role and documented duties. If the
-candidate lacks something the job wants, do not fabricate it — reflect that
-honestly in the reasons instead.
-
-Optimize for earning an interview. Use confident, specific language, mirror the
-vacancy's terminology where the candidate's evidence supports it, and foreground
-transferable scope, ownership, outcomes, and stakeholder impact. Do not weaken
-the CV with unnecessary caveats; keep unsupported requirements in the reasons.
-
-Company/department names are immutable labels. Never prepend a parent
-organization (including ADNOC or ADNOC Offshore), expand abbreviations,
-translate them, or correct their spelling.
-
-Return ONLY a valid JSON object. No markdown fences, no preamble.`;
-
-export function buildPrompt(job: Pick<Job, "title" | "company" | "location" | "description">, profile: Profile) {
-  const experienceBlock = profile.experience
-    .map((e, i) => {
-      const bulletsList = e.bullets
-        .map((bullet, bulletIndex) => `    [bulletIndex=${bulletIndex}] ${bullet}`)
-        .join("\n");
-      return `[experienceIndex=${i}] ${e.company} — ${e.role}${e.dates ? ` (${e.dates})` : ""}\n${bulletsList}`;
-    })
-    .join("\n\n");
-
-  const candidateContext = [
-    `NAME: ${profile.name || "Candidate"}`,
-    `CURRENT TITLE: ${profile.title || "n/a"}`,
-    `LOCATION: ${profile.location || "n/a"}`,
-    profile.summary ? `SUMMARY:\n${profile.summary}` : "",
-    profile.skills.length ? `SKILLS:\n${profile.skills.join(", ")}` : "",
-    profile.education.length ? `EDUCATION:\n${profile.education.join("\n")}` : "",
-    profile.certifications.length ? `CERTIFICATIONS:\n${profile.certifications.join("\n")}` : "",
-    profile.languages.length ? `LANGUAGES:\n${profile.languages.join("\n")}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  return `A candidate is considering this job.
-
-JOB TITLE: ${job.title}
-COMPANY: ${job.company}
-LOCATION: ${job.location || "n/a"}
-JOB DESCRIPTION:
-${job.description}
-
-CANDIDATE'S FIXED CV DATA (do not alter employers/dates/skills/education; position labels may only be lightly and truthfully rephrased):
-${candidateContext}
-
-CANDIDATE'S EXPERIENCE, WITH BULLET INDICES (use these exact indices when choosing which bullets to rewrite):
-${experienceBlock || "(no experience entries)"}
-
-Do the following and return a single JSON object with exactly these keys:
-{
-  "score": <integer 0-100, how well the candidate fits this job>,
-  "verdict": "<one short sentence, e.g. 'Strong fit — lead with SaaS + React'>",
-  "reasons": ["<exactly 3 concise reasons behind the score, covering the strongest matches and most important gap>"],
-  "tailoredSummary": "<one cohesive, confident and interview-focused professional profile of 1050-1100 characters INCLUDING spaces, targeting about 1075 characters; use 7-9 concise sentences tailored to THIS job; lead with the strongest direct and transferable evidence, use vacancy terminology where supported, and draw every claim from the candidate's real background; count the characters before returning and never return fewer than 1050 or more than 1100>",
-  "experienceRewriteVersion": 2,
-  "experienceRewrites": [
-    {
-      "experienceIndex": <copy the employer's 0-based position in the experience list above>,
-      "company": "<copy one employer label exactly as listed above; never prepend, expand, translate, or correct it>",
-      "role": "<optional concise, truthful rephrasing of that employer's existing position, replacing it entirely — never combine, append, or slash-join the original and new title together; use an empty string to keep the original role text unchanged>",
-      "bulletsToRewrite": [<3-4 UNIQUE 0-based bullet indices, or every available index when the employer has fewer than 3 bullets; list the strongest job-relevant evidence first>],
-      "rewrittenBullets": ["<confident, specific replacement for each selected bullet, using vacancy language where the source bullet supports it; same order and count as bulletsToRewrite>"],
-      "remainingBulletOrder": [<every unselected 0-based bullet index exactly once, ordered from most to least relevant to this job>]
-    }
-  ],
-  "coverLetter": "<a short, specific cover-letter BODY (100-140 words, 2-3 paragraphs) in a natural human voice, no clichés — do NOT include a greeting/salutation or a sign-off, those are added separately>",
-  "auditTrail": [{"statement": "<one of at most 3 important claims made in the tailored summary or a rewritten bullet>", "source": "<the CV section/line/experience it is drawn from>"}]
+  constructor(issues: string[]) {
+    super(issues.join(" "));
+    this.name = "TailoringQualityError";
+    this.issues = issues;
+  }
 }
 
-The tailoredSummary length requirement is strict: 1050-1100 characters including spaces. Include exactly one experienceRewrites entry for EVERY employer, even when its role stays unchanged. For each employer with at least 3 bullets, rewrite 3-4 of its strongest existing bullets. If it has fewer than 3, rewrite every available bullet; use empty arrays when it has none. Base each replacement only on its selected source bullet, preserve every supported number and level of ownership, and never transfer evidence between employers. Put selected indices in descending job relevance, followed by every unselected index in descending relevance; for equal relevance retain original index order. Never create, omit, merge, split, or duplicate a bullet or claim. Copy every company/department label character-for-character and keep every date unchanged. Do not add, remove, or reorder employers, skills, or education — those are fixed and applied automatically. Keep every other field concise and return only the JSON object.`;
+class WebResearchUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WebResearchUnavailableError";
+  }
+}
+
+class RetryableClaudeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RetryableClaudeError";
+  }
+}
+
+export const SYSTEM = `You are an expert CV strategist and evidence-grounded recruiter. Analyze one complete vacancy against one candidate's fixed CV.
+
+Your objective is to make the CV visibly and specifically relevant to this vacancy while remaining defensible in an interview. Rewrite the full profile and create concise tailored highlights from the candidate's real evidence. You may combine multiple bullets only when they belong to the SAME employer. Never transfer evidence between employers.
+
+Never invent or upgrade an employer, date, metric, tool, qualification, certification, responsibility, seniority, team size, budget, client, industry, or outcome. Never imply ownership when the evidence only shows participation. Requirements without evidence belong in the fit reasons, not the CV. Employer/department labels, role labels, dates, education, and skill values are immutable; skills may only be reordered.
+
+Treat the vacancy description as the primary source. General role research is secondary context only and must never become candidate evidence. Return ONLY one valid JSON object, with no markdown fence or commentary.`;
+
+interface BuildPromptOptions {
+  cachedRoleResearch?: RoleResearchBrief | null;
+  requestWebResearch?: boolean;
+  correctionIssues?: string[];
+}
+
+export function buildPrompt(
+  job: Pick<Job, "title" | "company" | "location" | "description">,
+  profile: Profile,
+  options: BuildPromptOptions = {}
+) {
+  const experienceBlock = profile.experience
+    .map((entry, experienceIndex) => {
+      const bullets = entry.bullets
+        .map((bullet, bulletIndex) => `    [bulletIndex=${bulletIndex}] ${bullet}`)
+        .join("\n");
+      return `[experienceIndex=${experienceIndex}] COMPANY: ${entry.company}\nROLE: ${entry.role}\nDATES: ${entry.dates || "n/a"}\n${bullets || "    (no bullets)"}`;
+    })
+    .join("\n\n");
+  const skillBlock = profile.skills
+    .map((skill, skillIndex) => `[skillIndex=${skillIndex}] ${skill}`)
+    .join("\n");
+  const researchInstructions = options.cachedRoleResearch
+    ? `A cached role-research brief is supplied below. Use it only to interpret common role expectations; the vacancy remains primary and it is NOT evidence about the candidate.\n${formatRoleResearchBrief(options.cachedRoleResearch)}`
+    : options.requestWebResearch
+      ? `Use the web-search tool exactly ONCE to research current, reputable expectations for this normalized role in the UAE or its functional domain. Prefer official/professional sources. Put the concise result in roleResearch. If search is unavailable or weak, continue from the full vacancy description without guessing.`
+      : `No external role research is supplied. Derive role expectations from the COMPLETE vacancy description and continue normally; do not request or depend on tools.`;
+  const correction = options.correctionIssues?.length
+    ? `\nCORRECTIVE PASS: The previous response failed these checks. Fix every item without changing protected facts:\n${options.correctionIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}\n`
+    : "";
+
+  return `TARGET VACANCY (analyze the entire description, not only keywords)
+TITLE: ${job.title}
+COMPANY: ${job.company}
+LOCATION: ${job.location || "n/a"}
+FULL JOB DESCRIPTION:
+${job.description}
+
+ROLE-EXPECTATION CONTEXT
+${researchInstructions}
+
+CANDIDATE PROFILE (fixed evidence)
+NAME: ${profile.name || "Candidate"}
+CURRENT TITLE: ${profile.title || "n/a"}
+LOCATION: ${profile.location || "n/a"}
+ORIGINAL PROFILE:
+${profile.summary || "n/a"}
+
+FIXED SKILLS (return every index exactly once in skillsOrder; reorder only):
+${skillBlock || "(none)"}
+
+FIXED EDUCATION:
+${profile.education.join("\n") || "(none)"}
+
+FIXED CERTIFICATIONS:
+${profile.certifications.join("\n") || "(none)"}
+
+FIXED LANGUAGES:
+${profile.languages.join("\n") || "(none)"}
+
+EXPERIENCE EVIDENCE WITH PROTECTED INDICES:
+${experienceBlock || "(none)"}
+${correction}
+Return this exact schema:
+{
+  "score": <integer 0-100>,
+  "verdict": "<one concise fit sentence>",
+  "reasons": ["<exactly 3 concise evidence/gap reasons>"],
+  "roleResearch": {
+    "normalizedRole": "<role family, not employer-specific>",
+    "marketContext": "<brief current role context or empty string>",
+    "expectations": ["<3-8 concise common expectations>"],
+    "sources": [{"title": "<source title>", "url": "<http(s) URL>"}]
+  },
+  "rankedRequirements": [
+    {
+      "id": "R1",
+      "priority": 1,
+      "importance": "mandatory",
+      "requirement": "<specific responsibility, skill, scope, or qualification>",
+      "source": "job_description",
+      "evidence": [{"experienceIndex": 0, "bulletIndices": [0, 2]}]
+    }
+  ],
+  "tailoredSummary": "<a COMPLETELY REWRITTEN, cohesive vacancy-specific profile of 1050-1100 characters INCLUDING spaces; 7-10 concise sentences; visibly different from the original; lead with direct evidence for the top requirements, then supported transferable evidence and realistic scope; do not include unsupported gaps or generic filler>",
+  "skillsOrder": [<every fixed skillIndex exactly once, most relevant first>],
+  "experienceRewriteVersion": 3,
+  "experienceRewrites": [
+    {
+      "experienceIndex": 0,
+      "company": "<copy exact company label>",
+      "supported": true,
+      "tailoredHighlights": [
+        {
+          "text": "<strong vacancy-specific achievement/responsibility synthesized only from the selected bullets for this employer>",
+          "sourceBulletIndices": [0, 2],
+          "requirementIds": ["R1"]
+        }
+      ],
+      "remainingBulletOrder": [1, 3]
+    }
+  ],
+  "coverLetter": "<specific 100-140 word body, 2-3 paragraphs, no greeting/sign-off>",
+  "auditTrail": []
+}
+
+Rules for rankedRequirements:
+- Return 6-10 requirements ranked by importance after reading the COMPLETE job description. Every item must use source "job_description"; role research is context only and stays in roleResearch.
+- Set importance to "mandatory", "preferred", or "context" based only on how the vacancy itself presents the requirement. Rank mandatory requirements first.
+- Evidence must point only to bullet indices that genuinely support the requirement. Use an empty evidence array for unsupported requirements; never manufacture a link.
+
+Rules for every employer:
+- Return exactly one experienceRewrites entry per employer, in input order, copying company exactly. Never rewrite role/date/company.
+- If this employer has enough evidence for the vacancy, set supported=true and create 2-3 strong tailoredHighlights FIRST. Each highlight may synthesize one or more source bullets, but all indices must belong to this SAME employer.
+- Select the strongest, most relevant evidence. Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
+- Every selected source bullet is replaced by its highlight and therefore MUST NOT appear in remainingBulletOrder. remainingBulletOrder must contain every unselected original index exactly once, ranked by vacancy relevance. This prevents duplication and CV growth.
+- If fewer than two defensible highlights exist, set supported=false, return no highlights, and put every original bullet index once in remainingBulletOrder, still ranked by relevance.
+- A requirementIds value must identify a ranked requirement actually supported by that highlight's source bullets.
+
+The final CV must look specifically written for this vacancy, but every claim must remain traceable to the fixed candidate evidence. Count tailoredSummary characters before returning. Return JSON only.`;
 }
 
 interface ExperienceRewrite {
@@ -148,8 +228,8 @@ function asSentence(value: unknown): string {
   return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
-function buildVerifiedSummaryFacts(profile: Profile): string[] {
-  const facts: string[] = [];
+function buildVerifiedSummaryFacts(profile: Profile, preferredFacts: string[] = []): string[] {
+  const facts: string[] = preferredFacts.map(asSentence).filter(Boolean);
 
   for (const entry of profile.experience) {
     const position =
@@ -203,10 +283,14 @@ function trimSummaryToMaximum(text: string): string {
   return `${wordSafe.replace(/[\s,;:–—-]+$/g, "")}.`;
 }
 
-function ensureTailoredSummaryLength(summary: unknown, profile: Profile): string {
+function ensureTailoredSummaryLength(
+  summary: unknown,
+  profile: Profile,
+  preferredFacts: string[] = []
+): string {
   let combined = normalizeSummaryText(summary);
 
-  for (const fact of buildVerifiedSummaryFacts(profile)) {
+  for (const fact of buildVerifiedSummaryFacts(profile, preferredFacts)) {
     if (combined.length >= SUMMARY_MIN_CHARS) break;
     if (combined.toLowerCase().includes(fact.toLowerCase())) continue;
     combined = normalizeSummaryText(`${combined} ${fact}`);
@@ -221,7 +305,9 @@ function ensureTailoredSummaryLength(summary: unknown, profile: Profile): string
 
   const fitted = trimSummaryToMaximum(combined);
   if (fitted.length < SUMMARY_MIN_CHARS || fitted.length > SUMMARY_MAX_CHARS) {
-    throw new LiveAnalysisError("Claude could not produce the required CV summary length.", 502);
+    throw new TailoringQualityError([
+      "Rewrite the tailored profile to 1050-1100 characters including spaces.",
+    ]);
   }
   return fitted;
 }
@@ -239,10 +325,381 @@ function isCleanRoleRewrite(rewrittenRole: string): boolean {
   return !/[/()]/.test(rewrittenRole);
 }
 
+interface RequirementEvidence {
+  experienceIndex: number;
+  bulletIndices: number[];
+}
+
+interface RankedRequirement {
+  id: string;
+  priority: number;
+  importance: "mandatory" | "preferred" | "context";
+  requirement: string;
+  source: "job_description";
+  evidence: RequirementEvidence[];
+}
+
+interface TailoredHighlight {
+  text: string;
+  sourceBulletIndices: number[];
+  requirementIds: string[];
+}
+
+interface ExperienceRewriteV3 {
+  experienceIndex: number;
+  company: string;
+  supported: boolean;
+  tailoredHighlights: TailoredHighlight[];
+  remainingBulletOrder: number[];
+}
+
+function parseRankedRequirements(raw: any, profile: Profile): RankedRequirement[] {
+  const items = Array.isArray(raw?.rankedRequirements) ? raw.rankedRequirements : [];
+  const invalid = (issue: string): never => {
+    throw new TailoringQualityError([issue]);
+  };
+  if (Number(raw?.experienceRewriteVersion) === EXPERIENCE_REWRITE_VERSION) {
+    if (items.length < 6 || items.length > 10) {
+      invalid("Return 6-10 ranked requirements from the complete job description.");
+    }
+  }
+
+  const ids = new Set<string>();
+  const priorities = new Set<number>();
+  const requirementTexts = new Set<string>();
+  const parsed: RankedRequirement[] = items.map((item: any, itemIndex: number) => {
+    const id = normalizeSummaryText(item?.id).toUpperCase();
+    const priority = Number(item?.priority);
+    const importance = item?.importance;
+    const requirement = normalizeSummaryText(item?.requirement);
+    const requirementKey = [...comparableTokens(requirement)].sort().join(" ");
+    const source = item?.source;
+    if (
+      !/^R\d+$/.test(id) ||
+      ids.has(id) ||
+      !requirement ||
+      !requirementKey ||
+      requirementTexts.has(requirementKey) ||
+      !Number.isInteger(priority) ||
+      priorities.has(priority) ||
+      !["mandatory", "preferred", "context"].includes(importance) ||
+      source !== "job_description"
+    ) {
+      invalid(
+        `Ranked requirement ${itemIndex + 1} must have a unique id/priority, valid importance, and job_description source.`
+      );
+    }
+    ids.add(id);
+    priorities.add(priority);
+    requirementTexts.add(requirementKey);
+
+    const evidence: RequirementEvidence[] = (Array.isArray(item?.evidence) ? item.evidence : []).map(
+      (reference: any) => {
+        const experienceIndex = Number(reference?.experienceIndex);
+        const bulletIndices = Array.isArray(reference?.bulletIndices)
+          ? reference.bulletIndices.map(Number)
+          : [];
+        const entry = profile.experience[experienceIndex];
+        if (
+          !Number.isInteger(experienceIndex) ||
+          !entry ||
+          bulletIndices.length === 0 ||
+          new Set(bulletIndices).size !== bulletIndices.length ||
+          bulletIndices.some(
+            (bulletIndex: number) =>
+              !Number.isInteger(bulletIndex) || bulletIndex < 0 || bulletIndex >= entry.bullets.length
+          )
+        ) {
+          invalid(`Requirement ${id} has an invalid experience evidence reference.`);
+        }
+        return { experienceIndex, bulletIndices };
+      }
+    );
+    return { id, priority, importance, requirement, source, evidence };
+  });
+  const sorted = parsed.sort((a, b) => a.priority - b.priority);
+  const importanceRank: Record<RankedRequirement["importance"], number> = {
+    mandatory: 0,
+    preferred: 1,
+    context: 2,
+  };
+  sorted.forEach((requirement, index) => {
+    if (requirement.priority !== index + 1) {
+      invalid("Ranked requirement priorities must be consecutive from 1 through N.");
+    }
+    if (
+      index > 0 &&
+      importanceRank[requirement.importance] <
+        importanceRank[sorted[index - 1].importance]
+    ) {
+      invalid("Mandatory requirements must precede preferred and context requirements.");
+    }
+  });
+  return sorted;
+}
+
+const SENSITIVE_FACT_TERMS = [
+  "SQL",
+  "Python",
+  "Excel",
+  "SAP",
+  "Oracle",
+  "Jira",
+  "Power BI",
+  "Tableau",
+  "Salesforce",
+  "ERP",
+  "CRM",
+  "AWS",
+  "Azure",
+  "GCP",
+  "PMP",
+  "PRINCE2",
+  "SAFe",
+  "ISO",
+  "FEED",
+  "EPC",
+];
+
+function normalizedFactToken(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9%]+/g, "");
+}
+
+function evidenceGuardIssues(
+  highlight: string,
+  sourceText: string,
+  originalRole: string,
+  label: string,
+  allowedContext = ""
+): string[] {
+  const issues: string[] = [];
+  const sourceLower = sourceText.toLowerCase();
+  const evidenceText = `${sourceText} ${originalRole}`;
+  const evidenceScope = evidenceText.toLowerCase();
+  const sourceNumbers = new Set(
+    (sourceText.match(/\b\d[\d,.]*(?:%|\+)?\b/g) || []).map(normalizedFactToken)
+  );
+  const addedNumbers = (highlight.match(/\b\d[\d,.]*(?:%|\+)?\b/g) || []).filter(
+    (token) => !sourceNumbers.has(normalizedFactToken(token))
+  );
+  if (addedNumbers.length) {
+    issues.push(`${label} adds unsupported numeric evidence (${addedNumbers.join(", ")}).`);
+  }
+
+  for (const term of SENSITIVE_FACT_TERMS) {
+    const termPattern = new RegExp(`\\b${term.replace(/\s+/g, "\\s+")}\\b`, "i");
+    if (termPattern.test(highlight) && !termPattern.test(sourceText)) {
+      issues.push(`${label} adds unsupported tool, framework, or qualification ${term}.`);
+    }
+  }
+
+  const ownership = /\b(led|lead|managed|owned|directed|supervised|oversaw|headed|accountable for)\b/i;
+  if (ownership.test(highlight) && !ownership.test(evidenceScope)) {
+    issues.push(`${label} upgrades ownership beyond its same-employer evidence.`);
+  }
+  const qualification = /\b(certified|certification|degree|bachelor(?:'s)?|master(?:'s)?|chartered)\b/i;
+  if (qualification.test(highlight) && !qualification.test(sourceLower)) {
+    issues.push(`${label} adds an unsupported qualification.`);
+  }
+
+  // Require a meaningful share of each rewritten claim to remain directly
+  // anchored to its selected same-employer evidence. This is deliberately a
+  // directed overlap (claim -> evidence), not similarity: the model can still
+  // rewrite strongly, but it cannot replace the source with unrelated JD text.
+  const claimTokens = comparableTokens(highlight);
+  if (claimTokens.size >= 6) {
+    const evidenceTokens = comparableTokens(evidenceText);
+    const supportedTokenCount = [...claimTokens].filter((token) => evidenceTokens.has(token)).length;
+    if (supportedTokenCount / claimTokens.size < 0.28) {
+      issues.push(`${label} is not sufficiently grounded in its selected candidate evidence.`);
+    }
+  }
+
+  // Catch arbitrary acronyms that a fixed allow-list cannot anticipate. Target
+  // company/title acronyms are allowed only where explicitly passed as context;
+  // tools, frameworks and qualifications still need to exist in CV evidence.
+  const acronyms = (value: string): Set<string> =>
+    new Set(
+      (value.match(/\b[A-Z][A-Z0-9]{1,9}\b/g) || [])
+        .map((token) => token.toUpperCase())
+        .filter((token) => !/^\d+$/.test(token))
+    );
+  const supportedAcronyms = acronyms(`${evidenceText} ${allowedContext}`);
+  const benignAcronyms = new Set(["CV", "JD"]);
+  const unsupportedAcronyms = [...acronyms(highlight)].filter(
+    (token) => !benignAcronyms.has(token) && !supportedAcronyms.has(token)
+  );
+  if (unsupportedAcronyms.length) {
+    issues.push(
+      `${label} adds unsupported acronym${unsupportedAcronyms.length === 1 ? "" : "s"} (${unsupportedAcronyms.join(", ")}).`
+    );
+  }
+  return issues;
+}
+
+function applyExperienceHighlightsV3(
+  profile: Profile,
+  raw: any
+): TailoredCVContent["experience"] {
+  const requirements = parseRankedRequirements(raw, profile);
+  const requirementById = new Map(requirements.map((requirement) => [requirement.id, requirement]));
+  const rawRewrites = Array.isArray(raw?.experienceRewrites) ? raw.experienceRewrites : [];
+  const qualityIssues: string[] = [];
+  if (rawRewrites.length !== profile.experience.length) {
+    throw new TailoringQualityError([
+      "Return exactly one version-3 experience rewrite for every employer.",
+    ]);
+  }
+
+  const rewritesByIndex = new Map<number, ExperienceRewriteV3>();
+  for (const rawRewrite of rawRewrites) {
+    const experienceIndex = Number(rawRewrite?.experienceIndex);
+    const entry = profile.experience[experienceIndex];
+    if (!Number.isInteger(experienceIndex) || !entry || rewritesByIndex.has(experienceIndex)) {
+      qualityIssues.push("Experience rewrites contain a missing, duplicate, or invalid employer index.");
+      continue;
+    }
+    const expectedCompany = canonicalizeExperienceCompanyName(entry.company);
+    const returnedCompany = normalizeSummaryText(rawRewrite?.company);
+    if (expectedCompany !== returnedCompany) {
+      qualityIssues.push(`Employer ${experienceIndex + 1} must copy its company label exactly.`);
+    }
+
+    const supported = rawRewrite?.supported === true;
+    const rawHighlights = Array.isArray(rawRewrite?.tailoredHighlights)
+      ? rawRewrite.tailoredHighlights
+      : [];
+    if ((supported && (rawHighlights.length < 2 || rawHighlights.length > 3)) || (!supported && rawHighlights.length)) {
+      qualityIssues.push(
+        `${expectedCompany}: supported employers need 2-3 highlights; unsupported employers need none.`
+      );
+    }
+
+    const usedSourceIndexes = new Set<number>();
+    const highlights: TailoredHighlight[] = [];
+    for (let highlightIndex = 0; highlightIndex < rawHighlights.length; highlightIndex += 1) {
+      const rawHighlight = rawHighlights[highlightIndex];
+      const text = normalizeSummaryText(rawHighlight?.text).slice(0, 420);
+      const sourceBulletIndices = Array.isArray(rawHighlight?.sourceBulletIndices)
+        ? rawHighlight.sourceBulletIndices.map(Number)
+        : [];
+      const requirementIds = Array.isArray(rawHighlight?.requirementIds)
+        ? rawHighlight.requirementIds.map((id: unknown) => normalizeSummaryText(id).toUpperCase())
+        : [];
+      const label = `${expectedCompany} highlight ${highlightIndex + 1}`;
+      if (!text || sourceBulletIndices.length === 0 || requirementIds.length === 0) {
+        qualityIssues.push(`${label} needs text, source bullets, and requirement ids.`);
+        continue;
+      }
+      if (
+        new Set(sourceBulletIndices).size !== sourceBulletIndices.length ||
+        sourceBulletIndices.some(
+          (bulletIndex: number) =>
+            !Number.isInteger(bulletIndex) ||
+            bulletIndex < 0 ||
+            bulletIndex >= entry.bullets.length ||
+            usedSourceIndexes.has(bulletIndex)
+        )
+      ) {
+        qualityIssues.push(`${label} must use valid, non-reused bullets from the same employer.`);
+        continue;
+      }
+      const sourceText = sourceBulletIndices
+        .map((index: number) => entry.bullets[index])
+        .join(" ");
+      if (requirementIds.some((id: string) => !requirementById.has(id))) {
+        qualityIssues.push(`${label} references an unknown ranked requirement.`);
+      }
+      for (const requirementId of requirementIds) {
+        const requirement = requirementById.get(requirementId);
+        const evidenceForEmployer = requirement?.evidence.find(
+          (reference) => reference.experienceIndex === experienceIndex
+        );
+        if (
+          !evidenceForEmployer ||
+          !sourceBulletIndices.some((bulletIndex: number) =>
+            evidenceForEmployer.bulletIndices.includes(bulletIndex)
+          )
+        ) {
+          qualityIssues.push(`${label} does not trace ${requirementId} to its declared evidence.`);
+        }
+        if (requirement) {
+          const requirementTokens = comparableTokens(requirement.requirement);
+          const highlightTokens = comparableTokens(text);
+          const evidenceTokens = comparableTokens(`${sourceText} ${entry.role}`);
+          const minimumDirectLinks = 1;
+          const highlightLinks = [...requirementTokens].filter((token) =>
+            highlightTokens.has(token)
+          ).length;
+          const evidenceLinks = [...requirementTokens].filter((token) =>
+            evidenceTokens.has(token)
+          ).length;
+          if (requirementTokens.size && highlightLinks < minimumDirectLinks) {
+            qualityIssues.push(`${label} does not visibly address ${requirementId}.`);
+          }
+          if (requirementTokens.size && evidenceLinks < minimumDirectLinks) {
+            qualityIssues.push(
+              `${label} links ${requirementId} to source bullets that do not directly support it.`
+            );
+          }
+        }
+      }
+      qualityIssues.push(...evidenceGuardIssues(text, sourceText, entry.role, label));
+      sourceBulletIndices.forEach((index: number) => usedSourceIndexes.add(index));
+      highlights.push({ text, sourceBulletIndices, requirementIds });
+    }
+
+    const remainingBulletOrder = Array.isArray(rawRewrite?.remainingBulletOrder)
+      ? rawRewrite.remainingBulletOrder.map(Number)
+      : [];
+    const expectedRemaining = entry.bullets
+      .map((_, bulletIndex) => bulletIndex)
+      .filter((bulletIndex) => !usedSourceIndexes.has(bulletIndex));
+    if (
+      remainingBulletOrder.length !== expectedRemaining.length ||
+      new Set(remainingBulletOrder).size !== remainingBulletOrder.length ||
+      remainingBulletOrder.some(
+        (bulletIndex: number) => !expectedRemaining.includes(bulletIndex)
+      )
+    ) {
+      qualityIssues.push(
+        `${expectedCompany}: remainingBulletOrder must contain every unselected original exactly once.`
+      );
+    }
+    rewritesByIndex.set(experienceIndex, {
+      experienceIndex,
+      company: expectedCompany,
+      supported,
+      tailoredHighlights: highlights,
+      remainingBulletOrder,
+    });
+  }
+
+  if (qualityIssues.length) throw new TailoringQualityError([...new Set(qualityIssues)]);
+  return profile.experience.map((entry, experienceIndex) => {
+    const rewrite = rewritesByIndex.get(experienceIndex);
+    if (!rewrite) {
+      throw new TailoringQualityError([`Missing rewrite for employer ${experienceIndex + 1}.`]);
+    }
+    return {
+      company: canonicalizeExperienceCompanyName(entry.company),
+      role: entry.role,
+      dates: entry.dates,
+      bullets: [
+        ...rewrite.tailoredHighlights.map((highlight) => highlight.text),
+        ...rewrite.remainingBulletOrder.map((bulletIndex) => entry.bullets[bulletIndex]),
+      ],
+    };
+  });
+}
+
 // Applies the model's chosen bullet rewrites onto a protected copy of the
 // candidate's real experience. Employer order, company, dates and bullet count
 // stay fixed; version 2 deliberately ranks bullets by vacancy relevance.
 function applyExperienceRewrites(profile: Profile, raw: any): TailoredCVContent["experience"] {
+  if (Number(raw?.experienceRewriteVersion) === EXPERIENCE_REWRITE_VERSION) {
+    return applyExperienceHighlightsV3(profile, raw);
+  }
   const rawRewrites = Array.isArray(raw?.experienceRewrites) ? raw.experienceRewrites : [];
 
   // Older saved/manual responses did not include an explicit schema version.
@@ -412,12 +869,264 @@ function applyExperienceRewrites(profile: Profile, raw: any): TailoredCVContent[
   });
 }
 
+function preferredRequirementFacts(raw: any, profile: Profile): string[] {
+  if (Number(raw?.experienceRewriteVersion) !== EXPERIENCE_REWRITE_VERSION) return [];
+  const requirements = parseRankedRequirements(raw, profile);
+  const seen = new Set<string>();
+  const facts: string[] = [];
+  for (const requirement of requirements) {
+    for (const reference of requirement.evidence) {
+      for (const bulletIndex of reference.bulletIndices) {
+        const bullet = profile.experience[reference.experienceIndex]?.bullets[bulletIndex];
+        const key = normalizeSummaryText(bullet).toLowerCase();
+        if (!bullet || seen.has(key)) continue;
+        seen.add(key);
+        facts.push(bullet);
+      }
+    }
+  }
+  return facts;
+}
+
+function resolveSkillOrder(raw: any, profile: Profile): string[] {
+  if (Number(raw?.experienceRewriteVersion) !== EXPERIENCE_REWRITE_VERSION) {
+    return profile.skills;
+  }
+  const indices = Array.isArray(raw?.skillsOrder) ? raw.skillsOrder.map(Number) : [];
+  if (
+    indices.length !== profile.skills.length ||
+    new Set(indices).size !== indices.length ||
+    indices.some(
+      (index: number) =>
+        !Number.isInteger(index) || index < 0 || index >= profile.skills.length
+    )
+  ) {
+    throw new TailoringQualityError([
+      "skillsOrder must contain every fixed skill index exactly once; skills may only be reordered.",
+    ]);
+  }
+  return indices.map((index: number) => profile.skills[index]);
+}
+
+function buildEvidenceAuditTrail(raw: any, profile: Profile): Analysis["auditTrail"] {
+  if (Number(raw?.experienceRewriteVersion) !== EXPERIENCE_REWRITE_VERSION) {
+    return Array.isArray(raw?.auditTrail)
+      ? raw.auditTrail.map((entry: any) => ({
+          statement: String(entry?.statement || ""),
+          source: String(entry?.source || ""),
+        }))
+      : [];
+  }
+  const entries: Analysis["auditTrail"] = [];
+  const rewrites = Array.isArray(raw?.experienceRewrites) ? raw.experienceRewrites : [];
+  for (const rewrite of rewrites) {
+    const experienceIndex = Number(rewrite?.experienceIndex);
+    const employer = profile.experience[experienceIndex];
+    if (!employer || !Array.isArray(rewrite?.tailoredHighlights)) continue;
+    for (const highlight of rewrite.tailoredHighlights) {
+      const sourceIndices = Array.isArray(highlight?.sourceBulletIndices)
+        ? highlight.sourceBulletIndices
+            .map(Number)
+            .filter(
+              (index: number) =>
+                Number.isInteger(index) && index >= 0 && index < employer.bullets.length
+            )
+        : [];
+      const statement = normalizeSummaryText(highlight?.text);
+      const sourceBullets = sourceIndices.map((index: number) => employer.bullets[index]);
+      if (!statement || !sourceBullets.length) continue;
+      entries.push({
+        statement,
+        source: `${employer.company}: ${sourceBullets.join(" | ")}`,
+      });
+      if (entries.length >= 12) return entries;
+    }
+  }
+  return entries;
+}
+
+const COMPARISON_STOP_WORDS = new Set([
+  "about",
+  "after",
+  "against",
+  "also",
+  "and",
+  "are",
+  "for",
+  "from",
+  "has",
+  "have",
+  "into",
+  "its",
+  "more",
+  "that",
+  "the",
+  "their",
+  "this",
+  "through",
+  "with",
+  "within",
+]);
+
+function comparableTokens(value: string): Set<string> {
+  return new Set(
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length > 3 && !COMPARISON_STOP_WORDS.has(token))
+  );
+}
+
+function tokenJaccard(left: string, right: string): number {
+  const leftTokens = comparableTokens(left);
+  const rightTokens = comparableTokens(right);
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  let intersection = 0;
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) intersection += 1;
+  });
+  return intersection / (leftTokens.size + rightTokens.size - intersection);
+}
+
+function validateTailoringQuality(
+  raw: any,
+  profile: Profile,
+  analysis: Analysis,
+  job: Pick<Job, "title" | "company" | "description">
+): void {
+  if (Number(raw?.experienceRewriteVersion) !== EXPERIENCE_REWRITE_VERSION) {
+    throw new TailoringQualityError([
+      "Use experienceRewriteVersion 3 and return the complete evidence-linked tailoring schema.",
+    ]);
+  }
+  const requirements = parseRankedRequirements(raw, profile);
+  const issues: string[] = [];
+  const jobDescriptionTokens = comparableTokens(job.description);
+  requirements.forEach((requirement) => {
+    const requirementTokens = comparableTokens(requirement.requirement);
+    const overlap = [...requirementTokens].filter((token) => jobDescriptionTokens.has(token)).length;
+    if (requirementTokens.size >= 3 && overlap < Math.max(1, Math.ceil(requirementTokens.size * 0.2))) {
+      issues.push(`${requirement.id} is not sufficiently grounded in the full job description.`);
+    }
+  });
+  const rawSummary = normalizeSummaryText(raw?.tailoredSummary);
+  const summary = analysis.tailoredCV.summary;
+  if (rawSummary.length < SUMMARY_MIN_CHARS || rawSummary.length > SUMMARY_MAX_CHARS) {
+    issues.push(
+      "The raw tailoredSummary itself must be a complete 1050-1100 character rewrite; do not rely on appended original CV text."
+    );
+  }
+  const completeProfileEvidence = [
+    profile.title,
+    profile.location,
+    profile.summary,
+    ...profile.skills,
+    ...profile.education,
+    ...profile.certifications,
+    ...profile.languages,
+    ...profile.experience.flatMap((entry) => [entry.role, ...entry.bullets]),
+  ].join(" ");
+  if (summary.length < SUMMARY_MIN_CHARS || summary.length > SUMMARY_MAX_CHARS) {
+    issues.push("Rewrite the profile to exactly 1050-1100 characters including spaces.");
+  }
+  issues.push(
+    ...evidenceGuardIssues(
+      summary,
+      completeProfileEvidence,
+      profile.title,
+      "Tailored profile",
+      `${job.title} ${job.company}`
+    )
+  );
+  if (profile.summary && tokenJaccard(summary, profile.summary) > 0.72) {
+    issues.push("The profile remains too similar to the original; fully rewrite it for this vacancy.");
+  }
+
+  const roleTokens = comparableTokens(job.title);
+  const summaryTokens = comparableTokens(summary);
+  const roleOverlap = [...roleTokens].filter((token) => summaryTokens.has(token)).length;
+  if (roleTokens.size > 0 && roleOverlap === 0) {
+    issues.push("The rewritten profile does not clearly target the vacancy's role family.");
+  }
+
+  const rewrites = Array.isArray(raw?.experienceRewrites) ? raw.experienceRewrites : [];
+  const coveredRequirementIds = new Set<string>();
+  let totalHighlights = 0;
+  for (const rewrite of rewrites) {
+    const experienceIndex = Number(rewrite?.experienceIndex);
+    const employer = profile.experience[experienceIndex];
+    if (!employer) continue;
+    const highlights = Array.isArray(rewrite?.tailoredHighlights)
+      ? rewrite.tailoredHighlights
+      : [];
+    totalHighlights += highlights.length;
+    const evidenceIndexes = new Set<number>();
+    requirements.forEach((requirement) => {
+      requirement.evidence
+        .filter((reference) => reference.experienceIndex === experienceIndex)
+        .forEach((reference) => reference.bulletIndices.forEach((index) => evidenceIndexes.add(index)));
+    });
+    if (evidenceIndexes.size >= 2 && (rewrite?.supported !== true || highlights.length < 2)) {
+      issues.push(`${employer.company} has enough declared evidence but lacks 2-3 tailored highlights.`);
+    }
+    highlights.forEach((highlight: any) => {
+      const sourceIndices = Array.isArray(highlight?.sourceBulletIndices)
+        ? highlight.sourceBulletIndices.map(Number)
+        : [];
+      const sourceText = sourceIndices.map((index: number) => employer.bullets[index] || "").join(" ");
+      const text = normalizeSummaryText(highlight?.text);
+      if (sourceText && tokenJaccard(text, sourceText) > 0.9) {
+        issues.push(`${employer.company} includes a highlight that is nearly unchanged from its source.`);
+      }
+      (Array.isArray(highlight?.requirementIds) ? highlight.requirementIds : []).forEach((id: unknown) =>
+        coveredRequirementIds.add(normalizeSummaryText(id).toUpperCase())
+      );
+    });
+  }
+  if (profile.experience.some((entry) => entry.bullets.length >= 2) && totalHighlights < 2) {
+    issues.push("The CV needs at least two evidence-backed, visibly tailored experience highlights.");
+  }
+
+  const supportedRequirements = requirements.filter((requirement) => requirement.evidence.length > 0);
+  const mustCover = supportedRequirements.slice(0, Math.min(3, supportedRequirements.length));
+  const uncovered = mustCover.filter((requirement) => !coveredRequirementIds.has(requirement.id));
+  if (uncovered.length) {
+    issues.push(
+      `Tailored highlights do not cover top supported requirement${uncovered.length === 1 ? "" : "s"}: ${uncovered
+        .map((requirement) => requirement.id)
+        .join(", ")}.`
+    );
+  }
+  if (normalizeSummaryText(job.description).length < MIN_FULL_JOB_DESCRIPTION_CHARS) {
+    issues.push("A complete job description is required for reliable tailoring.");
+  }
+  issues.push(
+    ...evidenceGuardIssues(
+      analysis.coverLetter,
+      completeProfileEvidence,
+      profile.title,
+      "Cover letter",
+      `${job.title} ${job.company}`
+    )
+  );
+  if (analysis.reasons.length !== 3) {
+    issues.push("Return exactly three concise fit reasons.");
+  }
+  if (issues.length) throw new TailoringQualityError([...new Set(issues)]);
+}
+
 export function toAnalysis(parsed: any, profile: Profile): Analysis {
   const score = Math.max(0, Math.min(100, Number(parsed.score) || 0));
   const tier = getMatchTier(score);
+  const preferredFacts = preferredRequirementFacts(parsed, profile);
   const tailoredCV: TailoredCVContent = {
-    summary: ensureTailoredSummaryLength(parsed.tailoredSummary || profile.summary || "", profile),
-    skills: profile.skills,
+    summary: ensureTailoredSummaryLength(
+      parsed.tailoredSummary || profile.summary || "",
+      profile,
+      preferredFacts
+    ),
+    skills: resolveSkillOrder(parsed, profile),
     experience: applyExperienceRewrites(profile, parsed),
     education: profile.education,
   };
@@ -429,13 +1138,18 @@ export function toAnalysis(parsed: any, profile: Profile): Analysis {
     reasons: Array.isArray(parsed.reasons) ? parsed.reasons.map(String) : [],
     tailoredCV,
     coverLetter: String(parsed.coverLetter || ""),
-    auditTrail: Array.isArray(parsed.auditTrail)
-      ? parsed.auditTrail.map((e: any) => ({
-          statement: String(e?.statement || ""),
-          source: String(e?.source || ""),
-        }))
-      : [],
+    auditTrail: buildEvidenceAuditTrail(parsed, profile),
   };
+}
+
+export function toValidatedAnalysis(
+  parsed: any,
+  profile: Profile,
+  job: Pick<Job, "title" | "company" | "description">
+): Analysis {
+  const analysis = toAnalysis(parsed, profile);
+  validateTailoringQuality(parsed, profile, analysis, job);
+  return analysis;
 }
 
 export function parseModelResponse(text: string) {
@@ -462,6 +1176,161 @@ export function parseModelResponse(text: string) {
   return parsed;
 }
 
+interface ClaudeCallResult {
+  parsed: any;
+  webSearchRequests: number;
+  researchSources: RoleResearchSource[];
+}
+
+function extractResearchSources(content: any[]): RoleResearchSource[] {
+  const sources: RoleResearchSource[] = [];
+  const seen = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    if (typeof record.url === "string" && /^https?:\/\//i.test(record.url) && !seen.has(record.url)) {
+      seen.add(record.url);
+      sources.push({
+        title: normalizeSummaryText(record.title) || "Role research source",
+        url: record.url,
+      });
+    }
+    Object.values(record).forEach(visit);
+  };
+  visit(content);
+  return sources.slice(0, 6);
+}
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timeout = setTimeout(() => resolve(fallback), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function callClaude(
+  job: Pick<Job, "title" | "company" | "location" | "description">,
+  profile: Profile,
+  apiKey: string,
+  promptOptions: BuildPromptOptions,
+  timeoutMs: number
+): Promise<ClaudeCallResult> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    let response: Response;
+    try {
+      response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: MAX_MODEL_TOKENS,
+          ...MODEL_PERFORMANCE_OPTIONS,
+          system: SYSTEM,
+          messages: [{ role: "user", content: buildPrompt(job, profile, promptOptions) }],
+          ...(promptOptions.requestWebResearch ? { tools: [WEB_SEARCH_TOOL] } : {}),
+        }),
+        signal: controller.signal,
+      });
+    } catch (error: any) {
+      if (promptOptions.requestWebResearch && error?.name !== "AbortError") {
+        throw new WebResearchUnavailableError(
+          "The bounded role-research request could not be confirmed; retry from the full job description without another web search."
+        );
+      }
+      throw error;
+    }
+    if (!response.ok) {
+      const providerStatus = response.status;
+      const providerDetail = (await response.text()).slice(0, 700);
+      console.error("Claude tailoring request failed", providerStatus, providerDetail);
+      if (providerStatus === 400 && /credit balance is too low/i.test(providerDetail)) {
+        throw new LiveAnalysisError(
+          "The AI service has run out of credit. Add credit in the Anthropic Console (Plans & Billing), then try again.",
+          402
+        );
+      }
+      if (
+        promptOptions.requestWebResearch &&
+        providerStatus === 400 &&
+        /web.?search|server.?tool|tools?/i.test(providerDetail)
+      ) {
+        throw new WebResearchUnavailableError(
+          "Web role research was unavailable; use the full job description only."
+        );
+      }
+      if (promptOptions.requestWebResearch && TRANSIENT_PROVIDER_STATUSES.has(providerStatus)) {
+        throw new WebResearchUnavailableError(
+          "The role-research request did not complete reliably; retry from the full job description without another web search."
+        );
+      }
+      if (TRANSIENT_PROVIDER_STATUSES.has(providerStatus)) {
+        throw new RetryableClaudeError(
+          "The provider returned a transient response; make one concise corrective request without web research."
+        );
+      }
+      throw new LiveAnalysisError(
+        "Live tailoring is temporarily unavailable. Please try again.",
+        502
+      );
+    }
+
+    const data = await response.json();
+    if (data.stop_reason === "max_tokens") {
+      throw new TailoringQualityError([
+        "Return a complete but concise JSON response within the output limit.",
+      ]);
+    }
+    if (data.stop_reason === "pause_turn") {
+      throw new WebResearchUnavailableError(
+        "Web role research did not finish in one bounded pass; use the full job description only."
+      );
+    }
+    const content = Array.isArray(data.content) ? data.content : [];
+    const text = content
+      .map((block: any) => (block?.type === "text" ? block.text : ""))
+      .join("")
+      .trim();
+    let parsed: any;
+    try {
+      parsed = parseModelResponse(text);
+    } catch (error) {
+      if (promptOptions.requestWebResearch) {
+        throw new WebResearchUnavailableError(
+          "The researched response was incomplete; retry using the job description only."
+        );
+      }
+      throw error;
+    }
+    return {
+      parsed,
+      webSearchRequests: Math.max(
+        0,
+        Number(data?.usage?.server_tool_use?.web_search_requests) || 0
+      ),
+      researchSources: extractResearchSources(content),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function analyzeJobForCandidate(
   job: Pick<Job, "title" | "company" | "location" | "description" | "id">,
   profile: Profile
@@ -471,7 +1340,7 @@ export async function analyzeJobForCandidate(
   const masterCV = buildMasterCVMarkdown(candidateProfile);
 
   if (process.env.DEMO_MODE === "true" || !key) {
-    const demo = buildDemoAnalysis(job as Job, masterCV, "Simulated preview — Claude was not called.");
+    const demo = buildDemoAnalysis(job as Job, masterCV, "Simulated preview - Claude was not called.");
     return {
       ...demo,
       tailoredCV: {
@@ -480,83 +1349,83 @@ export async function analyzeJobForCandidate(
       },
     };
   }
+  if (normalizeSummaryText(job.description).length < MIN_FULL_JOB_DESCRIPTION_CHARS) {
+    throw new LiveAnalysisError(
+      "This listing does not include a complete job description. Open the posting or paste the full description before tailoring.",
+      422
+    );
+  }
+
+  const deadline = Date.now() + 52_000;
+  let researchBrief: RoleResearchBrief | null = await settleWithin(
+    loadRoleResearchBrief(job),
+    1_500,
+    null
+  );
+  const firstOptions: BuildPromptOptions = researchBrief
+    ? { cachedRoleResearch: researchBrief }
+    : { requestWebResearch: process.env.ROLE_RESEARCH_ENABLED !== "false" };
+  let correctionIssues: string[] = [];
 
   try {
-    // Bound the call well under the route's maxDuration (60s) so an
-    // unbounded provider request cannot leave the client waiting forever.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 50_000);
-    let r: Response | null = null;
     try {
-      // 3 attempts, not 2 — a rate-limit/5xx response comes back fast (not
-      // after a full generation), so the extra attempt costs little time
-      // but meaningfully improves resilience against transient blips.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          r = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-api-key": key,
-              "anthropic-version": "2023-06-01",
-            },
-            body: JSON.stringify({
-              model: MODEL,
-              max_tokens: 4500,
-              ...MODEL_PERFORMANCE_OPTIONS,
-              system: SYSTEM,
-              messages: [{ role: "user", content: buildPrompt(job, candidateProfile) }],
-            }),
-            signal: controller.signal,
-          });
-        } catch (error: any) {
-          if (attempt < 2 && error?.name !== "AbortError") {
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            continue;
-          }
-          throw error;
-        }
-
-        if (r.ok || attempt === 2 || !TRANSIENT_PROVIDER_STATUSES.has(r.status)) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (!r || !r.ok) {
-      const providerStatus = r?.status || 502;
-      const providerDetail = r ? (await r.text()).slice(0, 500) : "No response";
-      console.error("Claude tailoring request failed", providerStatus, providerDetail);
-
-      // A billing/credit failure isn't transient — "try again" is actively
-      // misleading here, since retrying can't fix it. Surface the real cause
-      // so whoever's watching knows to add credit rather than keep clicking.
-      if (providerStatus === 400 && /credit balance is too low/i.test(providerDetail)) {
-        throw new LiveAnalysisError(
-          "The AI service has run out of credit. Add credit in the Anthropic Console (Plans & Billing), then try again.",
-          402
+      const firstResult = await callClaude(job, candidateProfile, key, firstOptions, 34_000);
+      if (!researchBrief && firstResult.webSearchRequests > 0) {
+        researchBrief = await settleWithin(
+          saveRoleResearchBrief(job, firstResult.parsed?.roleResearch, firstResult.researchSources),
+          1_500,
+          null
         );
       }
-
-      throw new LiveAnalysisError("Live tailoring is temporarily unavailable. Please try again.", 502);
+      const firstAnalysis = toValidatedAnalysis(firstResult.parsed, candidateProfile, job);
+      return firstAnalysis;
+    } catch (error: any) {
+      if (error instanceof LiveAnalysisError) throw error;
+      if (error?.name === "AbortError") {
+        correctionIssues = ["The first pass timed out. Return concise, complete JSON without web research."];
+      } else if (error instanceof TailoringQualityError) {
+        correctionIssues = error.issues.slice(0, 10);
+      } else if (error instanceof WebResearchUnavailableError) {
+        correctionIssues = [error.message];
+      } else if (error instanceof RetryableClaudeError) {
+        correctionIssues = [error.message];
+      } else {
+        correctionIssues = [
+          "Return one complete valid JSON object matching schema version 3; do not include prose or markdown.",
+        ];
+      }
     }
 
-    const data = await r.json();
-    if (data.stop_reason === "max_tokens") {
-      throw new LiveAnalysisError("Claude could not finish the CV response. Please try again.", 502);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs < 5_000) {
+      throw new LiveAnalysisError(
+        "Live tailoring timed out before the quality correction could finish. Please try again.",
+        504
+      );
     }
-    const text: string = (data.content || [])
-      .map((b: any) => (b.type === "text" ? b.text : ""))
-      .join("")
-      .trim();
-
-    const parsed = parseModelResponse(text);
-    return toAnalysis(parsed, candidateProfile);
+    const correctedResult = await callClaude(
+      job,
+      candidateProfile,
+      key,
+      {
+        requestWebResearch: false,
+        correctionIssues,
+      },
+      Math.min(remainingMs, 18_000)
+    );
+    const correctedAnalysis = toValidatedAnalysis(correctedResult.parsed, candidateProfile, job);
+    return correctedAnalysis;
   } catch (error: any) {
     if (error instanceof LiveAnalysisError) throw error;
     if (error?.name === "AbortError") {
       throw new LiveAnalysisError("Live tailoring timed out. Please try again.", 504);
+    }
+    if (error instanceof TailoringQualityError) {
+      console.error("Claude tailoring failed quality checks", error.issues);
+      throw new LiveAnalysisError(
+        "Claude could not produce a sufficiently specific, evidence-backed CV. Please try again.",
+        502
+      );
     }
     console.error("Failed to parse or build live tailoring response", error);
     throw new LiveAnalysisError("Claude returned an invalid CV response. Please try again.", 502);

@@ -7,7 +7,8 @@ export const MASTER_CV_KEY = "jobhunter:masterCV";
 export const PROFILE_KEY = "jobhunter:profile";
 // Provider-versioned so an old JSearch snapshot cannot be mistaken for a
 // Hirebase response after the normal listing provider is switched.
-export const JOBS_CACHE_KEY = "jobhunter:jobsCache:hirebase:v1";
+// v2 invalidates browser snapshots from the old static-sample fallback.
+export const JOBS_CACHE_KEY = "jobhunter:jobsCache:hirebase:v2";
 // Provider-versioned so a failed TheirStack comparison never silently falls
 // back to stale cards from the retired public LinkedIn crawler.
 export const LINKEDIN_JOBS_CACHE_KEY = "jobhunter:linkedinJobsCache:theirstack:v1";

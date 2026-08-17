@@ -21,11 +21,17 @@ export interface TheirStackSyncState {
   seenJobIds: number[];
 }
 
+export interface HirebaseSyncState {
+  version: 1;
+  lastAttemptAt: number | null;
+}
+
 const PATHS: Record<JobListingProvider, string> = {
   hirebase: "jobhunter/jobs/hirebase.json",
   theirstack: "jobhunter/jobs/theirstack.json",
 };
 const THEIRSTACK_SYNC_STATE_PATH = "jobhunter/jobs/theirstack-sync-state.json";
+const HIREBASE_SYNC_STATE_PATH = "jobhunter/jobs/hirebase-sync-state.json";
 const MAX_SYNC_STATE_JOB_IDS = 1_000;
 
 function normalizedApplyLink(value: string | null): string | null {
@@ -174,6 +180,12 @@ function isTheirStackSyncState(value: unknown): value is TheirStackSyncState {
   );
 }
 
+function isHirebaseSyncState(value: unknown): value is HirebaseSyncState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Partial<HirebaseSyncState>;
+  return state.version === 1 && isNullableTimestamp(state.lastAttemptAt);
+}
+
 function isSnapshot(
   value: unknown,
   provider: JobListingProvider
@@ -304,8 +316,58 @@ export async function saveTheirStackSyncState(
   }
 }
 
+export async function loadHirebaseSyncState(
+  options: { strict?: boolean } = {}
+): Promise<HirebaseSyncState | null> {
+  const token = process.env.BLOB_READ_WRITE_TOKEN;
+  if (!token) return null;
+  try {
+    const result = await get(HIREBASE_SYNC_STATE_PATH, {
+      access: "private",
+      token,
+      useCache: false,
+    });
+    if (!result?.stream) return null;
+    const text = await new Response(result.stream as any).text();
+    const parsed = JSON.parse(text) as unknown;
+    if (isHirebaseSyncState(parsed)) return parsed;
+    if (options.strict) throw new Error("The saved Hirebase sync state is invalid");
+    return null;
+  } catch (error) {
+    if (options.strict) {
+      console.error("loadHirebaseSyncState: failed to load sync state", error);
+      throw new Error(
+        "Hirebase sync state could not be loaded; no provider request was made"
+      );
+    }
+    return null;
+  }
+}
+
+export async function saveHirebaseSyncState(
+  state: HirebaseSyncState
+): Promise<boolean> {
+  const token = process.env.BLOB_READ_WRITE_TOKEN;
+  if (!token || !isHirebaseSyncState(state)) return false;
+  try {
+    await put(HIREBASE_SYNC_STATE_PATH, JSON.stringify(state), {
+      access: "private",
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: "application/json",
+      token,
+    });
+    return true;
+  } catch (error) {
+    console.error("saveHirebaseSyncState: failed to persist sync state", error);
+    return false;
+  }
+}
+
 export async function clearJobListingSnapshots(): Promise<void> {
   const token = process.env.BLOB_READ_WRITE_TOKEN;
   if (!token) return;
+  // Intentionally delete listing payloads only. Provider attempt ledgers are
+  // separate paths so Clear saved listings cannot bypass paid-request guards.
   await del(Object.values(PATHS), { token });
 }

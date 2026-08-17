@@ -16,6 +16,11 @@ import {
   NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
   PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
 } from "@/lib/targetRoles";
+import {
+  GOVERNMENT_GRE_COMPANY_FILTERS,
+  compareJobsByEmployerPriority,
+  getEmployerPriority,
+} from "@/lib/employerPriority";
 import { Job } from "@/lib/types";
 
 const THEIRSTACK_SEARCH_URL = "https://api.theirstack.com/v1/jobs/search";
@@ -27,7 +32,7 @@ const MAX_CONFIGURED_RESULTS = 250;
 const RESULTS_PER_REQUEST = 25;
 const MAX_CONCURRENT_REQUESTS = 3;
 const REQUEST_BATCH_DELAY_MS = 1_000;
-const QUERY_VERSION = 4;
+const QUERY_VERSION = 5;
 const MAX_EXCLUDED_JOB_IDS = 1_000;
 const DISCOVERY_OVERLAP_MS = 5 * 60 * 1_000;
 const FETCH_TIMEOUT_MS = 12_000;
@@ -36,76 +41,6 @@ const FETCH_TIMEOUT_MS = 12_000;
 // per 12 hours; normal reads always use the durable saved snapshot.
 const CACHE_TTL_MS = 12 * 60 * 60 * 1_000;
 const MAX_DESCRIPTION_CHARS = 18_000;
-const PRIORITY_COMPANY_PARTIAL_MATCHES = [
-  "ADNOC",
-  "Abu Dhabi National Oil Company",
-  "Mubadala",
-  "Abu Dhabi Developmental Holding",
-  "Abu Dhabi National Energy Company",
-  "TAQA",
-  "Masdar",
-  "AD Ports",
-  "Abu Dhabi Ports",
-  "Aldar",
-  "Modon",
-  "Miral",
-  "Etihad",
-  "Abu Dhabi Airports",
-  "First Abu Dhabi Bank",
-  "Abu Dhabi Commercial Bank",
-  "Abu Dhabi Islamic Bank",
-  "Abu Dhabi Investment Authority",
-  "Abu Dhabi Investment Council",
-  "Abu Dhabi Accountability Authority",
-  "Abu Dhabi Global Market",
-  "Abu Dhabi Securities Exchange",
-  "Abu Dhabi Chamber",
-  "Abu Dhabi Customs",
-  "Abu Dhabi Police",
-  "Environment Agency Abu Dhabi",
-  "Department of Government Enablement",
-  "Department of Culture and Tourism",
-  "Department of Municipalities and Transport",
-  "Abu Dhabi Department of Economic Development",
-  "Abu Dhabi Executive Office",
-  "Emirates Nuclear Energy Corporation",
-  "Nawah Energy",
-  "EDGE Group",
-  "Technology Innovation Institute",
-  "Advanced Technology Research Council",
-  "Khalifa University",
-  "NYU Abu Dhabi",
-  "Cleveland Clinic Abu Dhabi",
-  "Abu Dhabi Health Services",
-  "PureHealth",
-  "Space42",
-  "Presight",
-  "Core42",
-  "G42",
-  "AIQ",
-  "Borouge",
-  "Fertiglobe",
-  "Agthia",
-  "Emirates Global Aluminium",
-  "Yahsat",
-  "Tawazun",
-] as const;
-const PRIORITY_COMPANY_EXACT_MATCHES = [
-  "ADQ",
-  "FAB",
-  "ADCB",
-  "ADIB",
-  "ADIA",
-  "ADX",
-  "ADGM",
-  "ENEC",
-  "EGA",
-  "G42",
-  "M42",
-  "AIQ",
-  "FSRA",
-  "IRENA",
-] as const;
 function configuredMaxResults(): number {
   const parsed = Number.parseInt(process.env.THEIRSTACK_MAX_RESULTS || "", 10);
   if (!Number.isFinite(parsed)) return DEFAULT_MAX_RESULTS;
@@ -120,7 +55,17 @@ interface TheirStackJob {
   job_title?: string | null;
   company?: string | null;
   company_name?: string | null;
-  company_object?: { name?: string | null } | null;
+  company_object?: {
+    name?: string | null;
+    employee_count?: number | null;
+    employee_count_range?: string | null;
+    annual_revenue_usd?: number | null;
+    annual_revenue_usd_readable?: string | null;
+    industry?: string | null;
+    is_recruiting_agency?: boolean | null;
+    publicly_traded_symbol?: string | null;
+    publicly_traded_exchange?: string | null;
+  } | null;
   location?: string | null;
   short_location?: string | null;
   long_location?: string | null;
@@ -286,12 +231,6 @@ function formatSalary(job: TheirStackJob): string | null {
   return `${currency} up to ${format(max as number)} / year`;
 }
 
-function postedTimestamp(job: Job): number {
-  if (!job.postedAt) return 0;
-  const parsed = Date.parse(job.postedAt);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
 function numericTheirStackId(value: unknown): number | null {
   const numeric =
     typeof value === "number"
@@ -322,6 +261,27 @@ function mergeSeenJobIds(current: number[], incoming: number[]): number[] {
   return [...unique];
 }
 
+function finiteNonNegative(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+function employeeRange(value: unknown): { min: number | null; max: number | null } {
+  const text = cleanInlineText(value);
+  if (!text) return { min: null, max: null };
+  const numbers = text
+    .replace(/,/g, "")
+    .match(/\d+/g)
+    ?.map((entry) => Number(entry))
+    .filter((entry) => Number.isFinite(entry));
+  if (!numbers?.length) return { min: null, max: null };
+  return {
+    min: numbers[0] ?? null,
+    max: /\+\s*$/.test(text) ? null : numbers[1] ?? numbers[0] ?? null,
+  };
+}
+
 function toJob(raw: TheirStackJob): Job | null {
   const rawId = raw.id == null ? "" : String(raw.id).trim();
   const title = cleanInlineText(raw.job_title);
@@ -336,6 +296,17 @@ function toJob(raw: TheirStackJob): Job | null {
     "Abu Dhabi, UAE";
   const description = cleanDescription(raw.description);
   const applyLink = getApplyLink(raw);
+  const exactEmployeeCount = finiteNonNegative(raw.company_object?.employee_count);
+  const parsedEmployeeRange = employeeRange(raw.company_object?.employee_count_range);
+  const companySizeMin = exactEmployeeCount ?? parsedEmployeeRange.min;
+  const companySizeMax = exactEmployeeCount ?? parsedEmployeeRange.max;
+  const companyRevenueUsd = finiteNonNegative(raw.company_object?.annual_revenue_usd);
+  const companyIndustry = cleanInlineText(raw.company_object?.industry);
+  const recruitingAgency = raw.company_object?.is_recruiting_agency;
+  const publiclyTraded = Boolean(
+    cleanInlineText(raw.company_object?.publicly_traded_symbol) ||
+    cleanInlineText(raw.company_object?.publicly_traded_exchange)
+  );
 
   if (
     !rawId ||
@@ -351,7 +322,7 @@ function toJob(raw: TheirStackJob): Job | null {
     return null;
   }
 
-  return {
+  const job: Job = {
     // Keep this namespace distinct from the old public-crawler IDs. The old
     // `linkedin-*` prefix activates lazy HTML description hydration, while
     // TheirStack already returns the complete description in this response.
@@ -364,7 +335,17 @@ function toJob(raw: TheirStackJob): Job | null {
     applyLink,
     source: "LinkedIn via TheirStack",
     postedAt: cleanInlineText(raw.date_posted) || cleanInlineText(raw.discovered_at) || null,
+    companySizeMin,
+    companySizeMax,
+    companyRevenueUsd,
+    companyIndustries: companyIndustry ? [companyIndustry] : [],
+    companyType: publiclyTraded ? "Public Company" : null,
+    companyPubliclyTraded: publiclyTraded ? true : null,
+    directEmployer:
+      typeof recruitingAgency === "boolean" ? !recruitingAgency : null,
   };
+  job.employerTier = getEmployerPriority(job).tier;
+  return job;
 }
 
 function upstreamError(status: number): Error {
@@ -386,6 +367,8 @@ interface TheirStackSearchLane {
   excludedTitlePatterns: string[];
   companyNamePartialMatches?: readonly string[];
   companyNameExactMatches?: readonly string[];
+  minEmployeeCount?: number;
+  maxEmployeeCountOrNull?: number;
 }
 
 async function fetchTheirStackPage(
@@ -428,6 +411,12 @@ async function fetchTheirStackPage(
               company_name_case_insensitive_or:
                 lane.companyNameExactMatches,
             }
+          : {}),
+        ...(typeof lane.minEmployeeCount === "number"
+          ? { min_employee_count: lane.minEmployeeCount }
+          : {}),
+        ...(typeof lane.maxEmployeeCountOrNull === "number"
+          ? { max_employee_count_or_null: lane.maxEmployeeCountOrNull }
           : {}),
         url_domain_or: ["linkedin.com"],
         is_closed: false,
@@ -483,16 +472,24 @@ async function loadTheirStackLane(
     };
   }
 
-  const pages = Array.from(
-    { length: Math.ceil(maxRecords / RESULTS_PER_REQUEST) },
-    (_, page) => ({
-      page,
-      limit: Math.min(
-        RESULTS_PER_REQUEST,
-        maxRecords - page * RESULTS_PER_REQUEST
-      ),
-    })
+  // TheirStack's `page` offset is derived from `limit`. Changing the limit on
+  // the final page shifts that offset backwards and can return records already
+  // fetched by an earlier page. Use one fixed page size for the entire lane,
+  // while keeping the lane's maximum requested capacity inside its budget.
+  const desiredPageCount = Math.ceil(maxRecords / RESULTS_PER_REQUEST);
+  const pageSize = Math.max(
+    1,
+    Math.min(
+      RESULTS_PER_REQUEST,
+      Math.floor(maxRecords / desiredPageCount)
+    )
   );
+  const pageCount = Math.floor(maxRecords / pageSize);
+  const requestedCapacity = pageCount * pageSize;
+  const pages = Array.from({ length: pageCount }, (_, page) => ({
+    page,
+    limit: pageSize,
+  }));
   const rawJobs: TheirStackJob[] = [];
   let attemptedSearches = 0;
   let successfulSearches = 0;
@@ -534,7 +531,8 @@ async function loadTheirStackLane(
     successfulSearches,
     failedSearches,
     firstFailure,
-    windowComplete: failedSearches === 0 && rawJobs.length < maxRecords,
+    windowComplete:
+      failedSearches === 0 && rawJobs.length < requestedCapacity,
   };
 }
 
@@ -548,110 +546,163 @@ async function loadTheirStackJobs(
   if (!key) throw new Error("THEIRSTACK_API_KEY is not configured");
 
   const maxResults = configuredMaxResults();
-  // Give known Abu Dhabi government/GRE employers the first third of the
-  // paid-record budget so their vacancies cannot be buried by generic roles.
-  // Any unused capacity flows forward into the senior and broad lanes.
-  const governmentBudget = Math.max(1, Math.ceil(maxResults / 3));
-  const governmentLane: TheirStackSearchLane = {
-    includedTitlePatterns: [
-      ...PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
-      ...BROAD_MANAGERIAL_TITLE_PATTERN_SOURCES,
-    ],
-    excludedTitlePatterns: NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
-    companyNamePartialMatches: PRIORITY_COMPANY_PARTIAL_MATCHES,
-    companyNameExactMatches: PRIORITY_COMPANY_EXACT_MATCHES,
-  };
-  const government = await loadTheirStackLane(
-    key,
-    window,
-    governmentLane,
-    governmentBudget
-  );
-
-  const governmentIds = government.rawJobs
-    .map((job) => numericTheirStackId(job.id))
-    .filter((id): id is number => id !== null);
-  const afterGovernmentBudget = Math.max(
-    0,
-    maxResults - government.rawJobs.length
-  );
-  const broadReserve = Math.min(
-    afterGovernmentBudget,
-    Math.max(1, Math.floor(maxResults / 6))
-  );
-  const priorityBudget = Math.max(0, afterGovernmentBudget - broadReserve);
-  const priorityWindow: TheirStackSearchWindow = {
-    ...window,
-    excludedJobIds: mergeSeenJobIds(window.excludedJobIds, governmentIds),
-  };
-  const priorityLane: TheirStackSearchLane = {
-    includedTitlePatterns: PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
-    excludedTitlePatterns: NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
-  };
-  if (priorityBudget > 0 && government.attemptedSearches > 0) {
-    await new Promise((resolve) => setTimeout(resolve, REQUEST_BATCH_DELAY_MS));
-  }
-  const priority = await loadTheirStackLane(
-    key,
-    priorityWindow,
-    priorityLane,
-    priorityBudget
-  );
-
-  const priorityIds = [...government.rawJobs, ...priority.rawJobs]
-    .map((job) => numericTheirStackId(job.id))
-    .filter((id): id is number => id !== null);
-  const remainingBudget = Math.max(
-    0,
-    maxResults - government.rawJobs.length - priority.rawJobs.length
-  );
-  const broadWindow: TheirStackSearchWindow = {
-    ...window,
-    excludedJobIds: mergeSeenJobIds(window.excludedJobIds, priorityIds),
-  };
-  const broadLane: TheirStackSearchLane = {
-    includedTitlePatterns: BROAD_MANAGERIAL_TITLE_PATTERN_SOURCES,
-    excludedTitlePatterns: [
-      ...NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
-      ...PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
-    ],
-  };
-  // The lane boundary also acts as a rate-limit boundary; at most three
-  // requests were started in the previous one-second interval.
-  if (
-    remainingBudget > 0 &&
-    government.attemptedSearches + priority.attemptedSearches > 0
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, REQUEST_BATCH_DELAY_MS));
-  }
-  const broad = await loadTheirStackLane(
-    key,
-    broadWindow,
-    broadLane,
-    remainingBudget
-  );
-
-  const rawJobs = [
-    ...government.rawJobs,
-    ...priority.rawJobs,
-    ...broad.rawJobs,
+  const allManagerialPatterns = [
+    ...PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
+    ...BROAD_MANAGERIAL_TITLE_PATTERN_SOURCES,
   ];
-  const attemptedSearches =
-    government.attemptedSearches +
-    priority.attemptedSearches +
-    broad.attemptedSearches;
-  const successfulSearches =
-    government.successfulSearches +
-    priority.successfulSearches +
-    broad.successfulSearches;
-  const failedSearches =
-    government.failedSearches +
-    priority.failedSearches +
-    broad.failedSearches;
-  const firstFailure =
-    government.firstFailure ?? priority.firstFailure ?? broad.firstFailure;
+  const broadExclusions = [
+    ...NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
+    ...PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
+  ];
+  const rawJobs: TheirStackJob[] = [];
+  let attemptedSearches = 0;
+  let successfulSearches = 0;
+  let failedSearches = 0;
+  let firstFailure: unknown = null;
+  let allWindowsComplete = true;
+  let excludedJobIds = [...window.excludedJobIds];
+  let stopAfterAmbiguousFailure = false;
 
-  // TheirStack charges per returned record, not per empty request. Both lanes
+  // Lanes are sequential. Every returned ID is excluded before the next lane
+  // starts, so the same record cannot consume credits twice in one sync. Each
+  // lane is also capped by the single global maxResults budget.
+  const runLane = async (
+    lane: TheirStackSearchLane,
+    requestedBudget: number
+  ): Promise<TheirStackLaneResult> => {
+    // A timed-out or otherwise failed TheirStack request may still have used
+    // credits. Do not infer remaining credit budget from the records we saw,
+    // and do not schedule any later lane after an ambiguous failure.
+    if (stopAfterAmbiguousFailure) {
+      return {
+        rawJobs: [],
+        attemptedSearches: 0,
+        successfulSearches: 0,
+        failedSearches: 0,
+        firstFailure: null,
+        windowComplete: false,
+      };
+    }
+    const budget = Math.min(
+      Math.max(0, requestedBudget),
+      Math.max(0, maxResults - rawJobs.length)
+    );
+    if (budget <= 0) {
+      return {
+        rawJobs: [],
+        attemptedSearches: 0,
+        successfulSearches: 0,
+        failedSearches: 0,
+        firstFailure: null,
+        windowComplete: true,
+      };
+    }
+    // Keep provider bursts below three requests per one-second boundary.
+    if (attemptedSearches > 0) {
+      await new Promise((resolve) => setTimeout(resolve, REQUEST_BATCH_DELAY_MS));
+    }
+    const result = await loadTheirStackLane(
+      key,
+      { ...window, excludedJobIds },
+      lane,
+      budget
+    );
+    rawJobs.push(...result.rawJobs);
+    attemptedSearches += result.attemptedSearches;
+    successfulSearches += result.successfulSearches;
+    failedSearches += result.failedSearches;
+    firstFailure ??= result.firstFailure;
+    allWindowsComplete = allWindowsComplete && result.windowComplete;
+    if (result.failedSearches > 0) stopAfterAmbiguousFailure = true;
+    excludedJobIds = mergeSeenJobIds(
+      excludedJobIds,
+      result.rawJobs
+        .map((job) => numericTheirStackId(job.id))
+        .filter((id): id is number => id !== null)
+    );
+    return result;
+  };
+
+  // Forty percent is reserved for known Abu Dhabi government/GRE employers.
+  // Exact acronym aliases and partial long names are separate requests, which
+  // avoids relying on cross-filter OR semantics and makes dedupe explicit.
+  const governmentTarget = Math.max(1, Math.ceil(maxResults * 0.4));
+  const governmentExactTarget = Math.min(
+    governmentTarget,
+    Math.max(1, Math.ceil(governmentTarget * 0.25))
+  );
+  if (GOVERNMENT_GRE_COMPANY_FILTERS.exactNames.length) {
+    await runLane(
+      {
+        includedTitlePatterns: allManagerialPatterns,
+        excludedTitlePatterns: NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
+        companyNameExactMatches: GOVERNMENT_GRE_COMPANY_FILTERS.exactNames,
+      },
+      governmentExactTarget
+    );
+  }
+  const governmentUsed = rawJobs.length;
+  if (GOVERNMENT_GRE_COMPANY_FILTERS.partialNames.length) {
+    await runLane(
+      {
+        includedTitlePatterns: allManagerialPatterns,
+        excludedTitlePatterns: NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
+        companyNamePartialMatches: GOVERNMENT_GRE_COMPANY_FILTERS.partialNames,
+      },
+      Math.max(0, governmentTarget - governmentUsed)
+    );
+  }
+
+  // Established employers with 201+ employees get the next tranche. Senior
+  // titles are drained before generic manager/lead/supervisor aliases.
+  const afterGovernment = Math.max(0, maxResults - rawJobs.length);
+  const generalReserve = Math.min(
+    afterGovernment,
+    Math.max(1, Math.ceil(maxResults * 0.15))
+  );
+  const largeTarget = Math.max(0, afterGovernment - generalReserve);
+  const beforeLarge = rawJobs.length;
+  await runLane(
+    {
+      includedTitlePatterns: PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
+      excludedTitlePatterns: NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
+      minEmployeeCount: 201,
+    },
+    Math.ceil(largeTarget * 0.75)
+  );
+  const largePriorityUsed = rawJobs.length - beforeLarge;
+  await runLane(
+    {
+      includedTitlePatterns: BROAD_MANAGERIAL_TITLE_PATTERN_SOURCES,
+      excludedTitlePatterns: broadExclusions,
+      minEmployeeCount: 201,
+    },
+    Math.max(0, largeTarget - largePriorityUsed)
+  );
+
+  // The remaining budget is a genuine SME/unknown-size fallback rather than a
+  // hard large-company filter. This keeps relevant smaller employers visible.
+  const generalTarget = Math.max(0, maxResults - rawJobs.length);
+  const beforeGeneral = rawJobs.length;
+  await runLane(
+    {
+      includedTitlePatterns: PRIORITY_MANAGERIAL_TITLE_PATTERN_SOURCES,
+      excludedTitlePatterns: NON_MANAGERIAL_TITLE_PATTERN_SOURCES,
+      maxEmployeeCountOrNull: 200,
+    },
+    Math.ceil(generalTarget * 0.75)
+  );
+  const generalPriorityUsed = rawJobs.length - beforeGeneral;
+  await runLane(
+    {
+      includedTitlePatterns: BROAD_MANAGERIAL_TITLE_PATTERN_SOURCES,
+      excludedTitlePatterns: broadExclusions,
+      maxEmployeeCountOrNull: 200,
+    },
+    Math.max(0, generalTarget - generalPriorityUsed)
+  );
+
+  // TheirStack charges per returned record, not per empty request. All lanes
   // use rate-safe groups of three and intentionally do not retry ambiguous
   // timeouts, which may already have consumed credits.
   if (successfulSearches === 0) {
@@ -674,7 +725,7 @@ async function loadTheirStackJobs(
     const job = toJob(raw);
     if (job) jobs.push(job);
   }
-  jobs.sort((a, b) => postedTimestamp(b) - postedTimestamp(a));
+  jobs.sort(compareJobsByEmployerPriority);
 
   return {
     jobs: jobs.slice(0, maxResults),
@@ -684,13 +735,10 @@ async function loadTheirStackJobs(
     descriptionFailures,
     apiRecordsReturned: rawJobs.length,
     returnedJobIds: mergeSeenJobIds([], returnedJobIds),
-    // Advance the incremental watermark only after both priority and broad
-    // windows are fully drained. Otherwise the next eligible sync continues
-    // the same frozen window with all returned IDs excluded.
-    windowComplete:
-      government.windowComplete &&
-      priority.windowComplete &&
-      broad.windowComplete,
+    // Advance the watermark only after every bounded lane is fully drained.
+    // Otherwise the next eligible sync continues the same frozen window with
+    // every already-returned ID excluded.
+    windowComplete: allWindowsComplete,
   };
 }
 
@@ -756,7 +804,9 @@ function resultFromSnapshot(
     metadataNumber(snapshot, "syncedAt", state.lastSuccessfulSyncAt) ??
     snapshot.savedAt;
   return {
-    jobs: snapshot.jobs,
+    // Re-rank legacy snapshots immediately; name aliases cover records saved
+    // before firmographic metadata was persisted.
+    jobs: [...snapshot.jobs].sort(compareJobsByEmployerPriority),
     attemptedSearches: metadataNumber(snapshot, "attemptedSearches", 3) ?? 3,
     successfulSearches: metadataNumber(snapshot, "successfulSearches", 0) ?? 0,
     failedSearches: metadataNumber(snapshot, "failedSearches", 0) ?? 0,
@@ -919,7 +969,9 @@ async function loadPersistentOrLiveTheirStack(forceRefresh: boolean): Promise<Li
       ),
     };
     const accumulatedResult = {
-      jobs: mergeResult.jobs,
+      // Re-rank after the persistent upsert as well. Otherwise old snapshots
+      // keep insertion order and can bury newly classified major employers.
+      jobs: [...mergeResult.jobs].sort(compareJobsByEmployerPriority),
       attemptedSearches: result.attemptedSearches,
       successfulSearches: result.successfulSearches,
       failedSearches: result.failedSearches,

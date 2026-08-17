@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { LiveAnalysisError, parseModelResponse, toAnalysis } from "@/lib/analyzeJob";
+import {
+  LiveAnalysisError,
+  parseModelResponse,
+  toValidatedAnalysis,
+} from "@/lib/analyzeJob";
 import { sanitizeProfile } from "@/lib/profile";
 
 // Parses a response the user pasted back from claude.ai (see
@@ -17,7 +21,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
   }
 
-  const { text, profile } = body || {};
+  const { text, profile, job } = body || {};
   if (typeof text !== "string" || !text.trim()) {
     return NextResponse.json(
       { error: "Paste Claude's reply before importing." },
@@ -27,11 +31,28 @@ export async function POST(req: Request) {
   if (!profile) {
     return NextResponse.json({ error: "Profile is required." }, { status: 400 });
   }
+  if (
+    !job ||
+    typeof job.title !== "string" ||
+    !job.title.trim() ||
+    typeof job.description !== "string" ||
+    !job.description.trim()
+  ) {
+    return NextResponse.json(
+      { error: "The target job and its full description are required." },
+      { status: 400 }
+    );
+  }
 
   const candidateProfile = sanitizeProfile(profile);
+  const targetJob = {
+    title: job.title.trim(),
+    company: typeof job.company === "string" ? job.company.trim() : "",
+    description: job.description.trim(),
+  };
   try {
     const parsed = parseModelResponse(text);
-    const analysis = toAnalysis(parsed, candidateProfile);
+    const analysis = toValidatedAnalysis(parsed, candidateProfile, targetJob);
     return NextResponse.json(analysis);
   } catch (error: any) {
     console.error("Failed to import a pasted claude.ai response", error);

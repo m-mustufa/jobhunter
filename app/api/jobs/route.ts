@@ -17,6 +17,12 @@ import {
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
+function configuredLinkedInSyncCap(): number {
+  const parsed = Number.parseInt(process.env.THEIRSTACK_MAX_RESULTS || "", 10);
+  if (!Number.isFinite(parsed)) return 150;
+  return Math.min(250, Math.max(25, parsed));
+}
+
 function sampleJobs(keyword: string) {
   return keyword
     ? SAMPLE_JOBS.filter((job) =>
@@ -63,7 +69,7 @@ export async function DELETE(req: Request) {
     await clearJobListingSnapshots();
     return NextResponse.json({
       ok: true,
-      note: "Saved listings cleared. Click Refresh listings to fetch fresh jobs; the LinkedIn 12-hour credit cooldown still applies.",
+      note: "Saved listings cleared. Click Refresh listings to fetch fresh jobs; provider request cooldowns still apply.",
     });
   } catch (error) {
     console.error("Could not clear saved job listings", error);
@@ -110,7 +116,7 @@ export async function GET(req: Request) {
         );
       } else if (result.syncMode === "empty") {
         notes.push(
-          "No saved LinkedIn listings. Click Refresh listings to run the first sync (up to 70 credits)."
+          `No saved LinkedIn listings. Click Refresh listings to run the first sync (up to ${configuredLinkedInSyncCap()} credits).`
         );
       } else if (result.syncMode === "saved") {
         notes.push(
@@ -161,9 +167,10 @@ export async function GET(req: Request) {
     }
   }
 
-  // DEMO_MODE is the only unconditional sample path. Without a provider key,
+  // DEMO_MODE is the only sample path. Without a provider key,
   // fetchHirebaseJobs still gets the chance to restore a private snapshot;
-  // samples are used only when neither a key nor saved real data exists.
+  // if no saved real data exists, return a configuration error instead of
+  // placing fabricated listings in the production feed.
   if (process.env.DEMO_MODE === "true") {
     const res: JobsResponse = {
       jobs: sampleJobs(keyword),
@@ -182,7 +189,11 @@ export async function GET(req: Request) {
       );
     }
 
-    if (result.jobs.length === 0) {
+    if (
+      result.jobs.length === 0 &&
+      result.syncMode !== "cooldown" &&
+      result.syncMode !== "empty"
+    ) {
       throw new Error("Hirebase returned no usable Abu Dhabi jobs");
     }
 
@@ -191,7 +202,13 @@ export async function GET(req: Request) {
       notes.push(
         `Hirebase is temporarily unavailable — showing ${result.jobs.length} saved listings.`
       );
-    } else if (result.fromCache) {
+    } else if (result.syncMode === "cooldown") {
+      notes.push(
+        `A Hirebase refresh was already attempted recently — 0 provider requests sent. Next refresh in ${formatSyncWait(result.nextSyncAt)}. ${result.jobs.length} saved listings are available.`
+      );
+    } else if (result.syncMode === "empty") {
+      notes.push("No saved Hirebase listings. Click Refresh listings to run the first sync.");
+    } else if (result.fromCache || result.syncMode === "saved") {
       notes.push(`Showing ${result.jobs.length} saved Abu Dhabi listings.`);
     } else {
       notes.push(
@@ -211,17 +228,22 @@ export async function GET(req: Request) {
       jobs,
       sample: false,
       note: notes.join(" "),
+      ...(result.syncedAt ? { providerSyncedAt: result.syncedAt } : {}),
+      ...(result.nextSyncAt
+        ? { nextProviderSyncAt: result.nextSyncAt }
+        : {}),
     };
     return NextResponse.json(res);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Hirebase could not be reached";
     if (message === "HIREBASE_API_KEY is not configured") {
       const res: JobsResponse = {
-        jobs: sampleJobs(keyword),
-        sample: true,
-        note: "Showing sample jobs. Add HIREBASE_API_KEY to pull live listings.",
+        jobs: [],
+        sample: false,
+        error: message,
+        note: "No real listings are available. Add HIREBASE_API_KEY, then click Refresh listings.",
       };
-      return NextResponse.json(res);
+      return NextResponse.json(res, { status: 503 });
     }
     const res: JobsResponse = {
       jobs: [],

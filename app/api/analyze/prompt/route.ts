@@ -25,6 +25,8 @@ export async function POST(req: Request) {
   }
 
   const candidateProfile = sanitizeProfile(profile);
-  const prompt = `${SYSTEM}\n\n${buildPrompt(job, candidateProfile)}`;
+  const prompt = `${SYSTEM}\n\n${buildPrompt(job, candidateProfile, {
+    requestWebResearch: process.env.ROLE_RESEARCH_ENABLED !== "false",
+  })}`;
   return NextResponse.json({ prompt });
 }

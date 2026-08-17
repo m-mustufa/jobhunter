@@ -1,3 +1,9 @@
+export type EmployerPriorityTier =
+  | "government-gre"
+  | "large-established"
+  | "established"
+  | "other";
+
 export interface Job {
   id: string;
   title: string;
@@ -8,6 +14,16 @@ export interface Job {
   applyLink: string | null;
   source: string | null;
   postedAt: string | null;
+  // Optional provider firmographics. They intentionally remain optional so
+  // previously saved listing snapshots continue to load without a migration.
+  companySizeMin?: number | null;
+  companySizeMax?: number | null;
+  companyRevenueUsd?: number | null;
+  companyIndustries?: string[];
+  companyType?: string | null;
+  companyPubliclyTraded?: boolean | null;
+  directEmployer?: boolean | null;
+  employerTier?: EmployerPriorityTier;
 }
 
 export interface JobsResponse {
