@@ -50,6 +50,11 @@ interface FreeTailorState {
   importing: boolean;
   importError: string | null;
   copied: boolean;
+  // True right after a failed import replaces `prompt` with an
+  // auto-generated corrected version — drives the modal auto-scrolling
+  // back to step 1 and flagging it clearly, so the client can self-serve
+  // the fix instead of having to ask what changed.
+  hasCorrection: boolean;
 }
 
 interface SavedTailoredAnalysis {
@@ -682,6 +687,7 @@ export default function Home() {
       importing: false,
       importError: null,
       copied: false,
+      hasCorrection: false,
     });
     try {
       const hydratedJob = await ensureLinkedInDescription(item.job);
@@ -785,11 +791,11 @@ export default function Home() {
         patchFreeTailor({
           importing: false,
           importError: correctionPrompt
-            ? `${data?.error || "That response failed the evidence checks."} A correction prompt is ready above — reopen Claude Desktop, then paste its corrected reply.`
+            ? data?.error || "That response needs one fix."
             : data?.error || "Could not import that response.",
           ...(correctionPrompt
-            ? { prompt: correctionPrompt, promptError: null, pasteText: "", copied: false }
-            : {}),
+            ? { prompt: correctionPrompt, promptError: null, pasteText: "", copied: false, hasCorrection: true }
+            : { hasCorrection: false }),
         });
         return;
       }
@@ -1860,13 +1866,24 @@ function FreeTailorModal({
     importing,
     importError,
     copied,
+    hasCorrection,
   } = state;
   const { job } = item;
   const canSubmit = pasteText.trim().length > 0 && !importing;
 
+  // A failed import silently swaps in a corrected prompt up at step 1 while
+  // the client's attention (and scroll position) is down at step 2 where
+  // they just clicked Import — jump back to it so the fix is impossible to
+  // miss instead of something they'd have to notice and scroll up for.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (hasCorrection) scrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [prompt, hasCorrection]);
+
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
       <div
+        ref={scrollRef}
         className="scroll-thin max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-line bg-surface p-5"
         onClick={(e) => e.stopPropagation()}
       >
@@ -1887,7 +1904,7 @@ function FreeTailorModal({
         {/* Step 1: hand the generated prompt to Claude */}
         <div className="mt-5">
           <div className="mb-2 font-mono text-[11px] uppercase tracking-[0.15em] text-soft">
-            1. Send this prompt to Claude
+            1. {hasCorrection ? "Send this UPDATED prompt to Claude" : "Send this prompt to Claude"}
           </div>
 
           {promptLoading && (
@@ -1921,10 +1938,12 @@ function FreeTailorModal({
               <div className="mt-2 flex flex-wrap gap-2">
                 <button
                   onClick={onCopyPrompt}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
+                  className={`inline-flex items-center gap-1.5 rounded-lg border border-line px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright ${
+                    hasCorrection ? "animate-flashHighlight" : ""
+                  }`}
                 >
                   <DownloadIcon />
-                  {copied ? "Copied ✓" : "Copy prompt"}
+                  {copied ? "Copied ✓" : hasCorrection ? "Copy updated prompt" : "Copy prompt"}
                 </button>
                 <button
                   onClick={onOpenClaudeDesktop}
@@ -1971,7 +1990,18 @@ function FreeTailorModal({
             placeholder="Paste everything Claude replied with, including the opening { and closing } — nothing else needed."
             className="scroll-thin w-full resize-none rounded-lg border border-line bg-ink px-3 py-2.5 text-sm leading-relaxed text-bright outline-none placeholder:text-soft/40 focus:border-beacon/60 disabled:opacity-60"
           />
-          {importError && <p className="mt-2 text-sm text-weak">{importError}</p>}
+          {importError && hasCorrection && (
+            <button
+              type="button"
+              onClick={onCopyPrompt}
+              className="mt-2 w-full rounded-lg border border-beacon/40 bg-beacon/10 px-3.5 py-3 text-left text-sm text-beacon transition hover:bg-beacon/20"
+            >
+              {copied
+                ? "Copied ✓ — now open Claude, send it again, then paste the new reply in the box above."
+                : "Needs one fix — click to copy the updated prompt above, send it to Claude again, then paste the new reply in the box above."}
+            </button>
+          )}
+          {importError && !hasCorrection && <p className="mt-2 text-sm text-weak">{importError}</p>}
           <button
             onClick={onSubmitPaste}
             disabled={!canSubmit}

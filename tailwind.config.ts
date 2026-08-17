@@ -35,11 +35,20 @@ const config: Config = {
           "0%": { opacity: "0", transform: "translateY(6px)" },
           "100%": { opacity: "1", transform: "translateY(0)" },
         },
+        flashHighlight: {
+          "0%": { boxShadow: "0 0 0 0 rgba(242,177,60,0.7)" },
+          "70%": { boxShadow: "0 0 0 10px rgba(242,177,60,0)" },
+          "100%": { boxShadow: "0 0 0 0 rgba(242,177,60,0)" },
+        },
       },
       animation: {
         pulseDot: "pulseDot 1.6s ease-in-out infinite",
         sweep: "sweep 1.4s ease-in-out infinite",
         fadeIn: "fadeIn 0.15s ease",
+        // Plays twice then stops — a brief "look here" ping, not a
+        // permanent loop, for drawing the eye to something that just
+        // changed (e.g. a prompt the client needs to re-copy).
+        flashHighlight: "flashHighlight 1s ease-out 2",
       },
     },
   },
