@@ -1020,6 +1020,9 @@ async function loadPersistentOrLiveHirebase(forceRefresh: boolean): Promise<Hire
       stale: false,
     };
   } catch (error) {
+    // The client only ever sees a generic "temporarily unavailable" note, so
+    // this is the only trace of what actually failed upstream.
+    console.error("[hirebase] live refresh failed:", error);
     if (generation === hirebaseCacheGeneration && restored) {
       const staleResult: HirebaseStoredResult = {
         ...restored,
