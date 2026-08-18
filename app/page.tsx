@@ -47,6 +47,11 @@ interface FreeTailorState {
   promptError: string | null;
   clipboardError: string | null;
   pasteText: string;
+  // Bumped whenever `pasteText` is set from outside normal typing (clipboard
+  // paste, a correction reset) — used as part of FreeTailorModal's `key` so
+  // it remounts and re-seeds its local textarea state instead of the parent
+  // needing to control every keystroke (see submitFreeTailorPaste).
+  pasteResetToken: number;
   importing: boolean;
   importError: string | null;
   copied: boolean;
@@ -701,6 +706,7 @@ export default function Home() {
       promptError: null,
       clipboardError: null,
       pasteText: "",
+      pasteResetToken: 0,
       importing: false,
       importError: null,
       copied: false,
@@ -771,7 +777,11 @@ export default function Home() {
       if (!text.trim()) {
         throw new Error("empty");
       }
-      patchFreeTailor({ pasteText: text, importError: null });
+      patchFreeTailor({
+        pasteText: text,
+        importError: null,
+        pasteResetToken: freeTailor.pasteResetToken + 1,
+      });
     } catch {
       patchFreeTailor({
         importError: "Couldn't read the clipboard — paste Claude's full reply manually.",
@@ -783,9 +793,9 @@ export default function Home() {
   // exact same downstream path as a real API tailoring result (same cache,
   // same Apply modal, same CV template) — the free flow is indistinguishable
   // from the paid one from this point on.
-  async function submitFreeTailorPaste() {
-    if (!freeTailor || !freeTailor.pasteText.trim() || freeTailor.importing) return;
-    const { item, pasteText } = freeTailor;
+  async function submitFreeTailorPaste(pasteText: string) {
+    if (!freeTailor || !pasteText.trim() || freeTailor.importing) return;
+    const { item } = freeTailor;
     patchFreeTailor({ importing: true, importError: null });
     try {
       const analysisProfile = { ...profile, photo: "" };
@@ -811,7 +821,14 @@ export default function Home() {
             ? data?.error || "That response needs one fix."
             : data?.error || "Could not import that response.",
           ...(correctionPrompt
-            ? { prompt: correctionPrompt, promptError: null, pasteText: "", copied: false, hasCorrection: true }
+            ? {
+                prompt: correctionPrompt,
+                promptError: null,
+                pasteText: "",
+                pasteResetToken: freeTailor.pasteResetToken + 1,
+                copied: false,
+                hasCorrection: true,
+              }
             : { hasCorrection: false }),
         });
         return;
@@ -1293,11 +1310,11 @@ export default function Home() {
           hand it to Claude Desktop, then paste the reply back in to finish. */}
       {freeTailor && (
         <FreeTailorModal
+          key={`${freeTailor.item.job.id}-${freeTailor.pasteResetToken}`}
           state={freeTailor}
           onCopyPrompt={copyFreeTailorPrompt}
           onOpenClaudeDesktop={openClaudeDesktop}
           onRetryPrompt={retryFreeTailorPrompt}
-          onPasteTextChange={(text) => patchFreeTailor({ pasteText: text, importError: null })}
           onPasteFromClipboard={pasteFreeTailorReplyFromClipboard}
           onSubmitPaste={submitFreeTailorPaste}
           onClose={closeFreeTailorModal}
@@ -1888,7 +1905,6 @@ function FreeTailorModal({
   onCopyPrompt,
   onOpenClaudeDesktop,
   onRetryPrompt,
-  onPasteTextChange,
   onPasteFromClipboard,
   onSubmitPaste,
   onClose,
@@ -1897,9 +1913,8 @@ function FreeTailorModal({
   onCopyPrompt: () => void;
   onOpenClaudeDesktop: () => void;
   onRetryPrompt: () => void;
-  onPasteTextChange: (text: string) => void;
   onPasteFromClipboard: () => void;
-  onSubmitPaste: () => void;
+  onSubmitPaste: (text: string) => void;
   onClose: () => void;
 }) {
   const {
@@ -1915,7 +1930,13 @@ function FreeTailorModal({
     hasCorrection,
   } = state;
   const { job } = item;
-  const canSubmit = pasteText.trim().length > 0 && !importing;
+  // Local, not lifted to the parent on every keystroke — Home re-renders the
+  // full job list and the selected job's A4 CV preview on any state change,
+  // which made typing here noticeably janky (measured ~120ms+ per keydown).
+  // The parent still owns `pasteText` as the seed value for resets (opening
+  // fresh, a clipboard paste, a correction) — see `key` at the call site.
+  const [localPasteText, setLocalPasteText] = useState(pasteText);
+  const canSubmit = localPasteText.trim().length > 0 && !importing;
 
   // A failed import silently swaps in a corrected prompt up at step 1 while
   // the client's attention (and scroll position) is down at step 2 where
@@ -2029,8 +2050,8 @@ function FreeTailorModal({
             Paste reply from clipboard
           </button>
           <textarea
-            value={pasteText}
-            onChange={(e) => onPasteTextChange(e.target.value)}
+            value={localPasteText}
+            onChange={(e) => setLocalPasteText(e.target.value)}
             disabled={importing}
             rows={6}
             placeholder="Paste everything Claude replied with, including the opening { and closing } — nothing else needed."
@@ -2049,7 +2070,7 @@ function FreeTailorModal({
           )}
           {importError && !hasCorrection && <p className="mt-2 text-sm text-weak">{importError}</p>}
           <button
-            onClick={onSubmitPaste}
+            onClick={() => onSubmitPaste(localPasteText)}
             disabled={!canSubmit}
             aria-busy={importing}
             className="mt-3 inline-flex items-center gap-2 rounded-lg bg-beacon px-5 py-2.5 text-sm font-medium text-ink transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-50"
