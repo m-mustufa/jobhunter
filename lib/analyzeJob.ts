@@ -1472,6 +1472,79 @@ function hasUnmistakableV3Shape(raw: any, profile: Profile): boolean {
   });
 }
 
+// Names the specific cv-tailoring-v3.1 fields a response got wrong, so a
+// corrective pass (paid retry or a re-pasted claude.ai reply) is told exactly
+// what to fix instead of just "redo it" — most often seen when the schema
+// changes and Claude falls back to an earlier version's field names.
+function describeSchemaShapeIssues(raw: any, profile: Profile): string[] {
+  const issues: string[] = [];
+  // score and tailoredSummary get checked here unconditionally (not just when
+  // experienceRewriteVersion is wrong) because a missing one doesn't fail
+  // loudly downstream — toAnalysis silently falls back to score 0 or the
+  // untailored profile summary, so a bad response can otherwise look like a
+  // normal completed analysis.
+  if (typeof raw?.tailoredSummary !== "string" || !raw.tailoredSummary.trim()) {
+    issues.push(
+      'Add "tailoredSummary": a complete rewritten profile string (1050-1100 characters) — it is missing from this response.'
+    );
+  }
+  if (!Number.isFinite(Number(raw?.score))) {
+    issues.push(
+      'Add "score": an integer 0-100 fit score — it is missing from this response.'
+    );
+  }
+  if (
+    raw?.roleResearch !== undefined &&
+    (typeof raw.roleResearch !== "object" ||
+      raw.roleResearch === null ||
+      Array.isArray(raw.roleResearch))
+  ) {
+    issues.push(
+      '"roleResearch" must be an object ({normalizedRole, marketContext, expectations, sources}), not a string or array.'
+    );
+  }
+  if (Array.isArray(raw?.reasons) && raw.reasons.length !== 3) {
+    issues.push(
+      `"reasons" must contain exactly 3 items — this response has ${raw.reasons.length}.`
+    );
+  }
+  if (raw && typeof raw === "object" && "gaps" in raw) {
+    issues.push(
+      'Remove the old "gaps" field; unsupported terms belong only in "reasons", "roleResearch", or "verdict" in this schema.'
+    );
+  }
+  if (
+    Array.isArray(raw?.rankedRequirements) &&
+    raw.rankedRequirements.some(
+      (item: any) => item && typeof item === "object" && "evidenceMatch" in item
+    )
+  ) {
+    issues.push(
+      '"rankedRequirements" items must use id/priority/importance/source/evidence fields, not the old requirement/evidenceMatch format.'
+    );
+  }
+  const rewrites = Array.isArray(raw?.experienceRewrites) ? raw.experienceRewrites : [];
+  if (rewrites.length !== profile.experience.length) {
+    issues.push(
+      `"experienceRewrites" must include exactly one entry per employer — expected ${profile.experience.length}, got ${rewrites.length}.`
+    );
+  }
+  if (
+    rewrites.some(
+      (rewrite: any) =>
+        Array.isArray(rewrite?.tailoredHighlights) &&
+        rewrite.tailoredHighlights.some(
+          (highlight: any) => highlight && typeof highlight === "object" && "bulletIndex" in highlight
+        )
+    )
+  ) {
+    issues.push(
+      'Each tailoredHighlights item needs "sourceBulletIndices" (array) and "requirementIds" (array), not a single "bulletIndex".'
+    );
+  }
+  return issues;
+}
+
 function prepareValidationPayload(
   parsed: any,
   profile: Profile,
@@ -1480,10 +1553,20 @@ function prepareValidationPayload(
   const prepared = hasUnmistakableV3Shape(parsed, profile)
     ? { ...parsed, experienceRewriteVersion: EXPERIENCE_REWRITE_VERSION }
     : { ...parsed };
+  // score/tailoredSummary and the other structural checks run regardless of
+  // the version tag, then the version tag itself is checked separately —
+  // otherwise an explicit (but wrong) experienceRewriteVersion could mask a
+  // genuinely broken response that has no other detectable issue.
+  const shapeIssues = describeSchemaShapeIssues(prepared, profile);
   if (Number(prepared.experienceRewriteVersion) !== EXPERIENCE_REWRITE_VERSION) {
-    throw new TailoringQualityError([
-      "Use experienceRewriteVersion 3 and return the complete evidence-linked tailoring schema.",
-    ]);
+    shapeIssues.push(
+      shapeIssues.length
+        ? 'Add "experienceRewriteVersion": 3 to the response.'
+        : "Use experienceRewriteVersion 3 and return the complete evidence-linked tailoring schema."
+    );
+  }
+  if (shapeIssues.length) {
+    throw new TailoringQualityError(shapeIssues);
   }
   const evidence = completeProfileEvidence(profile);
   const rawSummary = normalizeSummaryText(prepared.tailoredSummary);
@@ -1565,12 +1648,11 @@ export function parseModelResponse(text: string) {
       : withoutFence;
   const parsed = JSON.parse(json);
 
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    !Number.isFinite(Number(parsed.score)) ||
-    typeof parsed.tailoredSummary !== "string"
-  ) {
+  // Only "is this a JSON object" belongs here. Schema-shape problems (missing
+  // score, an old field format, a missing employer, ...) are diagnosed by
+  // describeSchemaShapeIssues below so they produce a TailoringQualityError
+  // with a correction prompt instead of a dead-end generic failure.
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Claude returned an incomplete analysis.");
   }
   return parsed;
