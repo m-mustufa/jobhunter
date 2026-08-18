@@ -243,6 +243,22 @@ function rankBatchItems(
   });
 }
 
+// Pure reverse-chronological order, bypassing the curated employer-tier/
+// recommendation ranking above. Undated listings (no parseable postedAt)
+// always sink to the bottom instead of sorting as if posted in 1970.
+function sortItemsByPostedDate(items: BatchItem[]): BatchItem[] {
+  const now = Date.now();
+  return [...items].sort((a, b) => {
+    const aTime = postedTimestamp(a.job.postedAt, now);
+    const bTime = postedTimestamp(b.job.postedAt, now);
+    if (aTime === 0 || bTime === 0) {
+      if (aTime === bTime) return 0;
+      return aTime === 0 ? 1 : -1;
+    }
+    return bTime - aTime;
+  });
+}
+
 function saveTailoredAnalysis(
   job: Job,
   profile: Profile,
@@ -331,6 +347,7 @@ export default function Home() {
   const [fieldFilter, setFieldFilter] = useState("all");
   const [recommendedOnly, setRecommendedOnly] = useState(false);
   const [linkedinOnly, setLinkedinOnly] = useState(false);
+  const [sortNewestFirst, setSortNewestFirst] = useState(false);
   const [keywordSearchOpen, setKeywordSearchOpen] = useState(false);
   const [page, setPage] = useState(1);
 
@@ -910,8 +927,10 @@ export default function Home() {
       const recommendedOk = !recommendedOnly || recommendation?.recommended === true;
       return titleOk && fieldOk && recommendedOk;
     });
-    return rankBatchItems(filtered, profile, recommendations);
-  }, [items, profile, titleFilter, fieldFilter, recommendedOnly, recommendations]);
+    return sortNewestFirst
+      ? sortItemsByPostedDate(filtered)
+      : rankBatchItems(filtered, profile, recommendations);
+  }, [items, profile, titleFilter, fieldFilter, recommendedOnly, recommendations, sortNewestFirst]);
 
   useEffect(() => {
     if (!recommendedOnly) return;
@@ -936,6 +955,11 @@ export default function Home() {
 
   function toggleRecommendedOnly() {
     setRecommendedOnly((current) => !current);
+    setPage(1);
+  }
+
+  function toggleSortNewestFirst() {
+    setSortNewestFirst((current) => !current);
     setPage(1);
   }
 
@@ -989,8 +1013,7 @@ export default function Home() {
         </h1>
         <p className="mt-3 max-w-l text-soft">
           One click searches VP-through-Team-Lead roles across Abu Dhabi, highlights
-          recommended opportunities, and tailors a real CV + cover letter for any role
-          you choose.
+          recommended opportunities & tailors a real CV + cover letter for any role.
         </p>
 
       </section>
@@ -1125,6 +1148,29 @@ export default function Home() {
               <span
                 className={`absolute left-0 top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
                   linkedinOnly ? "translate-x-[19px]" : "translate-x-[3px]"
+                }`}
+              />
+            </button>
+          </div>
+
+          <div className="flex h-11 min-w-[150px] shrink-0 items-center justify-between gap-3 rounded-lg border border-line bg-ink px-3">
+            <span className="text-sm font-medium leading-tight text-bright">
+              Sort: Newest
+            </span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={sortNewestFirst}
+              aria-label="Sort by newest first"
+              data-testid="sort-newest-toggle"
+              onClick={toggleSortNewestFirst}
+              className={`relative h-6 w-10 shrink-0 rounded-full border transition ${
+                sortNewestFirst ? "border-good bg-good" : "border-line bg-raised"
+              }`}
+            >
+              <span
+                className={`absolute left-0 top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                  sortNewestFirst ? "translate-x-[19px]" : "translate-x-[3px]"
                 }`}
               />
             </button>
