@@ -11,3 +11,6 @@
 
 .claude
 tmp-*.log
+
+# Fiverr portfolio assets (not part of the deployed app)
+fiverr/

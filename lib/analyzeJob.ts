@@ -19,9 +19,13 @@ const TRANSIENT_PROVIDER_STATUSES = new Set([429, 500, 502, 503, 529]);
 const SUMMARY_MIN_CHARS = 1050;
 const SUMMARY_MAX_CHARS = 1100;
 const EXPERIENCE_REWRITE_VERSION = 3;
-const PROMPT_SCHEMA_REVISION = "cv-tailoring-v3.1";
+const PROMPT_SCHEMA_REVISION = "cv-tailoring-v3.2";
 const MIN_FULL_JOB_DESCRIPTION_CHARS = 240;
-const MAX_MODEL_TOKENS = 6000;
+// Every original bullet is now rewritten (not just 2-3 per employer), so
+// output volume scales with total bullet count across all employers instead
+// of a small fixed highlight count — raised from 6000 to avoid truncation
+// (stop_reason "max_tokens") on CVs with several employers/bullets.
+const MAX_MODEL_TOKENS = 8000;
 const WEB_SEARCH_TOOL = {
   type: "web_search_20250305",
   name: "web_search",
@@ -80,13 +84,20 @@ class RetryableClaudeError extends Error {
 
 export const SYSTEM = `You are an expert CV strategist and evidence-grounded recruiter. Analyze one complete vacancy against one candidate's fixed CV.
 
-Your objective is to make the CV visibly and specifically relevant to this vacancy while remaining defensible in an interview. Rewrite the full profile and create concise tailored highlights from the candidate's real evidence. You may combine multiple bullets only when they belong to the SAME employer. Never transfer evidence between employers.
+Your objective is to make the CV visibly and specifically relevant to this vacancy while remaining defensible in an interview. Rewrite the full profile, and rewrite EVERY experience bullet — not just a subset — into a tailored highlight synthesized from the candidate's real evidence. You may combine multiple bullets only when they belong to the SAME employer. Never transfer evidence between employers.
 
 Never invent or upgrade an employer, date, metric, tool, qualification, certification, responsibility, seniority, team size, budget, client, industry, or outcome. Never imply ownership when the evidence only shows participation. Requirements without evidence belong in the fit reasons, not the CV. Employer/department labels, role labels, dates, education, and skill values are immutable; skills may only be reordered.
 
 Candidate-facing text means tailoredSummary, experienceRewrites[].tailoredHighlights[].text, and coverLetter. Candidate-facing text may use a vacancy acronym, standard, tool, industry term, or responsibility only when it is supported by the candidate's fixed evidence. The cover letter may name the exact target role and employer only as neutral application context, never as candidate experience. Unsupported vacancy/research terminology belongs only in rankedRequirements, roleResearch, verdict, reasons, or gaps. On a corrective pass, remove the whole unsupported claim; never hide it by spelling out an acronym or replacing it with a synonym. This applies even when disclosing a gap: never write a sentence like "does not have experience with X" or "lacks X" in candidate-facing text if X is an unsupported tool, standard, or qualification — omit it by name entirely and put it in reasons/gaps instead. Naming an unsupported term to deny it still counts as adding it.
 
-Treat the vacancy description as the primary source. General role research is secondary context only and must never become candidate evidence. Return ONLY one valid JSON object, with no markdown fence or commentary.`;
+Treat the vacancy description as the primary source. General role research is secondary context only and must never become candidate evidence.
+
+Targeting standard:
+- Build the ranked requirements before writing any candidate-facing text. Aim for at least 70% visible relevance across the supported mandatory and preferred requirements by putting the strongest supported requirements first in the profile and experience highlights.
+- Start each employer's tailored highlights with its highest-priority supported evidence. Use the remaining highlights to reframe every other bullet toward the vacancy only where the original facts genuinely support that connection.
+- If the candidate's evidence supports less than 70% of the mandatory/preferred requirements, keep the score and wording honest and explain the gap in reasons. Never add a tool, responsibility, product-management claim, metric, qualification, or outcome merely to reach 70%.
+
+Return ONLY one valid JSON object, with no markdown fence or commentary.`;
 
 interface BuildPromptOptions {
   cachedRoleResearch?: RoleResearchBrief | null;
@@ -190,7 +201,7 @@ Return this exact schema:
           "requirementIds": ["R1"]
         }
       ],
-      "remainingBulletOrder": [1, 3]
+      "remainingBulletOrder": []
     }
   ],
   "coverLetter": "<specific 100-140 word body, 2-3 paragraphs, no greeting/sign-off>",
@@ -205,13 +216,14 @@ Rules for rankedRequirements:
 
 Rules for every employer:
 - Return exactly one experienceRewrites entry per employer, in input order, copying company exactly. Never rewrite role/date/company.
-- If this employer has enough evidence for the vacancy, set supported=true and create 2 strong tailoredHighlights FIRST. Add a third only when it supports a distinct atomic requirement and is substantially rewritten rather than restating the source. Each highlight may synthesize one or more source bullets, but all indices must belong to this SAME employer.
-- EVERY highlight, not just the third, must be a substantial rewrite of its source bullet(s) — restructure sentence order and phrasing, lead with a different word, combine or split clauses differently. Swapping punctuation (dashes to commas), reordering only two words, or changing a single word while keeping the same sentence structure is NOT a rewrite and will be rejected. If you cannot substantially restructure a bullet while keeping every fact exact, select different source bullets instead.
-- Select the strongest, most relevant evidence. Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
+- If this employer has at least one usable bullet, set supported=true and rewrite EVERY original bullet for this employer into a tailoredHighlights entry — none may be left unrewritten. You may combine two or more of this employer's bullets into one highlight when they share a theme, but every original bullet index for this employer must appear in exactly one highlight's sourceBulletIndices, across all of that employer's highlights combined.
+- remainingBulletOrder must be an empty array for a supported employer. There is no "leftover, unchanged" bullet list anymore — every bullet becomes part of a tailored highlight.
+- EVERY highlight must be a substantial rewrite of its source bullet(s) — restructure sentence order and phrasing, lead with a different word, combine or split clauses differently. Swapping punctuation (dashes to commas), reordering only two words, or changing a single word while keeping the same sentence structure is NOT a rewrite and will be rejected. If you cannot substantially restructure a bullet while keeping every fact exact, keep every fact but change its construction — never pass through the original wording unrewritten.
+- Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
 - Preserve the evidence's participation level for each activity: participated, supported, contributed, or collaborated must never become executed, conducted, led, managed, directed, or owned.
-- Every selected source bullet is replaced by its highlight and therefore MUST NOT appear in remainingBulletOrder. remainingBulletOrder must contain every unselected original index exactly once, ranked by vacancy relevance. This prevents duplication and CV growth.
-- If fewer than two defensible highlights exist, set supported=false, return no highlights, and put every original bullet index once in remainingBulletOrder, still ranked by relevance.
-- Give each highlight only 1-2 requirementIds. Each id must identify an atomic ranked requirement directly supported by that highlight's selected source bullets. Do not tag a requirement merely because it is generally related or transferable.
+- Only set supported=false when this employer has zero usable bullets; in that case return no highlights and put every original bullet index once in remainingBulletOrder, ranked by relevance.
+- Order tailoredHighlights by descending priority of their valid requirementIds; highlights without a direct requirement link come after directly supported highlights. This makes the strongest job-relevant evidence appear first in the rendered CV.
+- Give each highlight 1-2 requirementIds only when the selected evidence directly supports those atomic job requirements. When a bullet is genuinely grounded in the candidate's evidence but no ranked requirement directly fits, return an empty requirementIds array rather than forcing a weak or misleading tag. Never invent evidence to force a stronger link than the source bullet(s) actually provide.
 
 The final CV must look specifically written for this vacancy, but every claim must remain traceable to the fixed candidate evidence. Count tailoredSummary characters before returning. Return JSON only.`;
 }
@@ -704,9 +716,12 @@ function applyExperienceHighlightsV3(
     const rawHighlights = Array.isArray(rawRewrite?.tailoredHighlights)
       ? rawRewrite.tailoredHighlights
       : [];
-    if ((supported && (rawHighlights.length < 2 || rawHighlights.length > 3)) || (!supported && rawHighlights.length)) {
+    if (!supported && rawHighlights.length) {
+      qualityIssues.push(`${expectedCompany}: unsupported employers must return no tailored highlights.`);
+    }
+    if (supported && rawHighlights.length === 0 && entry.bullets.length > 0) {
       qualityIssues.push(
-        `${expectedCompany}: supported employers need 2-3 highlights; unsupported employers need none.`
+        `${expectedCompany}: a supported employer must return a tailored highlight covering every bullet.`
       );
     }
 
@@ -724,8 +739,8 @@ function applyExperienceHighlightsV3(
         ? rawHighlight.requirementIds.map((id: unknown) => normalizeSummaryText(id).toUpperCase())
         : [];
       const label = `${expectedCompany} highlight ${highlightIndex + 1}`;
-      if (!text || sourceBulletIndices.length === 0 || requirementIds.length === 0) {
-        qualityIssues.push(`${label} needs text, source bullets, and requirement ids.`);
+      if (!text || sourceBulletIndices.length === 0 || !Array.isArray(rawHighlight?.requirementIds)) {
+        qualityIssues.push(`${label} needs text, source bullets, and a requirementIds array (which may be empty when no direct JD requirement fits).`);
         continue;
       }
       if (
@@ -762,7 +777,6 @@ function applyExperienceHighlightsV3(
         qualityIssues.push(`${label} references an unknown ranked requirement.`);
       }
       const validatedRequirementIds: string[] = [];
-      const failedRequirements: string[] = [];
       for (const requirementId of requirementIds) {
         const requirement = requirementById.get(requirementId);
         if (!requirement) continue;
@@ -778,15 +792,12 @@ function applyExperienceHighlightsV3(
           requirementLinkIsSupported(requirement.requirement, text, sourceText, entry.role)
         ) {
           validatedRequirementIds.push(requirementId);
-        } else {
-          failedRequirements.push(`${requirementId} ("${requirement.requirement}")`);
         }
       }
-      if (validatedRequirementIds.length === 0) {
-        qualityIssues.push(
-          `${label} ("${text}") must visibly connect its selected evidence to at least one atomic job requirement — it is tagged to ${failedRequirements.join(", ") || "no valid requirement"} but shares no concrete wording with ${failedRequirements.length === 1 ? "it" : "any of them"}. Rewrite the highlight to explicitly reflect that requirement's language, or retag it to a requirement it actually supports.`
-        );
-      }
+      // A source-grounded bullet can legitimately be relevant background
+      // without directly satisfying one of the vacancy's ranked
+      // requirements. Drop unsupported metadata links instead of rejecting
+      // the whole CV; top supported requirements are still enforced below.
       qualityIssues.push(...evidenceGuardIssues(text, sourceText, entry.role, label));
       sourceBulletIndices.forEach((index: number) => usedSourceIndexes.add(index));
       highlights.push({
@@ -796,31 +807,58 @@ function applyExperienceHighlightsV3(
       });
     }
 
-    if (supported && highlights.length < 2) {
-      qualityIssues.push(
-        `${expectedCompany}: at least two highlights must be substantially rewritten and job-relevant.`
-      );
-    }
+    // Keep the most directly supported, highest-priority evidence at the top
+    // of each employer's rendered experience section. Empty requirementIds
+    // remain valid for grounded context bullets, but they follow linked ones.
+    highlights.sort((left, right) => {
+      const firstPriority = (highlight: TailoredHighlight) =>
+        highlight.requirementIds.reduce(
+          (best, id) => Math.min(best, requirementById.get(id)?.priority ?? Number.MAX_SAFE_INTEGER),
+          Number.MAX_SAFE_INTEGER
+        );
+      return firstPriority(left) - firstPriority(right);
+    });
 
-    const remainingBulletOrder = [
-      ...restoredSourceIndexes,
-      ...(Array.isArray(rawRewrite?.remainingBulletOrder)
-        ? rawRewrite.remainingBulletOrder.map(Number)
-        : []),
-    ];
+    const rawRemainingBulletOrder = Array.isArray(rawRewrite?.remainingBulletOrder)
+      ? rawRewrite.remainingBulletOrder.map(Number)
+      : [];
     const expectedRemaining = entry.bullets
       .map((_, bulletIndex) => bulletIndex)
       .filter((bulletIndex) => !usedSourceIndexes.has(bulletIndex));
-    if (
-      remainingBulletOrder.length !== expectedRemaining.length ||
-      new Set(remainingBulletOrder).size !== remainingBulletOrder.length ||
-      remainingBulletOrder.some(
-        (bulletIndex: number) => !expectedRemaining.includes(bulletIndex)
-      )
-    ) {
-      qualityIssues.push(
-        `${expectedCompany}: remainingBulletOrder must contain every unselected original exactly once.`
-      );
+
+    let remainingBulletOrder: number[];
+    if (supported) {
+      // Every bullet must land in a tailored highlight now — a supported
+      // employer has no "leftover, unchanged" list. A bullet only ends up
+      // here when its highlight was just rejected as near-verbatim above;
+      // that rejection is already reported, so this isn't a second issue,
+      // just how the (discarded) intermediate result stays well-formed.
+      if (rawRemainingBulletOrder.length) {
+        qualityIssues.push(
+          `${expectedCompany}: remainingBulletOrder must be empty — every bullet must be rewritten into a tailored highlight instead.`
+        );
+      }
+      const restoredSet = new Set(restoredSourceIndexes);
+      const trulyMissing = expectedRemaining.filter((index) => !restoredSet.has(index));
+      if (trulyMissing.length) {
+        qualityIssues.push(
+          `${expectedCompany}: bullet index ${trulyMissing.join(", ")} was left out of every tailored highlight — every original bullet must be rewritten.`
+        );
+      }
+      remainingBulletOrder = restoredSourceIndexes;
+    } else {
+      remainingBulletOrder = [...restoredSourceIndexes, ...rawRemainingBulletOrder];
+      if (
+        remainingBulletOrder.length !== expectedRemaining.length ||
+        new Set(remainingBulletOrder).size !== remainingBulletOrder.length ||
+        remainingBulletOrder.some(
+          (bulletIndex: number) => !expectedRemaining.includes(bulletIndex)
+        )
+      ) {
+        qualityIssues.push(
+          `${expectedCompany}: remainingBulletOrder must contain every unselected original exactly once.`
+        );
+      }
     }
     rewritesByIndex.set(experienceIndex, {
       experienceIndex,
@@ -1305,8 +1343,15 @@ function validateTailoringQuality(
         .filter((reference) => reference.experienceIndex === experienceIndex)
         .forEach((reference) => reference.bulletIndices.forEach((index) => evidenceIndexes.add(index)));
     });
-    if (evidenceIndexes.size >= 2 && (rewrite?.supported !== true || highlights.length < 2)) {
-      issues.push(`${employer.company} has enough declared evidence but lacks 2-3 tailored highlights.`);
+    if (evidenceIndexes.size >= 2 && rewrite?.supported !== true) {
+      issues.push(`${employer.company} has enough declared evidence but was not marked supported with tailored highlights.`);
+    }
+    if (
+      rewrite?.supported === true &&
+      Array.isArray(rewrite?.remainingBulletOrder) &&
+      rewrite.remainingBulletOrder.length > 0
+    ) {
+      issues.push(`${employer.company} is supported but still leaves bullets in remainingBulletOrder — every bullet must be rewritten.`);
     }
     highlights.forEach((highlight: any) => {
       const sourceIndices = Array.isArray(highlight?.sourceBulletIndices)
@@ -1466,8 +1511,7 @@ function hasUnmistakableV3Shape(raw: any, profile: Profile): boolean {
         Boolean(normalizeSummaryText(highlight.text)) &&
         Array.isArray(highlight.sourceBulletIndices) &&
         highlight.sourceBulletIndices.length > 0 &&
-        Array.isArray(highlight.requirementIds) &&
-        highlight.requirementIds.length > 0
+        Array.isArray(highlight.requirementIds)
     );
   });
 }
@@ -1540,6 +1584,22 @@ function describeSchemaShapeIssues(raw: any, profile: Profile): string[] {
   ) {
     issues.push(
       'Each tailoredHighlights item needs "sourceBulletIndices" (array) and "requirementIds" (array), not a single "bulletIndex".'
+    );
+  }
+  if (
+    rewrites.some(
+      (rewrite: any) =>
+        Array.isArray(rewrite?.tailoredHighlights) &&
+        rewrite.tailoredHighlights.some(
+          (highlight: any) =>
+            highlight &&
+            typeof highlight === "object" &&
+            !Array.isArray(highlight.requirementIds)
+        )
+    )
+  ) {
+    issues.push(
+      'Each tailoredHighlights item needs a "requirementIds" array; use [] when no direct ranked job requirement fits.'
     );
   }
   return issues;

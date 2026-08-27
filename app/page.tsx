@@ -1951,7 +1951,7 @@ function FreeTailorModal({
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
       <div
         ref={scrollRef}
-        className="scroll-thin max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-line bg-surface p-5"
+        className="scroll-thin max-h-[95vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-line bg-surface p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3">
@@ -2003,6 +2003,16 @@ function FreeTailorModal({
                 onFocus={(e) => e.currentTarget.select()}
               />
               <div className="mt-2 flex flex-wrap gap-2">
+                {job.applyLink && (
+                  <a
+                    href={job.applyLink}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright"
+                  >
+                    View job posting ↗
+                  </a>
+                )}
                 <button
                   onClick={onCopyPrompt}
                   className={`inline-flex items-center gap-1.5 rounded-lg border border-line px-3.5 py-2 text-sm text-soft transition hover:border-beacon/60 hover:text-bright ${
