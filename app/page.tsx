@@ -374,12 +374,20 @@ export default function Home() {
   const pageRootRef = useRef<HTMLElement | null>(null);
   const jobsRequestRef = useRef<AbortController | null>(null);
   const jobsRequestIdRef = useRef(0);
+  // The job the code selected on its own (not one the user clicked), so it can
+  // follow the list if the order changes before the user picks anything.
+  const autoSelectedRef = useRef<string | null>(null);
   const tailoringBusy = busy?.startsWith("tailor:") === true;
+  // What the page is loading while `searching` is true, for the lock overlay.
+  const [loadingKind, setLoadingKind] = useState<"load" | "refresh" | "linkedin">("load");
+  // The whole page is locked while a Claude call or a job load is running.
+  const uiLocked = tailoringBusy || searching;
 
-  // The Claude call is intentionally modal: prevent scrolling, pointer
-  // interaction, and keyboard focus from reaching the page until it ends.
+  // The Claude call and the job load are intentionally modal: prevent
+  // scrolling, pointer interaction, and keyboard focus from reaching the page
+  // until they end.
   useEffect(() => {
-    if (!tailoringBusy) return;
+    if (!uiLocked) return;
 
     const pageRoot = pageRootRef.current;
     const previousBodyOverflow = document.body.style.overflow;
@@ -396,7 +404,7 @@ export default function Home() {
       document.body.style.overflow = previousBodyOverflow;
       document.documentElement.style.overflow = previousHtmlOverflow;
     };
-  }, [tailoringBusy]);
+  }, [uiLocked]);
 
   // Hydrate persisted Master CV / Profile after mount (kept out of the
   // initial useState so server- and first-client-render markup match), then
@@ -423,7 +431,7 @@ export default function Home() {
         setSearched(true);
         const scored = toBatchItems(cache.jobs, prof);
         setItemsSynced(scored);
-        setSelectedId(scored[0]?.job.id ?? null);
+        autoSelect(scored[0]?.job.id ?? null);
         void revalidateJobs(prof, cache.fetchedAt ?? null, cache.keyword || "");
       } else if (loadJSON<number | null>(JOB_LISTINGS_CLEARED_KEY, null)) {
         setSearched(true);
@@ -456,6 +464,11 @@ export default function Home() {
   function setItemsSynced(next: BatchItem[]) {
     itemsRef.current = next;
     setItems(next);
+  }
+
+  function autoSelect(id: string | null) {
+    autoSelectedRef.current = id;
+    setSelectedId(id);
   }
 
   function patchItem(jobId: string, patch: Partial<BatchItem>) {
@@ -494,7 +507,14 @@ export default function Home() {
     const controller = new AbortController();
     const requestId = ++jobsRequestIdRef.current;
     jobsRequestRef.current = controller;
+    // The page is locked while this runs, so it must always end.
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 120_000);
 
+    setLoadingKind(linkedinMode ? "linkedin" : forceRefresh ? "refresh" : "load");
     setSearching(true);
     setSearched(true);
     setSelectedId(null);
@@ -543,7 +563,7 @@ export default function Home() {
       }
       note = data.note || (data.sample ? "Showing sample jobs." : null);
     } catch (error) {
-      if (controller.signal.aborted || requestId !== jobsRequestIdRef.current) return;
+      if (requestId !== jobsRequestIdRef.current || (controller.signal.aborted && !timedOut)) return;
       const cacheKey = linkedinMode ? LINKEDIN_JOBS_CACHE_KEY : JOBS_CACHE_KEY;
       const fallback = loadJSON<JobsCache | null>(cacheKey, null);
       if (fallback?.jobs?.length && fallback.keyword === keyword) {
@@ -553,9 +573,14 @@ export default function Home() {
           ? "LinkedIn sync could not be completed — showing your last saved results. Credit use for the failed attempt could not be confirmed."
           : "Could not refresh listings — showing your last saved results.";
       } else {
-        note = error instanceof Error ? error.message : "Could not reach the jobs service.";
+        note = timedOut
+          ? "Loading took too long. Try Refresh again."
+          : error instanceof Error
+            ? error.message
+            : "Could not reach the jobs service.";
       }
     } finally {
+      clearTimeout(timeout);
       if (requestId === jobsRequestIdRef.current) {
         jobsRequestRef.current = null;
         setSearching(false);
@@ -573,7 +598,7 @@ export default function Home() {
 
     const scored = toBatchItems(jobs, profileForCache);
     setItemsSynced(scored);
-    setSelectedId(scored[0]?.job.id ?? null);
+    autoSelect(scored[0]?.job.id ?? null);
 
     const cacheTimestamp = providerSyncedAt || Date.now();
     setFetchedAt(cacheTimestamp);
@@ -1058,6 +1083,18 @@ export default function Home() {
       : rankBatchItems(filtered, profile, recommendations);
   }, [items, profile, titleFilter, fieldFilter, recommendedOnly, recommendations, sortNewestFirst]);
 
+  // The first job is selected before the server's Recommended scores arrive,
+  // so the list can reorder under it. If the user has not picked a job
+  // themselves, follow the new top of the list.
+  useEffect(() => {
+    const top = filteredItems[0]?.job.id;
+    if (top && selectedId && selectedId === autoSelectedRef.current && top !== selectedId) {
+      autoSelectedRef.current = top;
+      setSelectedId(top);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverRecommendations]);
+
   useEffect(() => {
     if (!recommendedOnly) return;
     if (selectedId && filteredItems.some((item) => item.job.id === selectedId)) return;
@@ -1091,7 +1128,7 @@ export default function Home() {
 
   return (
     <>
-      {tailoringBusy && <TailoringOverlay />}
+      {tailoringBusy ? <TailoringOverlay /> : searching ? <LoadingOverlay kind={loadingKind} /> : null}
       <main ref={pageRootRef} className="mx-auto max-w-7xl px-5 pb-24">
       {/* Header */}
       <header className="flex items-center justify-between py-6">
@@ -1439,6 +1476,49 @@ export default function Home() {
 }
 
 /* ---------- components ---------- */
+
+// Shown while the job list loads or refreshes. The page behind it is inert, so
+// nothing can be clicked until the load ends. The panel itself only appears
+// after a short delay, so a fast load does not flash it.
+function LoadingOverlay({ kind }: { kind: "load" | "refresh" | "linkedin" }) {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setSeconds((value) => value + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const title =
+    kind === "refresh" ? "Refreshing listings…" : kind === "linkedin" ? "Syncing LinkedIn…" : "Loading jobs…";
+  const detail =
+    kind === "linkedin"
+      ? "Fetching LinkedIn listings. This can take a moment."
+      : "Checking employer career sites. This can take up to a minute.";
+  const showPanel = seconds >= 1;
+
+  return (
+    <div
+      className={`fixed inset-0 z-[100] flex cursor-wait items-center justify-center p-5 transition ${
+        showPanel ? "bg-ink/85 backdrop-blur-sm" : "bg-transparent"
+      }`}
+      role="status"
+      aria-live="polite"
+      aria-label={title}
+      data-testid="loading-lock"
+    >
+      {showPanel && (
+        <div className="flex min-w-[260px] flex-col items-center rounded-2xl border border-line bg-surface px-8 py-7 text-center shadow-2xl">
+          <span
+            className="h-10 w-10 animate-spin rounded-full border-4 border-beacon/20 border-t-beacon"
+            aria-hidden="true"
+          />
+          <p className="mt-4 font-display text-base font-semibold text-bright">{title}</p>
+          <p className="mt-1 text-xs text-soft">{detail}</p>
+          <p className="mt-3 font-mono text-[11px] text-soft/70">{seconds}s</p>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function TailoringOverlay() {
   return (
