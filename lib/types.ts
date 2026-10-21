@@ -24,6 +24,10 @@ export interface Job {
   companyPubliclyTraded?: boolean | null;
   directEmployer?: boolean | null;
   employerTier?: EmployerPriorityTier;
+  // Set on list responses where `description` is left empty (it is loaded when
+  // a job is opened). A short hash of the full text, so the app can still tell
+  // whether a posting changed.
+  descriptionHash?: string;
 }
 
 export interface JobsResponse {

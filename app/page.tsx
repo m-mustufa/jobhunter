@@ -108,7 +108,9 @@ function getJobAnalysisSignature(job: Job): string {
     title: job.title,
     company: job.company,
     location: job.location,
-    description: job.description,
+    // List responses leave `description` empty and carry a hash instead; this
+    // keeps the signature the same whether or not the text has been loaded.
+    description: job.descriptionHash ? `#${job.descriptionHash}` : job.description,
   });
 }
 
@@ -334,6 +336,12 @@ function needsLinkedInDescription(job: Job): boolean {
     /^linkedin-\d+$/.test(job.id) &&
     job.description.includes("full description will be loaded before tailoring")
   );
+}
+
+// Career-site listings arrive without their description (it is large); it is
+// fetched when the job is opened or tailored.
+function needsFreeDescription(job: Job): boolean {
+  return !job.description && job.id.startsWith("free-");
 }
 
 export default function Home() {
@@ -590,6 +598,22 @@ export default function Home() {
   }
 
   async function ensureLinkedInDescription(job: Job, signal?: AbortSignal): Promise<Job> {
+    if (needsFreeDescription(job)) {
+      const response = await fetch(`/api/jobs/description?id=${encodeURIComponent(job.id)}`, {
+        signal,
+      });
+      const data = (await response.json().catch(() => null)) as
+        | { description?: string; error?: string }
+        | null;
+      if (!response.ok || !data?.description) {
+        throw new Error(
+          data?.error || "The job description could not be loaded. Please try again shortly."
+        );
+      }
+      const hydratedJob = { ...job, description: data.description };
+      patchItem(job.id, { job: hydratedJob });
+      return hydratedJob;
+    }
     if (!needsLinkedInDescription(job)) return job;
     const jobId = job.id.replace(/^linkedin-/, "");
     const params = new URLSearchParams({ source: "linkedin", jobId });
@@ -926,11 +950,51 @@ export default function Home() {
     return FUNCTIONAL_DOMAINS.map((d) => d.domain).filter((d) => set.has(d)).concat(set.has(OTHER) ? [OTHER] : []);
   }, [items]);
 
+  // Listings come without descriptions, and the Recommended score reads them,
+  // so for those jobs the server scores them (same function) and sends back
+  // only the small result. A job whose text is already loaded is scored here.
+  const [serverRecommendations, setServerRecommendations] = useState<
+    Record<string, { score: number; recommended: boolean }>
+  >({});
+  const listKey = useMemo(() => items.map((item) => item.job.id).join("|"), [items]);
+  const hasLiteJobs = items.some((item) => needsFreeDescription(item.job));
+  const profileKey = useMemo(() => JSON.stringify({ ...profile, photo: "" }), [profile]);
+  useEffect(() => {
+    if (!hasLiteJobs) return;
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const response = await fetch("/api/jobs/recommendations", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ profile: JSON.parse(profileKey) }),
+          signal: controller.signal,
+        });
+        const data = await response.json().catch(() => null);
+        if (response.ok && data?.recommendations) setServerRecommendations(data.recommendations);
+      } catch {
+        // Offline or cancelled: the marker simply stays off until the next try.
+      }
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [hasLiteJobs, listKey, profileKey]);
+
   const recommendations = useMemo(() => {
     return new Map(
-      items.map((item) => [item.job.id, getJobRecommendation(profile, item.job)] as const)
+      items.map((item) => {
+        if (needsFreeDescription(item.job)) {
+          return [
+            item.job.id,
+            serverRecommendations[item.job.id] ?? { score: 0, recommended: false },
+          ] as const;
+        }
+        return [item.job.id, getJobRecommendation(profile, item.job)] as const;
+      })
     );
-  }, [items, profile]);
+  }, [items, profile, serverRecommendations]);
 
   const filteredItems = useMemo(() => {
     const filtered = items.filter((item) => {

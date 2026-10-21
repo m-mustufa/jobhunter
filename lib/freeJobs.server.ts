@@ -1,5 +1,7 @@
 import "server-only";
 
+import { createHash } from "node:crypto";
+
 import { Job } from "@/lib/types";
 import { compareJobsByEmployerPriority, getEmployerPriority } from "@/lib/employerPriority";
 import { loadJobListingSnapshot, saveJobListingSnapshot } from "@/lib/jobListingStore.server";
@@ -200,6 +202,37 @@ async function runLiveSync(previous: Job[]): Promise<FreeJobsResult> {
   };
 }
 
+function adoptSnapshot(snapshot: { jobs: Job[]; savedAt: number; metadata?: Record<string, number | null> }) {
+  memory = { jobs: snapshot.jobs, savedAt: snapshot.savedAt };
+  for (const [key, value] of Object.entries(snapshot.metadata || {})) {
+    if (key.startsWith(SYNCED_KEY) && typeof value === "number") {
+      sourceSyncedAt.set(key.slice(SYNCED_KEY.length), value);
+    }
+  }
+}
+
+/** The saved listings with full descriptions, without ever contacting a career site. */
+export async function getSavedFreeJobs(): Promise<Job[]> {
+  if (!memory) {
+    const snapshot = await loadJobListingSnapshot("free");
+    if (snapshot) adoptSnapshot(snapshot);
+  }
+  return memory?.jobs || [];
+}
+
+export function descriptionHash(text: string): string {
+  return createHash("sha1").update(text).digest("hex").slice(0, 16);
+}
+
+/**
+ * The card-sized version of a listing: everything except the (large)
+ * description, which is fetched when a job is opened. The hash stands in for
+ * the description wherever the app needs to know whether it changed.
+ */
+export function toLiteJob(job: Job): Job {
+  return { ...job, description: "", descriptionHash: job.descriptionHash || descriptionHash(job.description) };
+}
+
 async function load(forceRefresh: boolean): Promise<FreeJobsResult> {
   if (!FREE_JOB_SOURCES.length) {
     throw new Error("No free job sources are configured (lib/freeJobs/sources.ts)");
@@ -207,15 +240,7 @@ async function load(forceRefresh: boolean): Promise<FreeJobsResult> {
   const snapshot = memory
     ? { jobs: memory.jobs, savedAt: memory.savedAt }
     : await loadJobListingSnapshot("free");
-  if (snapshot && !memory) {
-    memory = { jobs: snapshot.jobs, savedAt: snapshot.savedAt };
-    const metadata = "metadata" in snapshot ? snapshot.metadata : {};
-    for (const [key, value] of Object.entries(metadata)) {
-      if (key.startsWith(SYNCED_KEY) && typeof value === "number") {
-        sourceSyncedAt.set(key.slice(SYNCED_KEY.length), value);
-      }
-    }
-  }
+  if (snapshot && !memory) adoptSnapshot(snapshot);
 
   const now = Date.now();
   const saved = (syncMode: FreeJobsResult["syncMode"], stale = false): FreeJobsResult => ({

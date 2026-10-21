@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { JobsResponse } from "@/lib/types";
 import { SAMPLE_JOBS } from "@/lib/sampleJobs";
 import { clearJobListingSnapshots } from "@/lib/jobListingStore.server";
-import { clearFreeJobsMemoryCache, fetchFreeJobs } from "@/lib/freeJobs.server";
+import { clearFreeJobsMemoryCache, fetchFreeJobs, toLiteJob } from "@/lib/freeJobs.server";
 // Legacy public LinkedIn guest-page crawler is intentionally disabled while
 // we compare the licensed TheirStack feed. Keep this line for easy rollback:
 // import { fetchLinkedInJobDescription, fetchLinkedInJobs } from "@/lib/linkedinJobs.server";
@@ -202,8 +202,11 @@ export async function GET(req: Request) {
     }
     if (keyword && jobs.length === 0) notes.push("No listings matched the current keyword.");
 
+    // The list is card-sized (no descriptions, ~15x smaller); a job's full
+    // text comes from /api/jobs/description when it is opened or tailored.
+    // `?full=1` returns everything for callers that want it in one go.
     const res: JobsResponse = {
-      jobs,
+      jobs: searchParams.get("full") === "1" ? jobs : jobs.map(toLiteJob),
       sample: false,
       note: notes.join(" "),
       ...(result.syncedAt ? { providerSyncedAt: result.syncedAt } : {}),
