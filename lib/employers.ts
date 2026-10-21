@@ -11,13 +11,13 @@ export interface EmployerProfile {
   subindustries: string[];
   sizeMin: number | null;
   sizeMax: number | null;
-  source: "hirebase" | "reference";
+  source: "reference";
 }
 
 export interface EmployersResponse {
   employers: EmployerProfile[];
   fetchedAt: number;
-  source: "hirebase" | "saved" | "reference";
+  source: "reference";
   fromCache: boolean;
   stale: boolean;
   note: string;

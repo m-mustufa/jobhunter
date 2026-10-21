@@ -1,11 +1,8 @@
 import { NextResponse } from "next/server";
 import { JobsResponse } from "@/lib/types";
 import { SAMPLE_JOBS } from "@/lib/sampleJobs";
-import {
-  clearHirebaseJobsMemoryCache,
-  fetchHirebaseJobs,
-} from "@/lib/hirebaseJobs.server";
 import { clearJobListingSnapshots } from "@/lib/jobListingStore.server";
+import { clearFreeJobsMemoryCache, fetchFreeJobs } from "@/lib/freeJobs.server";
 // Legacy public LinkedIn guest-page crawler is intentionally disabled while
 // we compare the licensed TheirStack feed. Keep this line for easy rollback:
 // import { fetchLinkedInJobDescription, fetchLinkedInJobs } from "@/lib/linkedinJobs.server";
@@ -62,8 +59,8 @@ export async function DELETE(req: Request) {
   // Invalidate process memory before deleting the durable snapshots so an
   // already-running refresh cannot repopulate the store after this reset.
   try {
+    clearFreeJobsMemoryCache();
     await Promise.all([
-      clearHirebaseJobsMemoryCache(),
       clearLinkedInJobsMemoryCache(),
     ]);
     await clearJobListingSnapshots();
@@ -93,7 +90,7 @@ export async function GET(req: Request) {
     );
   }
 
-  // LinkedIn mode is deliberately isolated from the existing Hirebase/sample
+  // LinkedIn mode is deliberately isolated from the career-site/sample
   // path. If LinkedIn is unavailable, never put mixed-source results under a
   // "LinkedIn only" toggle.
   if (source === "linkedin") {
@@ -167,10 +164,7 @@ export async function GET(req: Request) {
     }
   }
 
-  // DEMO_MODE is the only sample path. Without a provider key,
-  // fetchHirebaseJobs still gets the chance to restore a private snapshot;
-  // if no saved real data exists, return a configuration error instead of
-  // placing fabricated listings in the production feed.
+  // DEMO_MODE is the only sample path; real listings are never faked.
   if (process.env.DEMO_MODE === "true") {
     const res: JobsResponse = {
       jobs: sampleJobs(keyword),
@@ -180,76 +174,49 @@ export async function GET(req: Request) {
     return NextResponse.json(res);
   }
 
+  // Jobs come from the employer career sites (lib/freeJobs). No paid job API.
   try {
-    const result = await fetchHirebaseJobs(forceRefresh);
-    let jobs = result.jobs;
-    if (keyword) {
-      jobs = jobs.filter((job) =>
-        `${job.title} ${job.company} ${job.description}`.toLowerCase().includes(keyword)
-      );
-    }
-
-    if (
-      result.jobs.length === 0 &&
-      result.syncMode !== "cooldown" &&
-      result.syncMode !== "empty"
-    ) {
-      throw new Error("Hirebase returned no usable Abu Dhabi jobs");
-    }
+    const result = await fetchFreeJobs(forceRefresh);
+    const jobs = keyword
+      ? result.jobs.filter((job) =>
+          `${job.title} ${job.company} ${job.description}`.toLowerCase().includes(keyword)
+        )
+      : result.jobs;
 
     const notes: string[] = [];
-    if (result.stale) {
-      notes.push(
-        `Hirebase is temporarily unavailable — showing ${result.jobs.length} saved listings.`
-      );
+    if (result.syncMode === "stale") {
+      notes.push(`Free sources are unavailable — showing ${result.jobs.length} saved listings.`);
     } else if (result.syncMode === "cooldown") {
       notes.push(
-        `A Hirebase refresh was already attempted recently — 0 provider requests sent. Next refresh in ${formatSyncWait(result.nextSyncAt)}. ${result.jobs.length} saved listings are available.`
+        `Refreshed moments ago. Next refresh in ${formatSyncWait(result.nextSyncAt)}. ${result.jobs.length} saved listings are available.`
       );
-    } else if (result.syncMode === "empty") {
-      notes.push("No saved Hirebase listings. Click Refresh listings to run the first sync.");
-    } else if (result.fromCache || result.syncMode === "saved") {
-      notes.push(`Showing ${result.jobs.length} saved Abu Dhabi listings.`);
+    } else if (result.syncMode === "saved") {
+      notes.push(`Showing ${result.jobs.length} saved Abu Dhabi listings from employer career sites.`);
     } else {
       notes.push(
-        `Refresh checked ${result.fetchedJobsCount ?? 0} current Hirebase jobs and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} saved listings are available.`
+        `Checked ${result.successfulSearches} of ${result.attemptedSearches} employer career sites (${result.fetchedJobsCount ?? 0} postings read) and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} matching listings are available.`
       );
     }
-    if (result.failedSearches > 0) {
-      notes.push(
-        `${result.failedSearches} of ${result.attemptedSearches} Hirebase title groups could not be completed.`
-      );
+    if (result.failedSources.length) {
+      notes.push(`Could not reach: ${result.failedSources.join(", ")}. Their saved listings were kept.`);
     }
-    if (keyword && jobs.length === 0) {
-      notes.push("No Hirebase jobs matched the current keyword.");
-    }
+    if (keyword && jobs.length === 0) notes.push("No listings matched the current keyword.");
 
     const res: JobsResponse = {
       jobs,
       sample: false,
       note: notes.join(" "),
       ...(result.syncedAt ? { providerSyncedAt: result.syncedAt } : {}),
-      ...(result.nextSyncAt
-        ? { nextProviderSyncAt: result.nextSyncAt }
-        : {}),
+      ...(result.nextSyncAt ? { nextProviderSyncAt: result.nextSyncAt } : {}),
     };
     return NextResponse.json(res);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Hirebase could not be reached";
-    if (message === "HIREBASE_API_KEY is not configured") {
-      const res: JobsResponse = {
-        jobs: [],
-        sample: false,
-        error: message,
-        note: "No real listings are available. Add HIREBASE_API_KEY, then click Refresh listings.",
-      };
-      return NextResponse.json(res, { status: 503 });
-    }
+    const message = error instanceof Error ? error.message : "Free job sources could not be reached";
     const res: JobsResponse = {
       jobs: [],
       sample: false,
       error: message,
-      note: `Hirebase jobs could not be loaded (${message}). Your last saved live listings were not changed.`,
+      note: `Free job sources could not be loaded (${message}). Your last saved listings were not changed.`,
     };
     return NextResponse.json(res, { status: 502 });
   }

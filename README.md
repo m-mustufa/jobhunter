@@ -8,16 +8,19 @@ choose to apply to.
 
 ## What it does
 
-- Searches **Hirebase** across the complete target-role title list, filters
-  results to Abu Dhabi, removes duplicates, and keeps only the past 30 days.
-  Each refresh reserves capacity for large employers, SMEs/recruiters, and a
-  smaller unknown-size fallback instead of letting large-company duplicates
-  consume the entire response budget. Provider attempts have a restart-safe,
-  configurable 15-minute cooldown in production.
-  Successful results are accumulated in a private server snapshot as well as
-  the browser cache. A refresh upserts genuinely new jobs, updates matching
-  jobs in place, and keeps older saved jobs available through pagination; the
-  ranked UI order is reapplied after every refresh.
+- Reads the **career sites of ~40 Abu Dhabi employers** directly, using the
+  public job feeds their own careers pages use (Oracle Recruiting Cloud,
+  Workday, SmartRecruiters, Lever, Phenom, Workable, Eightfold, SuccessFactors).
+  No paid job API and no key are needed. Each refresh keeps only roles that
+  pass the rules in `lib/freeJobs/criteria.ts`: a real management title (VP,
+  Director, Head, Manager, Lead...), a location in Abu Dhabi, posted in the
+  past 30 days, and a full description. Government and sovereign employers
+  rank first. The list is saved server-side, refreshes itself when it is more
+  than 6 hours old, and a manual Refresh is allowed every 5 minutes. A site
+  that cannot be reached keeps its saved listings, and the stalest sites are
+  synced first, so pressing Refresh again completes any that were missed.
+  Employers are listed in `lib/freeJobs/sources.ts`; add one by finding its
+  platform from a job's apply URL and confirming it returns jobs.
 - The **LinkedIn only** toggle uses **TheirStack** to retrieve LinkedIn-source
   vacancies posted in Abu Dhabi during the past 30 days, including the full
   job description. Normal reads never contact TheirStack. Live LinkedIn syncs
@@ -66,33 +69,28 @@ npm run dev                  # http://localhost:3000
 | Variable | Needed? | What it's for |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Required for production tailoring | Per-job CV/cover-letter generation and CV-upload extraction. Get it at console.anthropic.com. |
-| `HIREBASE_API_KEY` | Required for live general listings | Powers the normal Abu Dhabi jobs listing and the Employers directory through Hirebase. |
 | `THEIRSTACK_API_KEY` | Required for LinkedIn mode | Powers LinkedIn-only listings through TheirStack. |
-| `BLOB_READ_WRITE_TOKEN` | Required for durable production data | Private durable storage for profiles, saved listings, and both providers' restart-safe request guards. Local Hirebase development may run memory-only; TheirStack still requires Blob. |
+| `BLOB_READ_WRITE_TOKEN` | Required for durable production data | Private durable storage for profiles, saved listings, and TheirStack's restart-safe request guard. Career-site listings run memory-only locally without it; TheirStack still requires Blob. |
 | `ANTHROPIC_MODEL` | Optional | Defaults to `claude-sonnet-5`. |
 | `ROLE_RESEARCH_ENABLED` | Optional | Bounded role research is enabled by default. Set to `false` to use the complete job description only. |
 | `ROLE_RESEARCH_CACHE_DAYS` | Optional | Role-research cache lifetime. Defaults to `45` and is clamped to `30`-`60` days. |
-| `HIREBASE_MAX_RESULTS` | Optional | Saved-result cap per Hirebase refresh. Defaults to `250`. |
-| `HIREBASE_SYNC_JOB_BUDGET` | Optional | Maximum provider records requested by one Hirebase refresh. Defaults to `250`. |
-| `HIREBASE_REFRESH_COOLDOWN_MINUTES` | Optional | Restart-safe minimum interval between Hirebase attempts. Defaults to `15` and is clamped to `5`-`60` minutes. |
+| `FREE_JOBS_MAX_AGE_DAYS` | Optional | Maximum age of a career-site posting. Defaults to `30`, capped at `120`. |
+| `FREE_JOBS_TITLE_MODE` | Optional | `tight` (default) keeps real management titles only; `broad` also accepts the title list's generic Senior Specialist/Engineer/Officer fallbacks. |
+| `FREE_JOBS_SYNC_DEADLINE_SECONDS` | Optional | Time budget for one refresh. Defaults to `50` on Vercel (its route limit is 60s) and `150` elsewhere. |
 | `THEIRSTACK_MAX_RESULTS` | Optional | Maximum LinkedIn records returned by an eligible live sync (`25`-`250`). Defaults to `150`. |
 | `SITE_PASSWORD` | Required for a public deployment | Password-gates the site so public/bot traffic cannot access private CV data or burn paid API usage. Use a strong unique value. |
-| `DEMO_MODE` | Optional | Set to `true` to block all real Claude/Hirebase/TheirStack calls and use sample data — useful for local dev. Leave unset in production. |
+| `DEMO_MODE` | Optional | Set to `true` to block all real Claude/TheirStack calls and use sample data — useful for local dev. Leave unset in production. |
 
 **Jobs cache note**: the server keeps each provider's successful snapshot in
-memory and private Blob storage. Normal searches reuse saved data. Hirebase
-attempts are limited by a configurable 15-minute guard; an early Refresh uses
-zero provider requests and reports when the next attempt is available.
-The first Hirebase sync is also explicit: click **Refresh listings**; ordinary
-page loads never start a provider request.
+memory and private Blob storage. Normal searches reuse saved data. Career-site
+listings refresh themselves when the saved list is over 6 hours old and
+otherwise only when you click **Refresh listings** (at most once every 5
+minutes).
 TheirStack live syncs are limited to once every 12 hours and incremental
 refreshes return only newly discovered records where possible. Saved jobs are
 never removed automatically. Profile & CV includes a **Clear saved listings**
 action protected by an exact `Confirm` entry; clearing listing payloads does
 not clear either provider's request guard.
-When Blob is configured, Hirebase loads and writes its durable snapshot
-fail-closed: a storage failure never exposes an unsaved fresh result. Local
-development without Blob retains its process-memory behavior.
 TheirStack live refreshes are refused when Blob storage is not configured, so a
 server restart cannot silently bypass the paid-request cooldown.
 The Recommended marker/filter and employer-priority ordering are local; they
@@ -137,24 +135,19 @@ Manager, Sustainability/ESG Manager, Investment/Treasury/Portfolio Manager,
 Category/Facilities/Program Manager) — see
 [lib/targetRoles.ts](lib/targetRoles.ts).
 
-The titles are split into at most 24 Hirebase groups per company-size lane and
-paged with a fixed page size inside one configured provider-record budget.
-Large employers run first, explicit 1-200 employee buckets preserve SME and
-recruiter capacity, and a smaller unfiltered lane retains employers whose size
-is unknown. TheirStack reserves most of each paid sync for
-executive, government, director, and explicitly senior roles before using the
-remaining capacity for broad manager/lead discovery. Every record is checked
-again for Abu Dhabi and a matching managerial title, deduplicated, and merged
-into durable saved listing history. The default UI order places current 30-day
-jobs first, then prioritizes employer tier, the candidate's local recommendation,
-and recency; it does not hide relevant SMEs or recruiter-posted roles. Defaults
-allow up to 250 Hirebase results and 150 LinkedIn
-records per eligible live sync without weakening the existing cache or 12-hour
-LinkedIn credit guard.
-
-The dedicated **Employers** page loads its Abu Dhabi company directory from
-Hirebase only when opened, reuses the saved result for 24 hours, and falls back
-to the bundled reference directory if the live provider is unavailable.
+Career-site jobs are matched against this title list and then tightened to
+real management titles (see `FREE_JOBS_TITLE_MODE`). TheirStack reserves most
+of each paid sync for executive, government, director, and explicitly senior
+roles before using the remaining capacity for broad manager/lead discovery.
+Every record is checked again for Abu Dhabi and a matching managerial title,
+deduplicated, and merged into durable saved listing history. The default UI
+order places current 30-day jobs first, then prioritizes employer tier, the
+candidate's local recommendation, and recency. Defaults allow up to 150
+LinkedIn records per eligible live sync without weakening the existing cache
+or 12-hour LinkedIn credit guard.
+The dedicated **Employers** page shows the bundled, curated Abu Dhabi employer
+directory (`lib/employerDirectory.ts`), grouped by sector, with a LinkedIn
+jobs link for each. It is static data; no provider is called.
 
 ## Notes
 

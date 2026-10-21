@@ -1322,7 +1322,7 @@ export default function Home() {
       )}
 
       <footer className="mt-16 border-t border-line pt-5 text-center font-mono text-xs text-soft/70">
-        JobHunter — jobs via Hirebase or LinkedIn listings via TheirStack, tailoring via Claude.
+        JobHunter — jobs from employer career sites (LinkedIn listings via TheirStack), tailoring via Claude.
       </footer>
       </main>
     </>

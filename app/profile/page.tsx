@@ -457,7 +457,7 @@ export default function ProfilePage() {
               every 12 hours to protect API credits.
             </p>
             <p className="mt-2 text-xs leading-relaxed text-soft/70">
-              This removes only saved Hirebase and LinkedIn listings. Applied Jobs, your profile,
+              This removes only saved job listings. Applied Jobs, your profile,
               CVs, and tailored documents are not affected.
             </p>
             <button
@@ -492,7 +492,7 @@ export default function ProfilePage() {
               Clear saved listings?
             </h2>
             <p className="mt-2 text-sm leading-relaxed text-soft">
-              All saved Hirebase and LinkedIn listings will be removed. Applied Jobs and CV data
+              All saved job listings will be removed. Applied Jobs and CV data
               will stay unchanged. Clearing does not bypass the LinkedIn 12-hour credit cooldown.
               Type <span className="font-semibold text-bright">Confirm</span> to continue.
             </p>

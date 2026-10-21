@@ -127,8 +127,8 @@ export default function EmployersPage() {
           Abu Dhabi employer directory.
         </h1>
         <p className="mt-2 max-w-2xl text-soft">
-          Browse up to 100 Abu Dhabi-headquartered company profiles. Hirebase is requested only
-          when this page opens, then the saved directory is reused for 24 hours.
+          Browse a curated list of about 100 major Abu Dhabi employers, grouped by sector, with a
+          LinkedIn jobs link for each.
         </p>
       </section>
 
@@ -158,7 +158,7 @@ export default function EmployersPage() {
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-soft/65">
           <span className="min-w-0 truncate" title={response?.note}>
             {loading
-              ? "Loading employers from Hirebase…"
+              ? "Loading employers…"
               : response
                 ? `${response.note} Updated ${timeAgo(response.fetchedAt)}.`
                 : error || "No employer data available."}
