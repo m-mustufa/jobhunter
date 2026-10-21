@@ -3,7 +3,7 @@ import "server-only";
 import { createHash } from "node:crypto";
 
 import { Job } from "@/lib/types";
-import { compareJobsByEmployerPriority, getEmployerPriority } from "@/lib/employerPriority";
+import { getEmployerPriority, sortJobsByEmployerPriority } from "@/lib/employerPriority";
 import {
   getJobListingSavedAt,
   loadJobListingSnapshot,
@@ -13,7 +13,7 @@ import { ADAPTERS } from "@/lib/freeJobs/adapters";
 import { MIN_DESCRIPTION_CHARS, passesListCriteria } from "@/lib/freeJobs/criteria";
 import { mapWithConcurrency } from "@/lib/freeJobs/http";
 import { FREE_JOB_SOURCES } from "@/lib/freeJobs/sources";
-import type { FreeJobSource } from "@/lib/freeJobs/types";
+import type { FreeJobSource, JobCandidate } from "@/lib/freeJobs/types";
 
 // These sources cost nothing, so the only limits are politeness and time:
 // a saved list is refreshed automatically once it is this old, and a manual
@@ -32,8 +32,16 @@ const SYNC_DEADLINE_MS =
       ? 50
       : 150) * 1_000;
 const SYNCED_KEY = "synced_";
-const SOURCE_CONCURRENCY = 6;
-const HYDRATE_CONCURRENCY = 4;
+// Postings that were downloaded once and turned out not to qualify (too old,
+// wrong place or title). Remembered so they are not downloaded again on every
+// refresh; kept in the saved snapshot so it survives a restart.
+const REJECTED_KEY = "rej_";
+const REJECTED_TTL_MS = 7 * 86_400_000;
+const MAX_REMEMBERED_REJECTIONS = 1_500;
+const SOURCE_CONCURRENCY = 16;
+// One slow site must not hold the whole refresh; it keeps its saved listings.
+const SOURCE_TIMEOUT_MS = 25_000;
+const HYDRATE_CONCURRENCY = 6;
 const MAX_HYDRATED_PER_SOURCE = 60;
 
 export interface FreeJobsResult {
@@ -42,6 +50,8 @@ export interface FreeJobsResult {
   successfulSearches: number;
   failedSearches: number;
   failedSources: string[];
+  /** Sites still working when the refresh answered; they join the list when done. */
+  lateSources: string[];
   fetchedJobsCount?: number;
   newJobsCount?: number;
   syncedAt: number | null;
@@ -59,9 +69,14 @@ let memory: Memory | null = null;
 let lastAttemptAt = 0;
 // When each source last answered successfully (persisted in the snapshot).
 const sourceSyncedAt = new Map<string, number>();
+// How long each source took last time, so the slow ones can be started first.
+const sourceDurationMs = new Map<string, number>();
+const rejectedAt = new Map<string, number>();
 let inFlight: Promise<FreeJobsResult> | null = null;
 
 const jobIdPrefix = (source: FreeJobSource) => `free-${source.id}-`;
+const jobIdFor = (source: FreeJobSource, externalId: string) =>
+  `${jobIdPrefix(source)}${externalId.replace(/[^a-zA-Z0-9]+/g, "-").slice(-80)}`;
 
 function buildJob(
   source: FreeJobSource,
@@ -69,7 +84,7 @@ function buildJob(
   description: string
 ): Job {
   const job: Job = {
-    id: `${jobIdPrefix(source)}${candidate.externalId.replace(/[^a-zA-Z0-9]+/g, "-").slice(-80)}`,
+    id: jobIdFor(source, candidate.externalId),
     title: candidate.title.trim(),
     company: source.employer,
     location: candidate.location.trim(),
@@ -86,8 +101,9 @@ function buildJob(
 
 async function syncSource(
   source: FreeJobSource,
-  signal: AbortSignal
-): Promise<{ source: FreeJobSource; jobs: Job[]; ok: boolean; seen: number }> {
+  signal: AbortSignal,
+  previousById: Map<string, Job>
+): Promise<{ source: FreeJobSource; jobs: Job[]; ok: boolean; seen: number; ms: number }> {
   const startedAt = Date.now();
   try {
     signal.throwIfAborted();
@@ -98,10 +114,39 @@ async function syncSource(
     );
 
     const jobs: Job[] = [];
-    const needDescription = matching.filter((candidate) => !candidate.description);
+    const needDescription: JobCandidate[] = [];
+    let reused = 0;
+    let skipped = 0;
     for (const candidate of matching) {
-      if (candidate.description && candidate.description.length >= MIN_DESCRIPTION_CHARS) {
-        jobs.push(buildJob(source, candidate, candidate.description));
+      const candidateId = jobIdFor(source, candidate.externalId);
+      const rejectedTime = rejectedAt.get(candidateId);
+      if (rejectedTime && Date.now() - rejectedTime < REJECTED_TTL_MS) {
+        skipped += 1;
+        continue;
+      }
+      const known = previousById.get(candidateId);
+      if (known && known.description.length >= MIN_DESCRIPTION_CHARS) {
+        // Downloaded on an earlier refresh: keep it instead of fetching the page
+        // again, which is what made refreshes slow. The list only overrides what
+        // it actually reports; the age rule is applied again either way.
+        const refreshed: Job = candidate.locationUnknown
+          ? known
+          : {
+              ...known,
+              title: candidate.title.trim() || known.title,
+              location: candidate.location.trim() || known.location,
+              postedAt: candidate.postedAt ?? known.postedAt,
+            };
+        if (passesListCriteria(refreshed)) {
+          jobs.push(refreshed);
+          reused += 1;
+        }
+      } else if (candidate.description) {
+        if (candidate.description.length >= MIN_DESCRIPTION_CHARS) {
+          jobs.push(buildJob(source, candidate, candidate.description));
+        }
+      } else {
+        needDescription.push(candidate);
       }
     }
     if (adapter.hydrate && needDescription.length) {
@@ -124,70 +169,161 @@ async function syncSource(
           location: detail.location ?? candidate.location,
           title: detail.title || candidate.title,
         };
-        if (!passesListCriteria(refined)) continue;
+        if (!passesListCriteria(refined)) {
+          rejectedAt.set(jobIdFor(source, candidate.externalId), Date.now());
+          continue;
+        }
         jobs.push(buildJob(source, refined, detail.description));
       }
     }
     console.info(
-      `free jobs: ${source.id} seen=${candidates.length} matched=${matching.length} kept=${jobs.length} ms=${Date.now() - startedAt}`
+      `free jobs: ${source.id} seen=${candidates.length} matched=${matching.length} kept=${jobs.length} reused=${reused} skipped=${skipped} ms=${Date.now() - startedAt}`
     );
-    return { source, jobs, ok: true, seen: candidates.length };
+    return { source, jobs, ok: true, seen: candidates.length, ms: Date.now() - startedAt };
   } catch (error) {
     console.error(`free jobs: ${source.id} failed`, error instanceof Error ? error.message : error);
-    return { source, jobs: [], ok: false, seen: 0 };
+    return { source, jobs: [], ok: false, seen: 0, ms: Date.now() - startedAt };
   }
+}
+
+// A refresh answers once this much time has passed, with whatever sites have
+// finished. A site still working carries on in the background and is merged
+// into the saved list when it finishes (its saved listings show until then),
+// so one slow career site no longer holds up the whole refresh.
+const configuredBudget = Number.parseInt(process.env.FREE_JOBS_REFRESH_BUDGET_SECONDS || "", 10);
+const REFRESH_BUDGET_MS =
+  (Number.isFinite(configuredBudget) && configuredBudget > 0 ? configuredBudget : 12) * 1_000;
+
+type SourceResult = Awaited<ReturnType<typeof syncSource>>;
+
+function snapshotMetadata(now: number, failedCount: number, fetchedCount: number) {
+  return {
+    attemptedSearches: FREE_JOB_SOURCES.length,
+    failedSearches: failedCount,
+    fetchedJobsCount: fetchedCount,
+    ...Object.fromEntries([...sourceSyncedAt].map(([id, at]) => [SYNCED_KEY + id, at])),
+    ...Object.fromEntries(
+      [...rejectedAt]
+        .filter(([, at]) => now - at < REJECTED_TTL_MS)
+        .slice(-MAX_REMEMBERED_REJECTIONS)
+        .map(([id, at]) => [REJECTED_KEY + id, at])
+    ),
+  };
+}
+
+// A source that finished after the refresh it belonged to had already answered.
+async function applyLateResult(result: SourceResult, syncStartedAt: number): Promise<void> {
+  if (!result.ok || !memory) return;
+  // A newer refresh already brought this source up to date.
+  if ((sourceSyncedAt.get(result.source.id) ?? 0) > syncStartedAt) return;
+  const now = Date.now();
+  sourceSyncedAt.set(result.source.id, now);
+  sourceDurationMs.set(result.source.id, result.ms);
+  const prefix = jobIdPrefix(result.source);
+  const byId = new Map<string, Job>();
+  for (const job of [...result.jobs, ...memory.jobs.filter((job) => !job.id.startsWith(prefix))]) {
+    if (!byId.has(job.id)) byId.set(job.id, job);
+  }
+  const jobs = sortJobsByEmployerPriority([...byId.values()]);
+  memory = { jobs, savedAt: now };
+  await saveJobListingSnapshot("free", jobs, snapshotMetadata(now, 0, result.jobs.length));
+  console.info(`free jobs: late source ${result.source.id} merged (${result.jobs.length} listings)`);
 }
 
 async function runLiveSync(previous: Job[]): Promise<FreeJobsResult> {
   lastAttemptAt = Date.now();
+  const syncStartedAt = lastAttemptAt;
   const signal = AbortSignal.timeout(SYNC_DEADLINE_MS);
-  // Longest-unsynced first, so anything cut off by the deadline goes first next time.
-  const ordered = [...FREE_JOB_SOURCES].sort(
-    (a, b) => (sourceSyncedAt.get(a.id) ?? 0) - (sourceSyncedAt.get(b.id) ?? 0)
-  );
-  const { results } = await mapWithConcurrency(ordered, SOURCE_CONCURRENCY, (source) =>
-    syncSource(source, signal)
-  );
-  const finishedAt = Date.now();
-  for (const result of results) if (result.ok) sourceSyncedAt.set(result.source.id, finishedAt);
+  // Sources that fell behind (a failed or cut-off one) go first so repeated
+  // refreshes converge; the rest start slowest-first, which keeps the total
+  // time close to the single slowest source instead of the sum of the waves.
+  const newestSync = Math.max(0, ...FREE_JOB_SOURCES.map((source) => sourceSyncedAt.get(source.id) ?? 0));
+  const isBehind = (source: FreeJobSource) =>
+    (sourceSyncedAt.get(source.id) ?? 0) < newestSync - 60_000;
+  const ordered = [...FREE_JOB_SOURCES].sort((a, b) => {
+    const behindA = isBehind(a);
+    const behindB = isBehind(b);
+    if (behindA !== behindB) return behindA ? -1 : 1;
+    if (behindA) return (sourceSyncedAt.get(a.id) ?? 0) - (sourceSyncedAt.get(b.id) ?? 0);
+    return (sourceDurationMs.get(b.id) ?? 0) - (sourceDurationMs.get(a.id) ?? 0);
+  });
+  const previousById = new Map(previous.map((job) => [job.id, job] as const));
 
-  const succeeded = results.filter((result) => result.ok);
-  const failedIds = new Set(
+  const results: SourceResult[] = [];
+  let responded = false;
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < ordered.length) {
+      const source = ordered[nextIndex++];
+      const result = await syncSource(
+        source,
+        AbortSignal.any([signal, AbortSignal.timeout(SOURCE_TIMEOUT_MS)]),
+        previousById
+      );
+      results.push(result);
+      if (responded) void applyLateResult(result, syncStartedAt).catch(() => undefined);
+    }
+  };
+  const pool = Promise.all(
+    Array.from({ length: Math.min(SOURCE_CONCURRENCY, ordered.length) }, worker)
+  );
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    pool,
+    new Promise<void>((resolve) => {
+      budgetTimer = setTimeout(resolve, REFRESH_BUDGET_MS);
+    }),
+  ]);
+  clearTimeout(budgetTimer);
+  responded = true;
+  const finished = [...results]; // only what is done right now; later ones merge themselves
+  const finishedIds = new Set(finished.map((result) => result.source.id));
+  const lateSources = FREE_JOB_SOURCES.filter((source) => !finishedIds.has(source.id)).map(
+    (source) => source.employer
+  );
+
+  const finishedAt = Date.now();
+  for (const result of finished) {
+    if (!result.ok) continue;
+    sourceSyncedAt.set(result.source.id, finishedAt);
+    sourceDurationMs.set(result.source.id, result.ms);
+  }
+
+  const succeeded = finished.filter((result) => result.ok);
+  // Sites that did not answer (failed, or still working) keep their saved listings.
+  const notUpdatedIds = new Set(
     FREE_JOB_SOURCES.filter((source) => !succeeded.some((result) => result.source.id === source.id)).map(
       (source) => source.id
     )
   );
-  const failedSources = FREE_JOB_SOURCES.filter((source) => failedIds.has(source.id)).map(
-    (source) => source.employer
-  );
+  const failedSources = finished.filter((result) => !result.ok).map((result) => result.source.employer);
 
   // A source that answered replaces its old listings (closed jobs disappear);
-  // a source that failed keeps what we already had, so a flaky site never
-  // wipes its jobs.
-  // Kept jobs are re-checked against today's rules, so changing the criteria
-  // (or a posting ageing out) also cleans up what a failed site left behind.
+  // one that did not keeps what we already had, so a flaky site never wipes
+  // its jobs. Kept jobs are re-checked against today's rules, so changing the
+  // criteria (or a posting ageing out) also cleans up what such a site left.
   const kept = previous.filter(
     (job) =>
-      FREE_JOB_SOURCES.some((source) => failedIds.has(source.id) && job.id.startsWith(jobIdPrefix(source))) &&
+      FREE_JOB_SOURCES.some((source) => notUpdatedIds.has(source.id) && job.id.startsWith(jobIdPrefix(source))) &&
       passesListCriteria(job)
   );
   const fresh = succeeded.flatMap((result) => result.jobs);
   const byId = new Map<string, Job>();
   for (const job of [...fresh, ...kept]) if (!byId.has(job.id)) byId.set(job.id, job);
-  const jobs = [...byId.values()].sort(compareJobsByEmployerPriority);
+  const jobs = sortJobsByEmployerPriority([...byId.values()]);
 
   const previousIds = new Set(previous.map((job) => job.id));
   const newJobsCount = fresh.filter((job) => !previousIds.has(job.id)).length;
   const now = Date.now();
+  const sourcesMs = now - syncStartedAt;
 
   if (jobs.length) {
     memory = { jobs, savedAt: now };
-    await saveJobListingSnapshot("free", jobs, {
-      attemptedSearches: FREE_JOB_SOURCES.length,
-      failedSearches: failedSources.length,
-      fetchedJobsCount: fresh.length,
-      ...Object.fromEntries([...sourceSyncedAt].map(([id, at]) => [SYNCED_KEY + id, at])),
-    });
+    const persistStartedAt = Date.now();
+    await saveJobListingSnapshot("free", jobs, snapshotMetadata(now, failedSources.length, fresh.length));
+    console.info(
+      `free jobs: TIMING sources=${sourcesMs}ms persist=${Date.now() - persistStartedAt}ms total=${Date.now() - syncStartedAt}ms late=${lateSources.length}`
+    );
   }
 
   return {
@@ -196,6 +332,7 @@ async function runLiveSync(previous: Job[]): Promise<FreeJobsResult> {
     successfulSearches: succeeded.length,
     failedSearches: failedSources.length,
     failedSources,
+    lateSources,
     fetchedJobsCount: succeeded.reduce((total, result) => total + result.seen, 0),
     newJobsCount,
     syncedAt: now,
@@ -209,9 +346,9 @@ async function runLiveSync(previous: Job[]): Promise<FreeJobsResult> {
 function adoptSnapshot(snapshot: { jobs: Job[]; savedAt: number; metadata?: Record<string, number | null> }) {
   memory = { jobs: snapshot.jobs, savedAt: snapshot.savedAt };
   for (const [key, value] of Object.entries(snapshot.metadata || {})) {
-    if (key.startsWith(SYNCED_KEY) && typeof value === "number") {
-      sourceSyncedAt.set(key.slice(SYNCED_KEY.length), value);
-    }
+    if (typeof value !== "number") continue;
+    if (key.startsWith(SYNCED_KEY)) sourceSyncedAt.set(key.slice(SYNCED_KEY.length), value);
+    else if (key.startsWith(REJECTED_KEY)) rejectedAt.set(key.slice(REJECTED_KEY.length), value);
   }
 }
 
@@ -268,6 +405,7 @@ async function load(forceRefresh: boolean): Promise<FreeJobsResult> {
     successfulSearches: 0,
     failedSearches: 0,
     failedSources: [],
+    lateSources: [],
     syncedAt: snapshot?.savedAt ?? null,
     nextSyncAt: lastAttemptAt ? lastAttemptAt + MANUAL_REFRESH_COOLDOWN_MS : null,
     syncMode,

@@ -197,6 +197,11 @@ export async function GET(req: Request) {
         `Checked ${result.successfulSearches} of ${result.attemptedSearches} employer career sites (${result.fetchedJobsCount ?? 0} postings read) and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} matching listings are available.`
       );
     }
+    if (result.lateSources.length) {
+      notes.push(
+        `Still checking: ${result.lateSources.join(", ")}. Their saved listings are shown for now; refresh again shortly to see anything new.`
+      );
+    }
     if (result.failedSources.length) {
       notes.push(`Could not reach: ${result.failedSources.join(", ")}. Their saved listings were kept.`);
     }

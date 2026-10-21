@@ -53,6 +53,16 @@ export function isTightManagerialTitle(title: string): boolean {
   return SOFT_LEAD_WORD.test(title) && !INDIVIDUAL_CONTRIBUTOR.test(title);
 }
 
+// Sitemap sources (SuccessFactors) give no location in their list, but their
+// job URLs read "<place>-<title>" ("Abu-Dhabi-Senior-Manager...", "ARE-...",
+// "Dubai-..."). That is enough to skip jobs clearly elsewhere without
+// downloading their pages; the real location is still checked afterwards.
+function slugMayBeTargetLocation(slugText: string): boolean {
+  if (ABU_DHABI_PLACES.test(slugText)) return true;
+  if (OTHER_EMIRATES.test(slugText)) return false;
+  return /\bARE\b/.test(slugText) || UAE_ONLY.test(slugText);
+}
+
 /** Cheap pre-filter run on the list data, before any description is downloaded. */
 export function passesListCriteria(
   candidate: { title: string; location: string; postedAt: string | null },
@@ -61,7 +71,9 @@ export function passesListCriteria(
   return (
     isTargetManagerialTitle(candidate.title) &&
     (!TIGHT_TITLES || isTightManagerialTitle(candidate.title)) &&
-    (options.skipLocation || isTargetLocation(candidate.location)) &&
+    (options.skipLocation
+      ? slugMayBeTargetLocation(candidate.title)
+      : isTargetLocation(candidate.location)) &&
     isRecent(candidate.postedAt)
   );
 }

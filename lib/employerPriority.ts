@@ -378,6 +378,33 @@ export function compareJobsByEmployerPriority(a: Job, b: Job): number {
   );
 }
 
+/**
+ * Same ordering as `compareJobsByEmployerPriority`, but each job's priority,
+ * freshness and date are worked out once instead of on every comparison.
+ * Matching an employer against the registries is the expensive part, and a
+ * sort of a few hundred jobs repeats it thousands of times.
+ */
+export function sortJobsByEmployerPriority(jobs: readonly Job[]): Job[] {
+  const now = Date.now();
+  return jobs
+    .map((job) => ({
+      job,
+      freshness: getJobFreshnessRank(job, now),
+      score: getEmployerPriority(job).score,
+      posted: postedTimestamp(job.postedAt, now),
+    }))
+    .sort(
+      (a, b) =>
+        b.freshness - a.freshness ||
+        b.score - a.score ||
+        b.posted - a.posted ||
+        a.job.company.localeCompare(b.job.company) ||
+        a.job.title.localeCompare(b.job.title) ||
+        a.job.id.localeCompare(b.job.id)
+    )
+    .map((entry) => entry.job);
+}
+
 function providerFilters(seeds: readonly EmployerSeed[]): EmployerProviderFilters {
   const exactNames: string[] = [];
   const partialNames: string[] = [];

@@ -2,7 +2,7 @@ import "server-only";
 
 import { isRecent, MAX_JOB_AGE_DAYS } from "./criteria";
 import { load } from "cheerio";
-import { fetchJson, fetchText, htmlToText } from "./http";
+import { fetchJson, fetchText, htmlToText, mapWithConcurrency } from "./http";
 import type { FreeJobAdapter, FreeJobSource, JobCandidate } from "./types";
 
 type Source<A extends FreeJobSource["adapter"]> = Extract<FreeJobSource, { adapter: A }>;
@@ -33,35 +33,57 @@ const greenhouse: FreeJobAdapter = {
 };
 
 // --- Lever: one call returns every posting with its full description. ------
+// --- Lever: its API is slow (a full board takes 15s+, one posting ~5s), so the
+// list comes from the public jobs page (~3s) and the API is used only to fetch
+// postings we have not downloaded before. -----------------------------------
+function leverDescription(job: any): string {
+  const lists = (job.lists || [])
+    .map((list: any) => `${list.text || ""}\n${htmlToText(String(list.content || ""))}`)
+    .join("\n\n");
+  // Some postings leave the *Plain fields empty and only fill the HTML ones,
+  // so fall back to converting those.
+  return [
+    job.descriptionPlain || htmlToText(String(job.description || "")),
+    lists,
+    job.additionalPlain || htmlToText(String(job.additional || "")),
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
 const lever: FreeJobAdapter = {
   async list(source, signal) {
     const { slug } = source as Source<"lever">;
-    const data = await fetchJson<any[]>(
-      `https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`,
+    const $ = load(await fetchText(`https://jobs.lever.co/${encodeURIComponent(slug)}`, signal));
+    const candidates: JobCandidate[] = $(".posting")
+      .map((_, element): JobCandidate | null => {
+        const link = $(element).find("a.posting-title").first();
+        const href = link.attr("href") || "";
+        const id = href.split("/").filter(Boolean).pop() || "";
+        const title = $(element).find("[data-qa=posting-name]").first().text().trim();
+        if (!id || !title) return null;
+        return {
+          externalId: id,
+          title,
+          location: $(element).find(".posting-categories .location").first().text().trim(),
+          applyLink: href,
+          postedAt: null,
+        };
+      })
+      .get();
+    // An empty page means the layout changed or the board is down; do not
+    // let that wipe the saved listings.
+    if (!candidates.length) throw new Error("no postings found on the Lever jobs page");
+    return candidates;
+  },
+  async hydrate(source, candidate, signal) {
+    const { slug } = source as Source<"lever">;
+    const job = await fetchJson<any>(
+      `https://api.lever.co/v0/postings/${encodeURIComponent(slug)}/${encodeURIComponent(candidate.externalId)}`,
       signal
     );
-    return (Array.isArray(data) ? data : []).map((job): JobCandidate => {
-      const lists = (job.lists || [])
-        .map((list: any) => `${list.text || ""}\n${htmlToText(String(list.content || ""))}`)
-        .join("\n\n");
-      return {
-        externalId: String(job.id),
-        title: String(job.text || ""),
-        location: String(job.categories?.location || job.country || ""),
-        applyLink: String(job.hostedUrl || ""),
-        postedAt: toIso(job.createdAt),
-        // Some postings leave the *Plain fields empty and only fill the HTML
-        // ones, so fall back to converting those.
-        description: [
-          job.descriptionPlain || htmlToText(String(job.description || "")),
-          lists,
-          job.additionalPlain || htmlToText(String(job.additional || "")),
-        ]
-          .filter(Boolean)
-          .join("\n\n")
-          .trim(),
-      };
-    });
+    return { description: leverDescription(job), postedAt: toIso(job.createdAt) };
   },
 };
 
@@ -126,19 +148,12 @@ const workday: FreeJobAdapter = {
     const { host, tenant, site, searchText } = source as Source<"workday">;
     const base = `https://${host}/wday/cxs/${tenant}/${site}`;
     const candidates: JobCandidate[] = [];
-    // Workday only reports `total` on the first page (later pages say 0), so
-    // keep the first page's value instead of trusting each response.
-    let total = 0;
-    for (let offset = 0; offset < 200; offset += 20) {
-      const page = await fetchJson<{ jobPostings?: any[]; total?: number }>(
-        `${base}/jobs`,
-        signal,
-        {
-          method: "POST",
-          body: { appliedFacets: {}, limit: 20, offset, searchText: searchText || "" },
-        }
-      );
-      if (offset === 0) total = page.total || 0;
+    const fetchPage = (offset: number) =>
+      fetchJson<{ jobPostings?: any[]; total?: number }>(`${base}/jobs`, signal, {
+        method: "POST",
+        body: { appliedFacets: {}, limit: 20, offset, searchText: searchText || "" },
+      });
+    const addPage = (page: { jobPostings?: any[] }) => {
       for (const job of page.jobPostings || []) {
         if (!job.externalPath) continue;
         candidates.push({
@@ -149,7 +164,24 @@ const workday: FreeJobAdapter = {
           postedAt: workdayPostedAt(job.postedOn),
         });
       }
-      if (!page.jobPostings?.length || offset + 20 >= total) break;
+    };
+    // Workday only reports `total` on the first page (later pages say 0), so
+    // read it there, then fetch the remaining pages in parallel (one at a time
+    // was most of a refresh's waiting).
+    const first = await fetchPage(0);
+    addPage(first);
+    const total = first.total || 0;
+    const offsets: number[] = [];
+    for (let offset = 20; offset < Math.min(total, 200); offset += 20) offsets.push(offset);
+    if (offsets.length) {
+      const { results, failed } = await mapWithConcurrency(offsets, 5, async (offset) => ({
+        offset,
+        page: await fetchPage(offset),
+      }));
+      // A missing page would silently drop jobs, so treat it as a failed source
+      // (its saved listings are kept) rather than a smaller list.
+      if (failed) throw new Error("some Workday pages could not be read");
+      results.sort((a, b) => a.offset - b.offset).forEach(({ page }) => addPage(page));
     }
     return candidates;
   },
@@ -168,12 +200,15 @@ const workday: FreeJobAdapter = {
 };
 
 // --- Oracle Recruiting Cloud: the REST API behind its Candidate Experience. -
+// Oracle accepts up to 100 rows per call; fewer calls means a faster refresh.
+const ORACLE_PAGE_SIZE = 100;
+
 const oracle: FreeJobAdapter = {
   async list(source, signal) {
     const { host, site, keyword } = source as Source<"oracle">;
     const candidates: JobCandidate[] = [];
-    for (let offset = 0; offset < 200; offset += 25) {
-      const finder = `findReqs;siteNumber=${site},limit=25,offset=${offset}${keyword ? `,keyword=${encodeURIComponent(keyword)}` : ""},sortBy=POSTING_DATES_DESC`;
+    for (let offset = 0; offset < 300; offset += ORACLE_PAGE_SIZE) {
+      const finder = `findReqs;siteNumber=${site},limit=${ORACLE_PAGE_SIZE},offset=${offset}${keyword ? `,keyword=${encodeURIComponent(keyword)}` : ""},sortBy=POSTING_DATES_DESC`;
       const page = await fetchJson<{ items?: any[] }>(
         `https://${host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList.secondaryLocations&finder=${finder}`,
         signal
@@ -189,7 +224,7 @@ const oracle: FreeJobAdapter = {
           postedAt: toIso(job.PostedDate),
         });
       }
-      if (list.length < 25 || offset + 25 >= (root?.TotalJobsCount || 0)) break;
+      if (list.length < ORACLE_PAGE_SIZE || offset + ORACLE_PAGE_SIZE >= (root?.TotalJobsCount || 0)) break;
       // Newest-first: once a page ends outside the age window, later pages
       // can only be older still.
       const last = candidates[candidates.length - 1];

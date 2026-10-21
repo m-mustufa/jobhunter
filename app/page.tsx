@@ -217,37 +217,46 @@ function rankBatchItems(
     );
   const now = Date.now();
 
-  return [...items].sort((a, b) => {
-    const freshnessDifference =
-      getJobFreshnessRank(b.job, now) - getJobFreshnessRank(a.job, now);
-    if (freshnessDifference) return freshnessDifference;
+  // Each job's freshness, employer tier and date are worked out once, not on
+  // every comparison: matching an employer against the registries is the slow
+  // part, and sorting a few hundred jobs repeats it thousands of times (it
+  // made the list lag after every load and filter change).
+  const keyed = items.map((item) => ({
+    item,
+    freshness: getJobFreshnessRank(item.job, now),
+    tier: EMPLOYER_TIER_RANK[getEmployerPriority(item.job).tier],
+    posted: postedTimestamp(item.job.postedAt, now),
+  }));
 
-    const employerTierDifference =
-      EMPLOYER_TIER_RANK[getEmployerPriority(b.job).tier] -
-      EMPLOYER_TIER_RANK[getEmployerPriority(a.job).tier];
-    if (employerTierDifference) return employerTierDifference;
+  return keyed
+    .sort((a, b) => {
+      const freshnessDifference = b.freshness - a.freshness;
+      if (freshnessDifference) return freshnessDifference;
 
-    const recommendationA = recommendations.get(a.job.id);
-    const recommendationB = recommendations.get(b.job.id);
-    const recommendedDifference =
-      Number(recommendationB?.recommended === true) -
-      Number(recommendationA?.recommended === true);
-    if (recommendedDifference) return recommendedDifference;
+      const employerTierDifference = b.tier - a.tier;
+      if (employerTierDifference) return employerTierDifference;
 
-    const recommendationScoreDifference =
-      (recommendationB?.score || 0) - (recommendationA?.score || 0);
-    if (recommendationScoreDifference) return recommendationScoreDifference;
+      const recommendationA = recommendations.get(a.item.job.id);
+      const recommendationB = recommendations.get(b.item.job.id);
+      const recommendedDifference =
+        Number(recommendationB?.recommended === true) -
+        Number(recommendationA?.recommended === true);
+      if (recommendedDifference) return recommendedDifference;
 
-    const recencyDifference =
-      postedTimestamp(b.job.postedAt, now) - postedTimestamp(a.job.postedAt, now);
-    if (recencyDifference) return recencyDifference;
+      const recommendationScoreDifference =
+        (recommendationB?.score || 0) - (recommendationA?.score || 0);
+      if (recommendationScoreDifference) return recommendationScoreDifference;
 
-    return (
-      a.job.company.localeCompare(b.job.company) ||
-      a.job.title.localeCompare(b.job.title) ||
-      a.job.id.localeCompare(b.job.id)
-    );
-  });
+      const recencyDifference = b.posted - a.posted;
+      if (recencyDifference) return recencyDifference;
+
+      return (
+        a.item.job.company.localeCompare(b.item.job.company) ||
+        a.item.job.title.localeCompare(b.item.job.title) ||
+        a.item.job.id.localeCompare(b.item.job.id)
+      );
+    })
+    .map((entry) => entry.item);
 }
 
 // Pure reverse-chronological order, bypassing the curated employer-tier/
