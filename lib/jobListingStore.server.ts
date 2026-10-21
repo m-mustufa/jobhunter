@@ -1,6 +1,6 @@
 import "server-only";
 
-import { del, get, put } from "@vercel/blob";
+import { del, get, head, put } from "@vercel/blob";
 import { Job } from "@/lib/types";
 
 export type JobListingProvider = "theirstack" | "free";
@@ -194,6 +194,26 @@ function isSnapshot(
       snapshot.jobs.every(isJob) &&
       isMetadata(snapshot.metadata)
   );
+}
+
+/**
+ * When the stored snapshot was last written (ms), without downloading it.
+ * Several server instances can each hold an older copy in memory; this is the
+ * cheap way to learn that another instance has saved something newer.
+ * Returns null when there is no snapshot, no storage, or the check failed.
+ */
+export async function getJobListingSavedAt(
+  provider: JobListingProvider
+): Promise<number | null> {
+  const token = process.env.BLOB_READ_WRITE_TOKEN;
+  if (!token) return null;
+  try {
+    const info = await head(PATHS[provider], { token });
+    const uploadedAt = new Date(info.uploadedAt).getTime();
+    return Number.isFinite(uploadedAt) ? uploadedAt : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function loadJobListingSnapshot(

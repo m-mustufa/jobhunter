@@ -4,7 +4,11 @@ import { createHash } from "node:crypto";
 
 import { Job } from "@/lib/types";
 import { compareJobsByEmployerPriority, getEmployerPriority } from "@/lib/employerPriority";
-import { loadJobListingSnapshot, saveJobListingSnapshot } from "@/lib/jobListingStore.server";
+import {
+  getJobListingSavedAt,
+  loadJobListingSnapshot,
+  saveJobListingSnapshot,
+} from "@/lib/jobListingStore.server";
 import { ADAPTERS } from "@/lib/freeJobs/adapters";
 import { MIN_DESCRIPTION_CHARS, passesListCriteria } from "@/lib/freeJobs/criteria";
 import { mapWithConcurrency } from "@/lib/freeJobs/http";
@@ -211,12 +215,29 @@ function adoptSnapshot(snapshot: { jobs: Job[]; savedAt: number; metadata?: Reco
   }
 }
 
+// Each server instance keeps its own copy of the list in memory, so one
+// instance can hold an older list than the stored snapshot another instance
+// has just written. Before serving, ask storage (a cheap timestamp lookup,
+// at most every few seconds) whether something newer exists and adopt it.
+const BLOB_CHECK_INTERVAL_MS = 5_000;
+const BLOB_CLOCK_TOLERANCE_MS = 5_000; // the stored time trails our own savedAt slightly
+let lastBlobCheckAt = 0;
+
+async function refreshMemoryFromStorage(): Promise<void> {
+  const now = Date.now();
+  if (memory && now - lastBlobCheckAt < BLOB_CHECK_INTERVAL_MS) return;
+  lastBlobCheckAt = now;
+  if (memory) {
+    const storedAt = await getJobListingSavedAt("free");
+    if (storedAt === null || storedAt <= memory.savedAt + BLOB_CLOCK_TOLERANCE_MS) return;
+  }
+  const snapshot = await loadJobListingSnapshot("free");
+  if (snapshot && (!memory || snapshot.savedAt > memory.savedAt)) adoptSnapshot(snapshot);
+}
+
 /** The saved listings with full descriptions, without ever contacting a career site. */
 export async function getSavedFreeJobs(): Promise<Job[]> {
-  if (!memory) {
-    const snapshot = await loadJobListingSnapshot("free");
-    if (snapshot) adoptSnapshot(snapshot);
-  }
+  await refreshMemoryFromStorage();
   return memory?.jobs || [];
 }
 
@@ -237,10 +258,8 @@ async function load(forceRefresh: boolean): Promise<FreeJobsResult> {
   if (!FREE_JOB_SOURCES.length) {
     throw new Error("No free job sources are configured (lib/freeJobs/sources.ts)");
   }
-  const snapshot = memory
-    ? { jobs: memory.jobs, savedAt: memory.savedAt }
-    : await loadJobListingSnapshot("free");
-  if (snapshot && !memory) adoptSnapshot(snapshot);
+  await refreshMemoryFromStorage();
+  const snapshot = memory ? { jobs: memory.jobs, savedAt: memory.savedAt } : null;
 
   const now = Date.now();
   const saved = (syncMode: FreeJobsResult["syncMode"], stale = false): FreeJobsResult => ({

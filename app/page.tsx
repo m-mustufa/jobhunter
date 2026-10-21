@@ -424,6 +424,7 @@ export default function Home() {
         const scored = toBatchItems(cache.jobs, prof);
         setItemsSynced(scored);
         setSelectedId(scored[0]?.job.id ?? null);
+        void revalidateJobs(prof, cache.fetchedAt ?? null, cache.keyword || "");
       } else if (loadJSON<number | null>(JOB_LISTINGS_CLEARED_KEY, null)) {
         setSearched(true);
         setListingsCleared(true);
@@ -576,12 +577,56 @@ export default function Home() {
 
     const cacheTimestamp = providerSyncedAt || Date.now();
     setFetchedAt(cacheTimestamp);
-    saveJSON(linkedinMode ? LINKEDIN_JOBS_CACHE_KEY : JOBS_CACHE_KEY, {
+    const cacheKey = linkedinMode ? LINKEDIN_JOBS_CACHE_KEY : JOBS_CACHE_KEY;
+    const cached = saveJSON(cacheKey, {
       jobs,
       fetchedAt: cacheTimestamp,
       keyword,
       sampleNote: note,
     });
+    // If the write failed (storage full), the previous copy would otherwise
+    // survive and come back as a stale list on the next load. Drop it.
+    if (!cached) removeJSON(cacheKey);
+  }
+
+  // The browser's copy is shown instantly on load, but it can be old, or the
+  // server may have saved a newer list since. Quietly ask the server and swap
+  // its list in only when it is newer. A search the user starts meanwhile wins.
+  async function revalidateJobs(prof: Profile, cachedAt: number | null, cachedKeyword: string) {
+    const startId = jobsRequestIdRef.current;
+    try {
+      const params = new URLSearchParams();
+      if (cachedKeyword) params.set("keyword", cachedKeyword);
+      const query = params.toString();
+      const r = await fetch(`/api/jobs${query ? `?${query}` : ""}`);
+      const data = (await r.json().catch(() => null)) as JobsResponse | null;
+      if (!r.ok || !data?.jobs?.length || data.sample) return;
+      if (jobsRequestIdRef.current !== startId) return;
+      const serverAt =
+        typeof data.providerSyncedAt === "number" && Number.isFinite(data.providerSyncedAt)
+          ? data.providerSyncedAt
+          : null;
+      if (serverAt === null || (cachedAt !== null && serverAt <= cachedAt)) return;
+
+      const scored = toBatchItems(data.jobs, prof);
+      setItemsSynced(scored);
+      setSelectedId((current) =>
+        current && scored.some((item) => item.job.id === current)
+          ? current
+          : scored[0]?.job.id ?? null
+      );
+      setFetchedAt(serverAt);
+      setSampleNote(data.note || null);
+      const saved = saveJSON(JOBS_CACHE_KEY, {
+        jobs: data.jobs,
+        fetchedAt: serverAt,
+        keyword: cachedKeyword,
+        sampleNote: data.note || null,
+      });
+      if (!saved) removeJSON(JOBS_CACHE_KEY);
+    } catch {
+      // Offline or the server is busy: keep showing the browser copy.
+    }
   }
 
   function toggleLinkedInJobs() {
