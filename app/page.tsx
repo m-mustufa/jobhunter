@@ -1211,13 +1211,19 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasLiteJobs, listKey, profileKey]);
 
-  // When the tab is shown again, look for a newer list.
+  // Look for a newer list when the tab is shown again, and every 5 minutes
+  // while the page stays open, so the "N new" badge shows up on its own after
+  // the scheduled sync has saved new jobs.
   useEffect(() => {
-    const onVisible = () => {
+    const check = () => {
       if (document.visibilityState === "visible") void checkForNewJobs();
     };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
+    document.addEventListener("visibilitychange", check);
+    const timer = setInterval(check, 5 * 60_000);
+    return () => {
+      document.removeEventListener("visibilitychange", check);
+      clearInterval(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

@@ -17,6 +17,6 @@ export function middleware(req: NextRequest) {
 export const config = {
   // Gate every page and every API route (the API routes are exactly what
   // costs money) except the login page itself, the login submit endpoint,
-  // and static assets.
-  matcher: ["/((?!login|api/login|_next/static|_next/image|favicon.ico|icon.svg).*)"],
+  // static assets, and the scheduled sync, which checks its own secret.
+  matcher: ["/((?!login|api/login|api/cron|_next/static|_next/image|favicon.ico|icon.svg).*)"],
 };

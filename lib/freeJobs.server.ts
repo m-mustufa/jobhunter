@@ -234,7 +234,10 @@ async function applyLateResult(result: SourceResult, syncStartedAt: number): Pro
   console.info(`free jobs: late source ${result.source.id} merged (${result.jobs.length} listings)`);
 }
 
-async function runLiveSync(previous: Job[]): Promise<FreeJobsResult> {
+async function runLiveSync(
+  previous: Job[],
+  options: { waitForAll?: boolean } = {}
+): Promise<FreeJobsResult> {
   lastAttemptAt = Date.now();
   const syncStartedAt = lastAttemptAt;
   const signal = AbortSignal.timeout(SYNC_DEADLINE_MS);
@@ -275,6 +278,8 @@ async function runLiveSync(previous: Job[]): Promise<FreeJobsResult> {
   await Promise.race([
     pool,
     new Promise<void>((resolve) => {
+      // A scheduled run has nobody waiting for an answer, so it waits for every source.
+      if (options.waitForAll) return;
       budgetTimer = setTimeout(resolve, REFRESH_BUDGET_MS);
     }),
   ]);
@@ -436,6 +441,51 @@ export async function fetchFreeJobs(forceRefresh = false): Promise<FreeJobsResul
     inFlight = null;
   });
   return inFlight;
+}
+
+// The scheduled (cron) run. It waits for every source instead of answering
+// after REFRESH_BUDGET_MS, and does nothing if the saved list is already fresh,
+// because a manual Refresh (or another instance) got there first.
+const SCHEDULED_MIN_GAP_MS = 20 * 60 * 1000;
+
+export interface ScheduledSyncResult {
+  ran: boolean;
+  reason?: string;
+  jobs?: number;
+  newJobs?: number;
+  failedSources?: string[];
+  lateSources?: string[];
+  durationMs: number;
+}
+
+export async function runScheduledSync(): Promise<ScheduledSyncResult> {
+  const startedAt = Date.now();
+  const done = (result: Omit<ScheduledSyncResult, "durationMs">): ScheduledSyncResult => ({
+    ...result,
+    durationMs: Date.now() - startedAt,
+  });
+
+  if (inFlight) {
+    await inFlight.catch(() => undefined);
+    return done({ ran: false, reason: "a sync was already running" });
+  }
+  await refreshMemoryFromStorage();
+  if (memory && Date.now() - memory.savedAt < SCHEDULED_MIN_GAP_MS) {
+    return done({ ran: false, reason: "the saved list was refreshed recently" });
+  }
+
+  const tracked = runLiveSync(memory?.jobs || [], { waitForAll: true }).finally(() => {
+    inFlight = null;
+  });
+  inFlight = tracked;
+  const result = await tracked;
+  return done({
+    ran: true,
+    jobs: result.jobs.length,
+    newJobs: result.newJobsCount,
+    failedSources: result.failedSources,
+    lateSources: result.lateSources,
+  });
 }
 
 export function clearFreeJobsMemoryCache(): void {

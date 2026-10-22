@@ -1,0 +1,31 @@
+name: Sync jobs
+
+# Refreshes the saved job list every two hours, so new jobs are already there
+# (and the "N new" badge can show) when the app is opened. The app skips the run
+# if the list was refreshed in the last 20 minutes.
+#
+# Needs a repository secret named CRON_SECRET with the same value as the
+# CRON_SECRET environment variable of the Vercel project.
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-jobs
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ask the app to sync the career sites
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl --fail-with-body --silent --show-error --max-time 100 \
+            -X POST \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            https://jobhunter-lemon.vercel.app/api/cron/sync
