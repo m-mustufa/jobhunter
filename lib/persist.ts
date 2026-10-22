@@ -12,6 +12,9 @@ export const JOBS_CACHE_KEY = "jobhunter:jobsCache:careersites:v1";
 // back to stale cards from the retired public LinkedIn crawler.
 export const LINKEDIN_JOBS_CACHE_KEY = "jobhunter:linkedinJobsCache:theirstack:v1";
 export const JOB_LISTINGS_CLEARED_KEY = "jobhunter:jobListingsCleared:v1";
+// Recommended scores for the saved list, tagged with the profile they were worked
+// out for, so the list can appear in its final order straight away on load.
+export const JOB_SCORES_CACHE_KEY = "jobhunter:jobScores:v1";
 export const TAILORED_ANALYSES_KEY = "jobhunter:tailoredAnalyses:v1";
 export const APPLIED_JOBS_KEY = "jobhunter:appliedJobs:v1";
 
@@ -57,6 +60,7 @@ export function markSavedJobListingsCleared(): boolean {
   try {
     window.localStorage.removeItem(JOBS_CACHE_KEY);
     window.localStorage.removeItem(LINKEDIN_JOBS_CACHE_KEY);
+    window.localStorage.removeItem(JOB_SCORES_CACHE_KEY);
     window.localStorage.removeItem("jobhunter:jobsCache");
     window.localStorage.setItem(JOB_LISTINGS_CLEARED_KEY, JSON.stringify(Date.now()));
     return true;

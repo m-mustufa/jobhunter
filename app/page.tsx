@@ -17,6 +17,7 @@ import {
   JOBS_CACHE_KEY,
   LINKEDIN_JOBS_CACHE_KEY,
   JOB_LISTINGS_CLEARED_KEY,
+  JOB_SCORES_CACHE_KEY,
   TAILORED_ANALYSES_KEY,
 } from "@/lib/persist";
 import { fetchStoredProfile } from "@/lib/profileStore";
@@ -353,6 +354,39 @@ function needsFreeDescription(job: Job): boolean {
   return !job.description && job.id.startsWith("free-");
 }
 
+type JobScore = { score: number; recommended: boolean };
+
+// A short, stable fingerprint of a string. Used to tell whether the scores kept
+// in the browser were worked out for the profile that is loaded now.
+function hashString(value: string): string {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash * 33) ^ value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+// Asks the server to score every saved job against the profile (the Recommended
+// marker needs each job's description, which the list does not carry).
+// Deliberately not cancellable with an AbortController: a cancelled fetch
+// rejects with an AbortError, which showed up as an "Unhandled Runtime Error"
+// in development. A stale request just finishes and its result is ignored.
+async function fetchRecommendations(
+  profileKey: string
+): Promise<Record<string, JobScore> | null> {
+  try {
+    const response = await fetch("/api/jobs/recommendations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profile: JSON.parse(profileKey) }),
+    });
+    const data = await response.json().catch(() => null);
+    return response.ok && data?.recommendations ? data.recommendations : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function Home() {
   const [keyword, setKeyword] = useState("");
   const [items, setItems] = useState<BatchItem[]>([]);
@@ -386,6 +420,16 @@ export default function Home() {
   // The job the code selected on its own (not one the user clicked), so it can
   // follow the list if the order changes before the user picks anything.
   const autoSelectedRef = useRef<string | null>(null);
+  // What the background checks need to read without being re-created on every render.
+  const liveRef = useRef({
+    fetchedAt: null as number | null,
+    keyword: "",
+    linkedinOnly: false,
+    searching: false,
+    profileKey: "",
+    pendingSyncedAt: null as number | null,
+  });
+  const lastNewJobsCheckRef = useRef(0);
   const tailoringBusy = busy?.startsWith("tailor:") === true;
   // What the page is loading while `searching` is true, for the lock overlay.
   const [loadingKind, setLoadingKind] = useState<"load" | "refresh" | "linkedin">("load");
@@ -420,28 +464,58 @@ export default function Home() {
   // either restore the last fetched job list from cache (instant, free) or
   // run a first search if nothing's cached yet.
   const [hydrated, setHydrated] = useState(false);
+
+  // Puts the browser's saved list on screen, together with the scores that were
+  // saved for this same profile, so it appears in its final order straight away.
+  function restoreCachedList(cache: JobsCache, prof: Profile) {
+    if (cache.keyword) setKeyword(cache.keyword);
+    setSampleNote(cache.sampleNote);
+    setFetchedAt(cache.fetchedAt);
+    setSearched(true);
+    const key = JSON.stringify({ ...prof, photo: "" });
+    const savedScores = loadJSON<{
+      profileHash: string;
+      scores: Record<string, JobScore>;
+    } | null>(JOB_SCORES_CACHE_KEY, null);
+    if (savedScores?.profileHash === hashString(key)) setRecs({ key, map: savedScores.scores });
+    const scored = toBatchItems(cache.jobs, prof);
+    setItemsSynced(scored);
+    autoSelect(scored[0]?.job.id ?? null);
+  }
+
   useEffect(() => {
     (async () => {
-      // Server (Vercel Blob) first — the durable copy that survives
-      // incognito/other browsers/devices; local storage is only a
-      // fallback for when the server copy is empty or unreachable.
+      const localMasterCV = loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV);
+      const localProfile = sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE));
+      const cache = loadJSON<JobsCache | null>(JOBS_CACHE_KEY, null);
+      const cachedList = cache && cache.jobs?.length ? cache : null;
+
+      // With a saved list, show it at once using the profile saved in this
+      // browser. Waiting for the server's copy of the profile (a storage read,
+      // about a second) used to delay the first paint.
+      if (cachedList) {
+        setMasterCV(localMasterCV);
+        setProfile(localProfile);
+        setHydrated(true);
+        restoreCachedList(cachedList, localProfile);
+      }
+
+      // Server (Vercel Blob) copy of the profile: the durable one that survives
+      // incognito/other browsers/devices; local storage is only a fallback for
+      // when the server copy is empty or unreachable.
       const remote = await fetchStoredProfile();
-      const mCV = remote ? remote.masterCV : loadJSON(MASTER_CV_KEY, DEFAULT_MASTER_CV);
-      const prof = remote ? sanitizeProfile(remote.profile) : sanitizeProfile(loadJSON(PROFILE_KEY, DEFAULT_PROFILE));
+      const mCV = remote ? remote.masterCV : localMasterCV;
+      const prof = remote ? sanitizeProfile(remote.profile) : localProfile;
       setMasterCV(mCV);
       setProfile(prof);
       setHydrated(true);
 
-      const cache = loadJSON<JobsCache | null>(JOBS_CACHE_KEY, null);
-      if (cache && cache.jobs?.length) {
-        if (cache.keyword) setKeyword(cache.keyword);
-        setSampleNote(cache.sampleNote);
-        setFetchedAt(cache.fetchedAt);
-        setSearched(true);
-        const scored = toBatchItems(cache.jobs, prof);
-        setItemsSynced(scored);
-        autoSelect(scored[0]?.job.id ?? null);
-        void revalidateJobs(prof, cache.fetchedAt ?? null, cache.keyword || "");
+      if (cachedList) {
+        // Only redo the list if the server's profile really differs.
+        if (getProfileAnalysisSignature(prof) !== getProfileAnalysisSignature(localProfile)) {
+          restoreCachedList(cachedList, prof);
+        }
+        void checkForNewJobs();
       } else if (loadJSON<number | null>(JOB_LISTINGS_CLEARED_KEY, null)) {
         setSearched(true);
         setListingsCleared(true);
@@ -525,6 +599,7 @@ export default function Home() {
 
     setLoadingKind(linkedinMode ? "linkedin" : forceRefresh ? "refresh" : "load");
     setSearching(true);
+    setPendingList(null);
     setSearched(true);
     setSelectedId(null);
     setItemsSynced([]);
@@ -623,14 +698,21 @@ export default function Home() {
     if (!cached) removeJSON(cacheKey);
   }
 
-  // The browser's copy is shown instantly on load, but it can be old, or the
-  // server may have saved a newer list since. Quietly ask the server and swap
-  // its list in only when it is newer. A search the user starts meanwhile wins.
-  async function revalidateJobs(prof: Profile, cachedAt: number | null, cachedKeyword: string) {
+  // The list on screen is the browser's saved copy, or the last one fetched. On
+  // load, and when the tab is shown again, quietly ask the server whether it has
+  // saved a newer list with jobs that are not on screen yet. If so the Refresh
+  // button gets an "N new" badge. The list itself is never swapped under the user.
+  async function checkForNewJobs() {
+    const now = Date.now();
+    if (now - lastNewJobsCheckRef.current < 30_000) return;
+    lastNewJobsCheckRef.current = now;
+    const live = liveRef.current;
+    if (live.linkedinOnly || live.searching || itemsRef.current.length === 0) return;
+
     const startId = jobsRequestIdRef.current;
     try {
       const params = new URLSearchParams();
-      if (cachedKeyword) params.set("keyword", cachedKeyword);
+      if (live.keyword) params.set("keyword", live.keyword);
       const query = params.toString();
       const r = await fetch(`/api/jobs${query ? `?${query}` : ""}`);
       const data = (await r.json().catch(() => null)) as JobsResponse | null;
@@ -640,27 +722,65 @@ export default function Home() {
         typeof data.providerSyncedAt === "number" && Number.isFinite(data.providerSyncedAt)
           ? data.providerSyncedAt
           : null;
-      if (serverAt === null || (cachedAt !== null && serverAt <= cachedAt)) return;
+      if (serverAt === null) return;
+      if (live.fetchedAt !== null && serverAt <= live.fetchedAt) return;
+      if (live.pendingSyncedAt !== null && serverAt <= live.pendingSyncedAt) return;
 
-      const scored = toBatchItems(data.jobs, prof);
-      setItemsSynced(scored);
-      setSelectedId((current) =>
-        current && scored.some((item) => item.job.id === current)
-          ? current
-          : scored[0]?.job.id ?? null
-      );
-      setFetchedAt(serverAt);
-      setSampleNote(data.note || null);
-      const saved = saveJSON(JOBS_CACHE_KEY, {
-        jobs: data.jobs,
-        fetchedAt: serverAt,
-        keyword: cachedKeyword,
-        sampleNote: data.note || null,
-      });
-      if (!saved) removeJSON(JOBS_CACHE_KEY);
+      const shownIds = new Set(itemsRef.current.map((item) => item.job.id));
+      const newCount = data.jobs.filter((job) => !shownIds.has(job.id)).length;
+      if (!newCount) return;
+
+      // Score the new list first, so showing it later does not reorder anything.
+      const scores = await fetchRecommendations(live.profileKey);
+      if (jobsRequestIdRef.current !== startId) return;
+      if (scores) {
+        setRecs({ key: live.profileKey, map: scores });
+        saveJSON(JOB_SCORES_CACHE_KEY, { profileHash: hashString(live.profileKey), scores });
+      }
+      setPendingList({ jobs: data.jobs, syncedAt: serverAt, note: data.note || null, newCount });
     } catch {
-      // Offline or the server is busy: keep showing the browser copy.
+      // Offline or the server is busy: keep showing what is on screen.
     }
+  }
+
+  // Pressing Refresh while it carries an "N new" badge shows the newer saved
+  // list at once, with no sync to wait for. Pressing Refresh again then runs a
+  // real sync of the career sites.
+  function applyPendingList() {
+    const pending = pendingList;
+    if (!pending) return;
+    const scores = recs.key === profileKey ? recs.map : {};
+    const scored = toBatchItems(pending.jobs, profile);
+    const ranked = rankBatchItems(
+      scored,
+      profile,
+      new Map(
+        scored.map(
+          (item) =>
+            [
+              item.job.id,
+              needsFreeDescription(item.job)
+                ? (scores[item.job.id] ?? { score: 0, recommended: false })
+                : getJobRecommendation(profile, item.job),
+            ] as const
+        )
+      )
+    );
+    setItemsSynced(ranked);
+    if (!(selectedId && ranked.some((item) => item.job.id === selectedId))) {
+      autoSelect(ranked[0]?.job.id ?? null);
+    }
+    setPage(1);
+    setFetchedAt(pending.syncedAt);
+    setSampleNote(pending.note);
+    const saved = saveJSON(JOBS_CACHE_KEY, {
+      jobs: pending.jobs,
+      fetchedAt: pending.syncedAt,
+      keyword,
+      sampleNote: pending.note,
+    });
+    if (!saved) removeJSON(JOBS_CACHE_KEY);
+    setPendingList(null);
   }
 
   function toggleLinkedInJobs() {
@@ -1032,53 +1152,86 @@ export default function Home() {
   // Listings come without descriptions, and the Recommended score reads them,
   // so for those jobs the server scores them (same function) and sends back
   // only the small result. A job whose text is already loaded is scored here.
-  const [serverRecommendations, setServerRecommendations] = useState<
-    Record<string, { score: number; recommended: boolean }>
-  >({});
+  // `recs.key` is the profile the scores were worked out for; scores for another
+  // profile are ignored. Until they are known the list shows loaders instead of
+  // a provisional order, so nothing jumps when they arrive.
+  const [recs, setRecs] = useState<{ key: string; map: Record<string, JobScore> }>({
+    key: "",
+    map: {},
+  });
+  const [recsSettled, setRecsSettled] = useState(false);
+  const [pendingList, setPendingList] = useState<{
+    jobs: Job[];
+    syncedAt: number;
+    note: string | null;
+    newCount: number;
+  } | null>(null);
   const listKey = useMemo(() => items.map((item) => item.job.id).join("|"), [items]);
   const hasLiteJobs = items.some((item) => needsFreeDescription(item.job));
   const profileKey = useMemo(() => JSON.stringify({ ...profile, photo: "" }), [profile]);
+  const scoresCoverList = useMemo(
+    () =>
+      recs.key === profileKey &&
+      items.every((item) => !needsFreeDescription(item.job) || recs.map[item.job.id] !== undefined),
+    [items, recs, profileKey]
+  );
+  const scoringPending = hasLiteJobs && !scoresCoverList && !recsSettled;
+  liveRef.current = {
+    fetchedAt,
+    keyword,
+    linkedinOnly,
+    searching,
+    profileKey,
+    pendingSyncedAt: pendingList ? pendingList.syncedAt : null,
+  };
+
   useEffect(() => {
     if (!hasLiteJobs) return;
-    // Not an AbortController on purpose: cancelling an in-flight fetch makes it
-    // reject with an AbortError, and in development (or with a browser
-    // extension that wraps fetch) that surfaced as an "Unhandled Runtime
-    // Error" on first load. A stale request just finishes and is ignored.
+    if (scoresCoverList) {
+      setRecsSettled(true);
+      return;
+    }
+    setRecsSettled(false);
     let cancelled = false;
     const timer = setTimeout(async () => {
-      try {
-        const response = await fetch("/api/jobs/recommendations", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ profile: JSON.parse(profileKey) }),
-        });
-        const data = await response.json().catch(() => null);
-        if (!cancelled && response.ok && data?.recommendations) {
-          setServerRecommendations(data.recommendations);
-        }
-      } catch {
-        // Offline: the marker simply stays off until the next try.
+      const scores = await fetchRecommendations(profileKey);
+      if (cancelled) return;
+      if (scores) {
+        setRecs({ key: profileKey, map: scores });
+        saveJSON(JOB_SCORES_CACHE_KEY, { profileHash: hashString(profileKey), scores });
       }
+      // Settle even if the request failed, so the list shows (unscored) instead
+      // of loading forever.
+      setRecsSettled(true);
     }, 250);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasLiteJobs, listKey, profileKey]);
+
+  // When the tab is shown again, look for a newer list.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void checkForNewJobs();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const recommendations = useMemo(() => {
     return new Map(
       items.map((item) => {
         if (needsFreeDescription(item.job)) {
-          return [
-            item.job.id,
-            serverRecommendations[item.job.id] ?? { score: 0, recommended: false },
-          ] as const;
+          const known = recs.key === profileKey ? recs.map[item.job.id] : undefined;
+          return [item.job.id, known ?? { score: 0, recommended: false }] as const;
         }
         return [item.job.id, getJobRecommendation(profile, item.job)] as const;
       })
     );
-  }, [items, profile, serverRecommendations]);
+  }, [items, profile, recs, profileKey]);
 
   const filteredItems = useMemo(() => {
     const filtered = items.filter((item) => {
@@ -1107,7 +1260,7 @@ export default function Home() {
       setSelectedId(top);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverRecommendations]);
+  }, [recs]);
 
   useEffect(() => {
     if (!recommendedOnly) return;
@@ -1374,13 +1527,25 @@ export default function Home() {
 
           <button
             type="button"
-            onClick={() => runSearch(profile, linkedinOnly, true)}
+            onClick={() => (pendingList ? applyPendingList() : runSearch(profile, linkedinOnly, true))}
             disabled={searching}
-            className="inline-flex h-11 shrink-0 items-center gap-2 rounded-lg border border-line bg-ink px-3.5 text-sm text-soft transition hover:border-beacon/60 hover:text-beacon disabled:opacity-50"
-            title="Refresh listings"
+            className="relative inline-flex h-11 shrink-0 items-center gap-2 rounded-lg border border-line bg-ink px-3.5 text-sm text-soft transition hover:border-beacon/60 hover:text-beacon disabled:opacity-50"
+            title={
+              pendingList
+                ? `${pendingList.newCount} new ${pendingList.newCount === 1 ? "job" : "jobs"} found — click to show ${pendingList.newCount === 1 ? "it" : "them"}`
+                : "Refresh listings"
+            }
           >
             <RefreshIcon />
             <span className="hidden xl:inline">Refresh</span>
+            {pendingList && (
+              <span
+                data-testid="new-jobs-badge"
+                className="absolute -right-2 -top-2 rounded-full bg-beacon px-1.5 py-0.5 font-mono text-[10px] font-semibold leading-none text-ink"
+              >
+                {pendingList.newCount} new
+              </span>
+            )}
           </button>
         </div>
       </section>
@@ -1391,7 +1556,7 @@ export default function Home() {
         <div className="space-y-3">
           {!searched && <ListHint />}
 
-          {searched && !searching && filteredItems.length === 0 && (
+          {searched && !searching && !scoringPending && filteredItems.length === 0 && (
             <div className="rounded-xl border border-line bg-surface p-6 text-soft">
               {items.length === 0
                 ? listingsCleared
@@ -1404,9 +1569,10 @@ export default function Home() {
                   : "No vacancies match the current filters."}
             </div>
           )}
-          {searching &&
-            [0, 1, 2].map((i) => <JobSkeleton key={i} />)}
+          {(searching || scoringPending) &&
+            [0, 1, 2, 3, 4].map((i) => <JobSkeleton key={i} />)}
           {!searching &&
+            !scoringPending &&
             pageItems.map((item) => (
               <JobCard
                 key={item.job.id}
@@ -1421,7 +1587,7 @@ export default function Home() {
               />
             ))}
 
-          {!searching && filteredItems.length > 0 && (
+          {!searching && !scoringPending && filteredItems.length > 0 && (
             <Pagination
               page={currentPage}
               totalPages={totalPages}

@@ -36,6 +36,9 @@ const SYNCED_KEY = "synced_";
 // wrong place or title). Remembered so they are not downloaded again on every
 // refresh; kept in the saved snapshot so it survives a restart.
 const REJECTED_KEY = "rej_";
+// How long each source took, kept in the snapshot so the slowest-first order
+// survives a server restart (on Vercel every cold start would forget it).
+const DURATION_KEY = "dur_";
 const REJECTED_TTL_MS = 7 * 86_400_000;
 const MAX_REMEMBERED_REJECTIONS = 1_500;
 const SOURCE_CONCURRENCY = 16;
@@ -202,6 +205,7 @@ function snapshotMetadata(now: number, failedCount: number, fetchedCount: number
     failedSearches: failedCount,
     fetchedJobsCount: fetchedCount,
     ...Object.fromEntries([...sourceSyncedAt].map(([id, at]) => [SYNCED_KEY + id, at])),
+    ...Object.fromEntries([...sourceDurationMs].map(([id, ms]) => [DURATION_KEY + id, ms])),
     ...Object.fromEntries(
       [...rejectedAt]
         .filter(([, at]) => now - at < REJECTED_TTL_MS)
@@ -348,6 +352,7 @@ function adoptSnapshot(snapshot: { jobs: Job[]; savedAt: number; metadata?: Reco
   for (const [key, value] of Object.entries(snapshot.metadata || {})) {
     if (typeof value !== "number") continue;
     if (key.startsWith(SYNCED_KEY)) sourceSyncedAt.set(key.slice(SYNCED_KEY.length), value);
+    else if (key.startsWith(DURATION_KEY)) sourceDurationMs.set(key.slice(DURATION_KEY.length), value);
     else if (key.startsWith(REJECTED_KEY)) rejectedAt.set(key.slice(REJECTED_KEY.length), value);
   }
 }
