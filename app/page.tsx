@@ -1040,24 +1040,29 @@ export default function Home() {
   const profileKey = useMemo(() => JSON.stringify({ ...profile, photo: "" }), [profile]);
   useEffect(() => {
     if (!hasLiteJobs) return;
-    const controller = new AbortController();
+    // Not an AbortController on purpose: cancelling an in-flight fetch makes it
+    // reject with an AbortError, and in development (or with a browser
+    // extension that wraps fetch) that surfaced as an "Unhandled Runtime
+    // Error" on first load. A stale request just finishes and is ignored.
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         const response = await fetch("/api/jobs/recommendations", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ profile: JSON.parse(profileKey) }),
-          signal: controller.signal,
         });
         const data = await response.json().catch(() => null);
-        if (response.ok && data?.recommendations) setServerRecommendations(data.recommendations);
+        if (!cancelled && response.ok && data?.recommendations) {
+          setServerRecommendations(data.recommendations);
+        }
       } catch {
-        // Offline or cancelled: the marker simply stays off until the next try.
+        // Offline: the marker simply stays off until the next try.
       }
     }, 250);
     return () => {
+      cancelled = true;
       clearTimeout(timer);
-      controller.abort();
     };
   }, [hasLiteJobs, listKey, profileKey]);
 
