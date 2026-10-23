@@ -35,8 +35,15 @@ export interface JobCandidate {
   locationUnknown?: boolean;
 }
 
+/**
+ * What an adapter's list() returns. `incomplete` is set when a paging limit
+ * stopped it while the site still had more jobs, so the sync does not mistake
+ * the jobs it never read for closed ones.
+ */
+export type CandidateList = JobCandidate[] & { incomplete?: boolean };
+
 export interface FreeJobAdapter {
-  list(source: FreeJobSource, signal: AbortSignal): Promise<JobCandidate[]>;
+  list(source: FreeJobSource, signal: AbortSignal): Promise<CandidateList>;
   /** Only needed when `list` does not return descriptions. */
   hydrate?(
     source: FreeJobSource,

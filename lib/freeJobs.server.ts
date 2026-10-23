@@ -55,6 +55,8 @@ export interface FreeJobsResult {
   failedSources: string[];
   /** Sites still working when the refresh answered; they join the list when done. */
   lateSources: string[];
+  /** Sites with more jobs than we read; their older listings were kept. */
+  incompleteSources: string[];
   fetchedJobsCount?: number;
   newJobsCount?: number;
   syncedAt: number | null;
@@ -106,12 +108,20 @@ async function syncSource(
   source: FreeJobSource,
   signal: AbortSignal,
   previousById: Map<string, Job>
-): Promise<{ source: FreeJobSource; jobs: Job[]; ok: boolean; seen: number; ms: number }> {
+): Promise<{
+  source: FreeJobSource;
+  jobs: Job[];
+  ok: boolean;
+  seen: number;
+  ms: number;
+  incomplete: boolean;
+}> {
   const startedAt = Date.now();
   try {
     signal.throwIfAborted();
     const adapter = ADAPTERS[source.adapter];
     const candidates = await adapter.list(source, signal);
+    const incomplete = candidates.incomplete === true;
     const matching = candidates.filter((candidate) =>
       passesListCriteria(candidate, { skipLocation: candidate.locationUnknown })
     );
@@ -180,12 +190,12 @@ async function syncSource(
       }
     }
     console.info(
-      `free jobs: ${source.id} seen=${candidates.length} matched=${matching.length} kept=${jobs.length} reused=${reused} skipped=${skipped} ms=${Date.now() - startedAt}`
+      `free jobs: ${source.id} seen=${candidates.length} matched=${matching.length} kept=${jobs.length} reused=${reused} skipped=${skipped} incomplete=${incomplete} ms=${Date.now() - startedAt}`
     );
-    return { source, jobs, ok: true, seen: candidates.length, ms: Date.now() - startedAt };
+    return { source, jobs, ok: true, seen: candidates.length, ms: Date.now() - startedAt, incomplete };
   } catch (error) {
     console.error(`free jobs: ${source.id} failed`, error instanceof Error ? error.message : error);
-    return { source, jobs: [], ok: false, seen: 0, ms: Date.now() - startedAt };
+    return { source, jobs: [], ok: false, seen: 0, ms: Date.now() - startedAt, incomplete: false };
   }
 }
 
@@ -225,7 +235,10 @@ async function applyLateResult(result: SourceResult, syncStartedAt: number): Pro
   sourceDurationMs.set(result.source.id, result.ms);
   const prefix = jobIdPrefix(result.source);
   const byId = new Map<string, Job>();
-  for (const job of [...result.jobs, ...memory.jobs.filter((job) => !job.id.startsWith(prefix))]) {
+  const unreadJobs = result.incomplete
+    ? memory.jobs.filter((job) => job.id.startsWith(prefix) && passesListCriteria(job))
+    : [];
+  for (const job of [...result.jobs, ...unreadJobs, ...memory.jobs.filter((job) => !job.id.startsWith(prefix))]) {
     if (!byId.has(job.id)) byId.set(job.id, job);
   }
   const jobs = sortJobsByEmployerPriority([...byId.values()]);
@@ -316,9 +329,18 @@ async function runLiveSync(
       FREE_JOB_SOURCES.some((source) => notUpdatedIds.has(source.id) && job.id.startsWith(jobIdPrefix(source))) &&
       passesListCriteria(job)
   );
+  // A site that stopped at its page limit did not show us every job. The ones we
+  // never read are not closed, so its older listings stay next to what we read.
+  const incompleteResults = succeeded.filter((result) => result.incomplete);
+  const incompleteIds = new Set(incompleteResults.map((result) => result.source.id));
+  const keptFromIncomplete = previous.filter(
+    (job) =>
+      FREE_JOB_SOURCES.some((source) => incompleteIds.has(source.id) && job.id.startsWith(jobIdPrefix(source))) &&
+      passesListCriteria(job)
+  );
   const fresh = succeeded.flatMap((result) => result.jobs);
   const byId = new Map<string, Job>();
-  for (const job of [...fresh, ...kept]) if (!byId.has(job.id)) byId.set(job.id, job);
+  for (const job of [...fresh, ...kept, ...keptFromIncomplete]) if (!byId.has(job.id)) byId.set(job.id, job);
   const jobs = sortJobsByEmployerPriority([...byId.values()]);
 
   const previousIds = new Set(previous.map((job) => job.id));
@@ -342,6 +364,7 @@ async function runLiveSync(
     failedSearches: failedSources.length,
     failedSources,
     lateSources,
+    incompleteSources: incompleteResults.map((result) => result.source.employer),
     fetchedJobsCount: succeeded.reduce((total, result) => total + result.seen, 0),
     newJobsCount,
     syncedAt: now,
@@ -416,6 +439,7 @@ async function load(forceRefresh: boolean): Promise<FreeJobsResult> {
     failedSearches: 0,
     failedSources: [],
     lateSources: [],
+    incompleteSources: [],
     syncedAt: snapshot?.savedAt ?? null,
     nextSyncAt: lastAttemptAt ? lastAttemptAt + MANUAL_REFRESH_COOLDOWN_MS : null,
     syncMode,
