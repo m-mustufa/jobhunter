@@ -3,7 +3,20 @@ import "server-only";
 import { isRecent, MAX_JOB_AGE_DAYS } from "./criteria";
 import { load } from "cheerio";
 import { fetchJson, fetchText, htmlToText, mapWithConcurrency } from "./http";
-import type { FreeJobAdapter, FreeJobSource, JobCandidate } from "./types";
+import type { CandidateList, FreeJobAdapter, FreeJobSource, JobCandidate } from "./types";
+
+// Every adapter stops at a page limit as a safety net. These two can be raised
+// (or lowered, to test) without a code change.
+function envInt(name: string, fallback: number): number {
+  const value = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+const WORKDAY_MAX_ROWS = envInt("FREE_JOBS_WORKDAY_MAX_ROWS", 200);
+const ORACLE_MAX_ROWS = envInt("FREE_JOBS_ORACLE_MAX_ROWS", 300);
+
+function withCompleteness(candidates: JobCandidate[], complete: boolean): CandidateList {
+  return Object.assign(candidates, { incomplete: !complete });
+}
 
 type Source<A extends FreeJobSource["adapter"]> = Extract<FreeJobSource, { adapter: A }>;
 
@@ -92,6 +105,7 @@ const smartrecruiters: FreeJobAdapter = {
   async list(source, signal) {
     const { companyId } = source as Source<"smartrecruiters">;
     const candidates: JobCandidate[] = [];
+    let complete = false;
     for (let offset = 0; offset < 500; offset += 100) {
       const page = await fetchJson<{ content?: any[]; totalFound?: number }>(
         `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(companyId)}/postings?limit=100&offset=${offset}&country=ae`,
@@ -108,9 +122,12 @@ const smartrecruiters: FreeJobAdapter = {
           postedAt: toIso(job.releasedDate),
         });
       }
-      if (!page.content?.length || offset + 100 >= (page.totalFound || 0)) break;
+      if (!page.content?.length || offset + 100 >= (page.totalFound || 0)) {
+        complete = true;
+        break;
+      }
     }
-    return candidates;
+    return withCompleteness(candidates, complete);
   },
   async hydrate(source, candidate, signal) {
     const { companyId } = source as Source<"smartrecruiters">;
@@ -172,7 +189,8 @@ const workday: FreeJobAdapter = {
     addPage(first);
     const total = first.total || 0;
     const offsets: number[] = [];
-    for (let offset = 20; offset < Math.min(total, 200); offset += 20) offsets.push(offset);
+    const rowCap = WORKDAY_MAX_ROWS;
+    for (let offset = 20; offset < Math.min(total, rowCap); offset += 20) offsets.push(offset);
     if (offsets.length) {
       const { results, failed } = await mapWithConcurrency(offsets, 5, async (offset) => ({
         offset,
@@ -183,7 +201,8 @@ const workday: FreeJobAdapter = {
       if (failed) throw new Error("some Workday pages could not be read");
       results.sort((a, b) => a.offset - b.offset).forEach(({ page }) => addPage(page));
     }
-    return candidates;
+    // More jobs than the cap means the rest were never read.
+    return withCompleteness(candidates, total <= rowCap);
   },
   async hydrate(source, candidate, signal) {
     const { host, tenant, site } = source as Source<"workday">;
@@ -207,7 +226,8 @@ const oracle: FreeJobAdapter = {
   async list(source, signal) {
     const { host, site, keyword } = source as Source<"oracle">;
     const candidates: JobCandidate[] = [];
-    for (let offset = 0; offset < 300; offset += ORACLE_PAGE_SIZE) {
+    let complete = false;
+    for (let offset = 0; offset < ORACLE_MAX_ROWS; offset += ORACLE_PAGE_SIZE) {
       const finder = `findReqs;siteNumber=${site},limit=${ORACLE_PAGE_SIZE},offset=${offset}${keyword ? `,keyword=${encodeURIComponent(keyword)}` : ""},sortBy=POSTING_DATES_DESC`;
       const page = await fetchJson<{ items?: any[] }>(
         `https://${host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList.secondaryLocations&finder=${finder}`,
@@ -224,13 +244,19 @@ const oracle: FreeJobAdapter = {
           postedAt: toIso(job.PostedDate),
         });
       }
-      if (list.length < ORACLE_PAGE_SIZE || offset + ORACLE_PAGE_SIZE >= (root?.TotalJobsCount || 0)) break;
+      if (list.length < ORACLE_PAGE_SIZE || offset + ORACLE_PAGE_SIZE >= (root?.TotalJobsCount || 0)) {
+        complete = true;
+        break;
+      }
       // Newest-first: once a page ends outside the age window, later pages
       // can only be older still.
       const last = candidates[candidates.length - 1];
-      if (!isRecent(last?.postedAt ?? null)) break;
+      if (!isRecent(last?.postedAt ?? null)) {
+        complete = true; // everything older is outside the window on purpose
+        break;
+      }
     }
-    return candidates;
+    return withCompleteness(candidates, complete);
   },
   async hydrate(source, candidate, signal) {
     const { host, site } = source as Source<"oracle">;
@@ -284,6 +310,7 @@ const phenom: FreeJobAdapter = {
   async list(source, signal) {
     const { host, locale } = source as Source<"phenom">;
     const candidates: JobCandidate[] = [];
+    let complete = false;
     for (let from = 0; from < 500; from += 100) {
       const data = await fetchJson<any>(`https://${host}/widgets`, signal, {
         method: "POST",
@@ -299,9 +326,12 @@ const phenom: FreeJobAdapter = {
           postedAt: toIso(job.postedDate),
         });
       }
-      if (jobs.length < 100 || from + 100 >= (data?.refineSearch?.totalHits || 0)) break;
+      if (jobs.length < 100 || from + 100 >= (data?.refineSearch?.totalHits || 0)) {
+        complete = true;
+        break;
+      }
     }
-    return candidates;
+    return withCompleteness(candidates, complete);
   },
   async hydrate(_source, candidate, signal) {
     const posting = findJobPosting(await fetchText(candidate.applyLink, signal));
@@ -318,6 +348,7 @@ const workable: FreeJobAdapter = {
     const { account } = source as Source<"workable">;
     const candidates: JobCandidate[] = [];
     let token: string | undefined;
+    let complete = false;
     for (let page = 0; page < 5; page += 1) {
       const data = await fetchJson<any>(
         `https://apply.workable.com/api/v3/accounts/${encodeURIComponent(account)}/jobs`,
@@ -337,9 +368,12 @@ const workable: FreeJobAdapter = {
         });
       }
       token = data.nextPage;
-      if (!token) break;
+      if (!token) {
+        complete = true;
+        break;
+      }
     }
-    return candidates;
+    return withCompleteness(candidates, complete);
   },
   async hydrate(source, candidate, signal) {
     const { account } = source as Source<"workable">;
@@ -361,6 +395,7 @@ const eightfold: FreeJobAdapter = {
     const { host, domain, query } = source as Source<"eightfold">;
     const candidates: JobCandidate[] = [];
     let total = 0;
+    let complete = false;
     for (let start = 0; start < 200; start += 10) {
       const params = new URLSearchParams({
         domain,
@@ -384,11 +419,17 @@ const eightfold: FreeJobAdapter = {
           postedAt: toIso(job.postedTs ? Number(job.postedTs) * 1000 : null),
         });
       }
-      if (!positions.length || start + 10 >= total) break;
+      if (!positions.length || start + 10 >= total) {
+        complete = true;
+        break;
+      }
       // Newest-first: stop once a page ends outside the age window.
-      if (!isRecent(candidates[candidates.length - 1]?.postedAt ?? null)) break;
+      if (!isRecent(candidates[candidates.length - 1]?.postedAt ?? null)) {
+        complete = true;
+        break;
+      }
     }
-    return candidates;
+    return withCompleteness(candidates, complete);
   },
   async hydrate(source, candidate, signal) {
     const { host, domain } = source as Source<"eightfold">;
