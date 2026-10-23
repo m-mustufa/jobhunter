@@ -28,6 +28,12 @@ export interface Job {
   // a job is opened). A short hash of the full text, so the app can still tell
   // whether a posting changed.
   descriptionHash?: string;
+  // Free career-site listings only. When the sync first saw this posting (ms).
+  firstSeenAt?: number;
+  // How many complete syncs in a row no longer listed this posting, and when
+  // the last one was. It is removed once that reaches the limit, not on the first miss.
+  missedSyncs?: number;
+  lastMissedAt?: number;
 }
 
 export interface JobsResponse {
