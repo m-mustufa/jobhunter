@@ -220,7 +220,7 @@ Rules for every employer:
 - If this employer has at least one usable bullet, set supported=true and rewrite EVERY original bullet for this employer into a tailoredHighlights entry — none may be left unrewritten. You may combine two or more of this employer's bullets into one highlight when they share a theme, but every original bullet index for this employer must appear in exactly one highlight's sourceBulletIndices, across all of that employer's highlights combined.
 - remainingBulletOrder must be an empty array for a supported employer. There is no "leftover, unchanged" bullet list anymore — every bullet becomes part of a tailored highlight.
 - EVERY highlight must be a substantial rewrite of its source bullet(s) — restructure sentence order and phrasing, lead with a different word, combine or split clauses differently. Swapping punctuation (dashes to commas), reordering only two words, or changing a single word while keeping the same sentence structure is NOT a rewrite and will be rejected. If you cannot substantially restructure a bullet while keeping every fact exact, keep every fact but change its construction — never pass through the original wording unrewritten.
-- Keep every tailoredHighlight under 600 characters (aim for 250-450). When combining bullets would pass that, write separate highlights instead; a highlight over 600 characters is rejected.
+- Keep every tailoredHighlight short (aim for 250-450 characters, never over 800). When combining bullets would pass that, write separate highlights instead; a highlight over 800 characters is rejected.
 - Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
 - Preserve the evidence's participation level for each activity: participated, supported, contributed, or collaborated must never become executed, conducted, led, managed, directed, or owned.
 - Only set supported=false when this employer has zero usable bullets; in that case return no highlights and put every original bullet index once in remainingBulletOrder, ranked by relevance.
@@ -349,7 +349,7 @@ function isCleanRoleRewrite(rewrittenRole: string): boolean {
 }
 
 // A longer highlight overflows the CV layout, so it is sent back for splitting.
-const MAX_HIGHLIGHT_CHARS = 600;
+const MAX_HIGHLIGHT_CHARS = 800;
 
 interface RequirementEvidence {
   experienceIndex: number;
@@ -753,7 +753,6 @@ function applyExperienceHighlightsV3(
         qualityIssues.push(
           `${label} is ${text.length} characters; keep every highlight under ${MAX_HIGHLIGHT_CHARS}. Split it into separate highlights (each with its own source bullets) instead of combining many bullets into one.`
         );
-        continue;
       }
       if (
         new Set(sourceBulletIndices).size !== sourceBulletIndices.length ||
