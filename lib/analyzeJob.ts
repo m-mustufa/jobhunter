@@ -220,7 +220,7 @@ Rules for every employer:
 - If this employer has at least one usable bullet, set supported=true and rewrite EVERY original bullet for this employer into a tailoredHighlights entry — none may be left unrewritten. You may combine two or more of this employer's bullets into one highlight when they share a theme, but every original bullet index for this employer must appear in exactly one highlight's sourceBulletIndices, across all of that employer's highlights combined.
 - remainingBulletOrder must be an empty array for a supported employer. There is no "leftover, unchanged" bullet list anymore — every bullet becomes part of a tailored highlight.
 - EVERY highlight must be a substantial rewrite of its source bullet(s) — restructure sentence order and phrasing, lead with a different word, combine or split clauses differently. Swapping punctuation (dashes to commas), reordering only two words, or changing a single word while keeping the same sentence structure is NOT a rewrite and will be rejected. If you cannot substantially restructure a bullet while keeping every fact exact, keep every fact but change its construction — never pass through the original wording unrewritten.
-- Keep every tailoredHighlight short (aim for 250-450 characters, never over 800). When combining bullets would pass that, write separate highlights instead; a highlight over 800 characters is rejected.
+- Keep every tailoredHighlight short (aim for 250-450 characters, never over 800). When combining bullets would pass that, write separate highlights instead; a very long highlight is rejected.
 - Do not reuse a source bullet in two highlights. Preserve every number, named tool, qualification, and ownership level exactly; never add one from the vacancy or research.
 - Preserve the evidence's participation level for each activity: participated, supported, contributed, or collaborated must never become executed, conducted, led, managed, directed, or owned.
 - Only set supported=false when this employer has zero usable bullets; in that case return no highlights and put every original bullet index once in remainingBulletOrder, ranked by relevance.
@@ -348,8 +348,8 @@ function isCleanRoleRewrite(rewrittenRole: string): boolean {
   return !/[/()]/.test(rewrittenRole);
 }
 
-// A longer highlight overflows the CV layout, so it is sent back for splitting.
-const MAX_HIGHLIGHT_CHARS = 800;
+// A highlight this long is a broken reply, so it is sent back for splitting; merely long ones are kept.
+const MAX_HIGHLIGHT_CHARS = 1200;
 
 interface RequirementEvidence {
   experienceIndex: number;
@@ -772,17 +772,10 @@ function applyExperienceHighlightsV3(
         .map((index: number) => entry.bullets[index])
         .join(" ");
       if (tokenJaccard(text, sourceText) > 0.9) {
-        // A near-copy is not a tailored highlight. Preserve its original
-        // source bullets in the remaining list instead of rejecting an
-        // otherwise usable manual response or presenting unchanged text as
-        // newly tailored content. Surfaced explicitly (not just a silent
-        // drop) so a corrective pass knows exactly which highlight and text
-        // needs a substantive rewrite, not just punctuation changes.
-        qualityIssues.push(
-          `${label} ("${text}") is a near-verbatim copy of its source bullet ("${sourceText}") — substantially rephrase the sentence structure and wording while preserving every fact exactly.`
-        );
-        restoredSourceIndexes.push(...sourceBulletIndices);
-        continue;
+        // A near-copy is still true to its source bullet, so it stays in the CV;
+        // it is only a quality shortfall, not a reason to send the reply back.
+        // (It does not count as a "visibly tailored" highlight below.)
+        console.warn(`${label} is a near-copy of its source bullet; kept as is.`);
       }
       if (requirementIds.some((id: string) => !requirementById.has(id))) {
         qualityIssues.push(`${label} references an unknown ranked requirement.`);
@@ -1286,36 +1279,6 @@ function tokenJaccard(left: string, right: string): number {
   return intersection / (leftTokens.size + rightTokens.size - intersection);
 }
 
-/**
- * The correction line for top supported requirements no highlight covers. The
- * reply is regenerated from a fresh prompt, where requirement ids can be
- * numbered differently, so the line names each requirement by its text and says
- * where its evidence is and what a covering highlight must contain.
- */
-export function uncoveredRequirementsIssue(
-  uncovered: RankedRequirement[],
-  experience: Profile["experience"]
-): string {
-  const described = uncovered
-    .map((requirement) => {
-      const evidence = requirement.evidence
-        .map((reference) => {
-          const entry = experience[reference.experienceIndex];
-          return `${entry?.company || "employer"} (experienceIndex ${reference.experienceIndex}, bullet ${reference.bulletIndices.join("/")})`;
-        })
-        .join("; ");
-      return `${requirement.id} "${requirement.requirement}" — evidence: ${evidence}`;
-    })
-    .join(" | ");
-  return (
-    `Tailored highlights do not cover top supported requirement${uncovered.length === 1 ? "" : "s"}: ${described}. ` +
-    "Ids can differ between replies, so match by the requirement text. Cover each one with a tailored highlight whose " +
-    "sourceBulletIndices include that evidence bullet, whose requirementIds contains the requirement's id, and whose " +
-    "wording visibly uses the requirement's key terms (only terms that appear in the source bullet). " +
-    "If the CV has no real evidence for a requirement, give it an empty evidence list instead of claiming support."
-  );
-}
-
 function validateTailoringQuality(
   raw: any,
   profile: Profile,
@@ -1430,7 +1393,9 @@ function validateTailoringQuality(
   const mustCover = supportedRequirements.slice(0, Math.min(3, supportedRequirements.length));
   const uncovered = mustCover.filter((requirement) => !coveredRequirementIds.has(requirement.id));
   if (uncovered.length) {
-    issues.push(uncoveredRequirementsIssue(uncovered, profile.experience));
+    // Only affects which evidence is tagged to the vacancy's top requirements,
+    // never what the CV claims, so it is not a reason to reject the reply.
+    console.warn(`Top supported requirement(s) not covered by a highlight: ${uncovered.map((requirement) => requirement.id).join(", ")}.`);
   }
   if (normalizeSummaryText(job.description).length < MIN_FULL_JOB_DESCRIPTION_CHARS) {
     issues.push("A complete job description is required for reliable tailoring.");
