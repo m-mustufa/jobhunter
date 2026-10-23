@@ -13,6 +13,7 @@ import { ADAPTERS } from "@/lib/freeJobs/adapters";
 import { MIN_DESCRIPTION_CHARS, passesListCriteria } from "@/lib/freeJobs/criteria";
 import { mapWithConcurrency } from "@/lib/freeJobs/http";
 import { FREE_JOB_SOURCES } from "@/lib/freeJobs/sources";
+import { reconcileSource } from "@/lib/freeJobs/reconcile";
 import type { FreeJobSource, JobCandidate } from "@/lib/freeJobs/types";
 
 // These sources cost nothing, so the only limits are politeness and time:
@@ -115,6 +116,8 @@ async function syncSource(
   seen: number;
   ms: number;
   incomplete: boolean;
+  /** Ids of every posting the site listed, whether or not it passed our filters. */
+  listedIds: Set<string>;
 }> {
   const startedAt = Date.now();
   try {
@@ -192,10 +195,19 @@ async function syncSource(
     console.info(
       `free jobs: ${source.id} seen=${candidates.length} matched=${matching.length} kept=${jobs.length} reused=${reused} skipped=${skipped} incomplete=${incomplete} ms=${Date.now() - startedAt}`
     );
-    return { source, jobs, ok: true, seen: candidates.length, ms: Date.now() - startedAt, incomplete };
+    const listedIds = new Set(candidates.map((candidate) => jobIdFor(source, candidate.externalId)));
+    return { source, jobs, ok: true, seen: candidates.length, ms: Date.now() - startedAt, incomplete, listedIds };
   } catch (error) {
     console.error(`free jobs: ${source.id} failed`, error instanceof Error ? error.message : error);
-    return { source, jobs: [], ok: false, seen: 0, ms: Date.now() - startedAt, incomplete: false };
+    return {
+      source,
+      jobs: [],
+      ok: false,
+      seen: 0,
+      ms: Date.now() - startedAt,
+      incomplete: false,
+      listedIds: new Set<string>(),
+    };
   }
 }
 
@@ -235,10 +247,8 @@ async function applyLateResult(result: SourceResult, syncStartedAt: number): Pro
   sourceDurationMs.set(result.source.id, result.ms);
   const prefix = jobIdPrefix(result.source);
   const byId = new Map<string, Job>();
-  const unreadJobs = result.incomplete
-    ? memory.jobs.filter((job) => job.id.startsWith(prefix) && passesListCriteria(job))
-    : [];
-  for (const job of [...result.jobs, ...unreadJobs, ...memory.jobs.filter((job) => !job.id.startsWith(prefix))]) {
+  const sourceJobs = reconcileSource(result, memory.jobs.filter((job) => job.id.startsWith(prefix)), now, passesListCriteria);
+  for (const job of [...sourceJobs, ...memory.jobs.filter((job) => !job.id.startsWith(prefix))]) {
     if (!byId.has(job.id)) byId.set(job.id, job);
   }
   const jobs = sortJobsByEmployerPriority([...byId.values()]);
@@ -320,27 +330,30 @@ async function runLiveSync(
   );
   const failedSources = finished.filter((result) => !result.ok).map((result) => result.source.employer);
 
-  // A source that answered replaces its old listings (closed jobs disappear);
-  // one that did not keeps what we already had, so a flaky site never wipes
-  // its jobs. Kept jobs are re-checked against today's rules, so changing the
-  // criteria (or a posting ageing out) also cleans up what such a site left.
+  // A source that answered is reconciled with its old listings (a posting is
+  // dropped once it is gone for two complete syncs); one that did not keeps
+  // what we already had, so a flaky site never wipes its jobs. Kept jobs are
+  // re-checked against today's rules, so changing the criteria (or a posting
+  // ageing out) also cleans up what such a site left.
   const kept = previous.filter(
     (job) =>
       FREE_JOB_SOURCES.some((source) => notUpdatedIds.has(source.id) && job.id.startsWith(jobIdPrefix(source))) &&
       passesListCriteria(job)
   );
   // A site that stopped at its page limit did not show us every job. The ones we
-  // never read are not closed, so its older listings stay next to what we read.
+  // never read are not closed, so reconcileSource keeps them.
   const incompleteResults = succeeded.filter((result) => result.incomplete);
-  const incompleteIds = new Set(incompleteResults.map((result) => result.source.id));
-  const keptFromIncomplete = previous.filter(
-    (job) =>
-      FREE_JOB_SOURCES.some((source) => incompleteIds.has(source.id) && job.id.startsWith(jobIdPrefix(source))) &&
-      passesListCriteria(job)
+  const reconciled = succeeded.flatMap((result) =>
+    reconcileSource(
+      result,
+      previous.filter((job) => job.id.startsWith(jobIdPrefix(result.source))),
+      finishedAt,
+      passesListCriteria
+    )
   );
   const fresh = succeeded.flatMap((result) => result.jobs);
   const byId = new Map<string, Job>();
-  for (const job of [...fresh, ...kept, ...keptFromIncomplete]) if (!byId.has(job.id)) byId.set(job.id, job);
+  for (const job of [...reconciled, ...kept]) if (!byId.has(job.id)) byId.set(job.id, job);
   const jobs = sortJobsByEmployerPriority([...byId.values()]);
 
   const previousIds = new Set(previous.map((job) => job.id));
