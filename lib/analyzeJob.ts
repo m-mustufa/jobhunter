@@ -213,6 +213,7 @@ Rules for rankedRequirements:
 - Set importance to "mandatory", "preferred", or "context" based only on how the vacancy itself presents the requirement. Rank mandatory requirements first.
 - Keep each requirement atomic. Do not combine a supported duty with a separate unsupported duty, tool, qualification, or scope in one requirement.
 - Evidence must point only to bullet indices that genuinely support the requirement. Use an empty evidence array for unsupported requirements; never manufacture a link.
+- List evidence for a requirement only if you will also write a tailoredHighlight from that evidence, put the requirement's id in its requirementIds, and word it with a key term of the requirement that the source bullet itself already contains. The first three requirements that have evidence must each be covered this way. A generic or soft-skill requirement (for example "strong analytical skills" or "problem-solving") that no bullet states in its own words must get an empty evidence array, not an inferred link.
 
 Rules for every employer:
 - Return exactly one experienceRewrites entry per employer, in input order, copying company exactly. Never rewrite role/date/company.
