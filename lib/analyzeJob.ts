@@ -1275,6 +1275,36 @@ function tokenJaccard(left: string, right: string): number {
   return intersection / (leftTokens.size + rightTokens.size - intersection);
 }
 
+/**
+ * The correction line for top supported requirements no highlight covers. The
+ * reply is regenerated from a fresh prompt, where requirement ids can be
+ * numbered differently, so the line names each requirement by its text and says
+ * where its evidence is and what a covering highlight must contain.
+ */
+export function uncoveredRequirementsIssue(
+  uncovered: RankedRequirement[],
+  experience: Profile["experience"]
+): string {
+  const described = uncovered
+    .map((requirement) => {
+      const evidence = requirement.evidence
+        .map((reference) => {
+          const entry = experience[reference.experienceIndex];
+          return `${entry?.company || "employer"} (experienceIndex ${reference.experienceIndex}, bullet ${reference.bulletIndices.join("/")})`;
+        })
+        .join("; ");
+      return `${requirement.id} "${requirement.requirement}" — evidence: ${evidence}`;
+    })
+    .join(" | ");
+  return (
+    `Tailored highlights do not cover top supported requirement${uncovered.length === 1 ? "" : "s"}: ${described}. ` +
+    "Ids can differ between replies, so match by the requirement text. Cover each one with a tailored highlight whose " +
+    "sourceBulletIndices include that evidence bullet, whose requirementIds contains the requirement's id, and whose " +
+    "wording visibly uses the requirement's key terms (only terms that appear in the source bullet). " +
+    "If the CV has no real evidence for a requirement, give it an empty evidence list instead of claiming support."
+  );
+}
+
 function validateTailoringQuality(
   raw: any,
   profile: Profile,
@@ -1389,11 +1419,7 @@ function validateTailoringQuality(
   const mustCover = supportedRequirements.slice(0, Math.min(3, supportedRequirements.length));
   const uncovered = mustCover.filter((requirement) => !coveredRequirementIds.has(requirement.id));
   if (uncovered.length) {
-    issues.push(
-      `Tailored highlights do not cover top supported requirement${uncovered.length === 1 ? "" : "s"}: ${uncovered
-        .map((requirement) => requirement.id)
-        .join(", ")}.`
-    );
+    issues.push(uncoveredRequirementsIssue(uncovered, profile.experience));
   }
   if (normalizeSummaryText(job.description).length < MIN_FULL_JOB_DESCRIPTION_CHARS) {
     issues.push("A complete job description is required for reliable tailoring.");
