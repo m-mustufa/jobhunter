@@ -787,6 +787,9 @@ export default function Home() {
     if (searching) return;
     const next = !linkedinOnly;
     setLinkedinOnly(next);
+    // LinkedIn postings carry no employer ranking, so they open newest first;
+    // the Sort toggle still lets the user change it.
+    setSortNewestFirst(next);
     void runSearch(profile, next);
   }
 
