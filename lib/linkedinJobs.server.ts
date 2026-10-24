@@ -16,10 +16,10 @@ const FETCH_TIMEOUT_MS = 8_000;
 const MAX_DESCRIPTION_CHARS = 18_000;
 const DESCRIPTION_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
 const REQUEST_GAP_MS = 700;
-// A second page is only worth a request when the first was full of matches.
-const FULL_PAGE = 10;
-const MIN_YIELD_FOR_NEXT_PAGE = 6;
-const MAX_REQUESTS_PER_CRAWL = 18;
+// LinkedIn refused the 5th request in a row from Vercel, so a sync reads only a
+// few searches and the next sync carries on where this one stopped.
+const MAX_REQUESTS_PER_SYNC = 4;
+const PAGE_SIZE = 10;
 
 // Role families searched, one request each. A single huge OR query favours broad
 // titles, so the families stay separate. Same coverage as lib/targetRoles.
@@ -34,6 +34,12 @@ export const LINKEDIN_QUERIES = [
   '("Senior Manager" OR "Team Leader" OR "Section Head" OR Lead)',
   '("Marketing Manager" OR "Communications Manager" OR "Legal Counsel" OR "Sustainability Manager" OR "Facilities Manager" OR "Category Manager")',
 ];
+
+// One slot is one request: a role family and a results page. Every family's first
+// page comes before any second page, so a partial cycle covers the newest jobs first.
+export const LINKEDIN_SLOTS: { query: string; start: number }[] = [0, PAGE_SIZE].flatMap((start) =>
+  LINKEDIN_QUERIES.map((query) => ({ query, start }))
+);
 
 const LINKEDIN_HEADERS = {
   accept: "text/html,application/xhtml+xml",
@@ -59,6 +65,11 @@ export interface LinkedInCrawl {
   failedRequests: number;
   /** LinkedIn answered 429/403/999: the crawl stopped and the list is partial. */
   blocked: boolean;
+  /** Where the next sync should start (an index into LINKEDIN_SLOTS). */
+  nextCursor: number;
+  /** Searches read successfully in this sync, out of LINKEDIN_SLOTS.length in a full cycle. */
+  slotsRead: number;
+  totalSlots: number;
 }
 
 /** LinkedIn refused to serve us (rate limit or block). */
@@ -164,46 +175,42 @@ function wasPostedWithinPastMonth(card: LinkedInCard, now = Date.now()): boolean
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Searches each role family once, then a second page for the families whose
- * first page was full. Requests are made one at a time with a short gap; the
- * first block (429/403/999) stops the crawl and returns what was read so far.
- * Throws only when nothing at all could be read.
+ * Reads the next few searches, starting at `cursor`, one at a time with a short
+ * gap. The first block (429/403/999) stops the crawl, and the next sync retries
+ * the search that was refused. Throws only when not a single search could be read.
  */
-export async function crawlLinkedInCards(signal?: AbortSignal): Promise<LinkedInCrawl> {
+export async function crawlLinkedInCards(signal?: AbortSignal, cursor = 0): Promise<LinkedInCrawl> {
+  const total = LINKEDIN_SLOTS.length;
+  let index = ((Math.trunc(cursor) % total) + total) % total;
   const collected = new Map<string, LinkedInCard>();
   let attempted = 0;
   let failed = 0;
+  let read = 0;
   let blocked = false;
   let firstFailure: unknown;
-  const yields = new Map<string, number>();
 
-  const search = async (query: string, start: number) => {
-    if (blocked || attempted >= MAX_REQUESTS_PER_CRAWL || signal?.aborted) return;
+  while (read + failed < MAX_REQUESTS_PER_SYNC && !blocked && !signal?.aborted) {
     if (attempted > 0) await pause(REQUEST_GAP_MS);
+    const slot = LINKEDIN_SLOTS[index];
     attempted += 1;
     try {
-      const cards = (await fetchPublicHtmlCards(query, start, signal)).filter((card) =>
+      const cards = (await fetchPublicHtmlCards(slot.query, slot.start, signal)).filter((card) =>
         wasPostedWithinPastMonth(card)
       );
-      yields.set(query, cards.length);
       for (const card of cards) collected.set(card.id, card);
+      read += 1;
+      index = (index + 1) % total;
     } catch (error) {
       failed += 1;
       firstFailure ??= error;
-      yields.set(query, 0);
       if (error instanceof LinkedInBlockedError) blocked = true;
+      // A block is retried next time; any other failure is skipped so one bad
+      // search cannot hold the cursor in place forever.
+      else index = (index + 1) % total;
     }
-  };
+  }
 
-  for (const query of LINKEDIN_QUERIES) await search(query, 0);
-
-  const followUps = [...yields.entries()]
-    .filter(([, count]) => count >= MIN_YIELD_FOR_NEXT_PAGE && count <= FULL_PAGE)
-    .sort((a, b) => b[1] - a[1])
-    .map(([query]) => query);
-  for (const query of followUps) await search(query, FULL_PAGE);
-
-  if (collected.size === 0 && failed > 0) {
+  if (read === 0 && failed > 0) {
     throw firstFailure instanceof Error ? firstFailure : new Error("LinkedIn could not be reached");
   }
   return {
@@ -211,6 +218,9 @@ export async function crawlLinkedInCards(signal?: AbortSignal): Promise<LinkedIn
     attemptedRequests: attempted,
     failedRequests: failed,
     blocked,
+    nextCursor: index,
+    slotsRead: read,
+    totalSlots: total,
   };
 }
 

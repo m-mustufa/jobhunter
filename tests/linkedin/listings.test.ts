@@ -7,11 +7,14 @@ import type { LinkedInCrawl } from "@/lib/linkedinJobs.server";
 const state = vi.hoisted(() => ({
   next: null as null | LinkedInCrawl | Error,
   crawls: 0,
+  cursors: [] as number[],
+  saved: [] as { jobs: unknown[]; metadata: Record<string, number | null> }[],
 }));
 
 vi.mock("@/lib/linkedinJobs.server", () => ({
-  crawlLinkedInCards: vi.fn(async () => {
+  crawlLinkedInCards: vi.fn(async (_signal: unknown, cursor: number) => {
     state.crawls += 1;
+    state.cursors.push(cursor);
     if (state.next instanceof Error) throw state.next;
     return state.next;
   }),
@@ -19,7 +22,12 @@ vi.mock("@/lib/linkedinJobs.server", () => ({
 vi.mock("@/lib/jobListingStore.server", () => ({
   getJobListingSavedAt: vi.fn(async () => null),
   loadJobListingSnapshot: vi.fn(async () => null),
-  saveJobListingSnapshot: vi.fn(async () => true),
+  saveJobListingSnapshot: vi.fn(
+    async (_provider: string, jobs: unknown[], metadata: Record<string, number | null>) => {
+      state.saved.push({ jobs, metadata });
+      return true;
+    }
+  ),
 }));
 
 const HOUR = 3_600_000;
@@ -37,9 +45,12 @@ const card = (id: string, title = "Operations Manager", ageDays = 2, location = 
 });
 const crawl = (cards: ReturnType<typeof card>[], extra: Partial<LinkedInCrawl> = {}): LinkedInCrawl => ({
   cards,
-  attemptedRequests: 9,
+  attemptedRequests: 4,
   failedRequests: 0,
   blocked: false,
+  nextCursor: 4,
+  slotsRead: 4,
+  totalSlots: 18,
   ...extra,
 });
 const idsOf = (jobs: { id: string }[]) => jobs.map((job) => job.id.replace("linkedin-", "")).sort();
@@ -55,6 +66,8 @@ beforeEach(async () => {
   vi.resetModules();
   state.next = null;
   state.crawls = 0;
+  state.cursors = [];
+  state.saved = [];
   listings = await import("@/lib/linkedinListings.server");
 });
 afterEach(() => vi.useRealTimers());
@@ -152,6 +165,49 @@ describe("LinkedIn saved list", () => {
   });
 });
 
+describe("LinkedIn cursor", () => {
+  it("starts at the first search and carries on where the last sync stopped", async () => {
+    state.next = crawl([card("1")], { nextCursor: 4 });
+    await sync();
+    state.next = crawl([card("2")], { nextCursor: 8 });
+    await sync();
+    state.next = crawl([card("3")], { nextCursor: 12 });
+    await sync();
+    expect(state.cursors).toEqual([0, 4, 8]);
+  });
+
+  it("saves the cursor with the list so another server instance carries on from it", async () => {
+    state.next = crawl([card("1")], { nextCursor: 4 });
+    await sync();
+    expect(state.saved.at(-1)?.metadata.cursor).toBe(4);
+  });
+
+  it("holds the cursor at the refused search when LinkedIn blocks", async () => {
+    state.next = crawl([card("1")], { nextCursor: 6, blocked: true, failedRequests: 1, slotsRead: 2 });
+    await sync();
+    state.next = crawl([card("2")], { nextCursor: 10 });
+    await sync();
+    expect(state.cursors).toEqual([0, 6]);
+  });
+
+  it("starts the cycle again after the saved list is cleared", async () => {
+    state.next = crawl([card("1")], { nextCursor: 4 });
+    await sync();
+    listings.clearLinkedInListingsMemory();
+    state.next = crawl([card("2")], { nextCursor: 4 });
+    await sync();
+    expect(state.cursors).toEqual([0, 0]);
+  });
+
+  it("builds a full list across syncs, each adding what it read", async () => {
+    state.next = crawl([card("1"), card("2")], { nextCursor: 4 });
+    await sync();
+    state.next = crawl([card("3")], { nextCursor: 8 });
+    const result = await sync();
+    expect(idsOf(result.jobs)).toEqual(["1", "2", "3"]);
+  });
+});
+
 describe("scheduled LinkedIn sync", () => {
   it("runs when there is nothing saved", async () => {
     state.next = crawl([card("9001")]);
@@ -159,21 +215,22 @@ describe("scheduled LinkedIn sync", () => {
     expect(result).toMatchObject({ ran: true, jobs: 1, blocked: false });
   });
 
-  it("leaves LinkedIn alone when the saved list is only a few hours old", async () => {
+  it("leaves LinkedIn alone when the saved list was read less than 90 minutes ago", async () => {
     state.next = crawl([card("9101")]);
     await listings.runScheduledLinkedInSync();
-    vi.setSystemTime(Date.now() + 2 * HOUR);
+    vi.setSystemTime(Date.now() + 0.5 * HOUR);
     const result = await listings.runScheduledLinkedInSync();
     expect(result.ran).toBe(false);
     expect(state.crawls).toBe(1);
   });
 
-  it("runs again once the saved list is 6 hours old", async () => {
-    state.next = crawl([card("9201")]);
+  it("runs again on the next cron, two hours later, and carries on from the cursor", async () => {
+    state.next = crawl([card("9201")], { nextCursor: 4 });
     await listings.runScheduledLinkedInSync();
-    vi.setSystemTime(Date.now() + 7 * HOUR);
+    vi.setSystemTime(Date.now() + 2 * HOUR);
     const result = await listings.runScheduledLinkedInSync();
     expect(result.ran).toBe(true);
     expect(state.crawls).toBe(2);
+    expect(state.cursors).toEqual([0, 4]);
   });
 });

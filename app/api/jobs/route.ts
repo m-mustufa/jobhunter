@@ -111,12 +111,12 @@ export async function GET(req: Request) {
         notes.push(`Showing ${result.jobs.length} saved LinkedIn listings.`);
       } else {
         notes.push(
-          `Read LinkedIn (${result.attemptedRequests} requests) and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} LinkedIn listings are saved.`
+          `Read ${result.slotsRead} of ${result.totalSlots} LinkedIn searches and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} LinkedIn listings are saved; the other searches are read on the next refreshes.`
         );
       }
       if (result.blocked) {
         notes.push(
-          "LinkedIn limited the requests, so only part of the list was read. Saved listings were kept; try again later."
+          "LinkedIn limited the requests, so this read stopped early. Saved listings were kept; it carries on next time."
         );
       }
       if (keyword && jobs.length === 0) {

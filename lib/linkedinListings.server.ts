@@ -11,13 +11,16 @@ import { passesListCriteria } from "@/lib/freeJobs/criteria";
 import { reconcileSource } from "@/lib/freeJobs/reconcile";
 import { crawlLinkedInCards, type LinkedInCard } from "@/lib/linkedinJobs.server";
 
-// The "LinkedIn only" list: LinkedIn's public search, read at most every few
-// hours and kept as a saved snapshot, exactly like the career-site list, so the
-// toggle answers from storage instead of waiting on LinkedIn. LinkedIn
-// rate-limits quickly, so syncs are rare and a block never costs saved jobs.
-const AUTO_REFRESH_AFTER_MS = 12 * 60 * 60 * 1_000;
+// The "LinkedIn only" list: LinkedIn's public search, kept as a saved snapshot
+// like the career-site list, so the toggle answers from storage instead of
+// waiting on LinkedIn. LinkedIn refuses a client after a handful of requests,
+// so each sync reads only the next few searches (a cursor remembers where it
+// stopped) and the full set of searches is covered over several syncs. A block
+// never costs saved jobs.
+const AUTO_REFRESH_AFTER_MS = 6 * 60 * 60 * 1_000;
 const MANUAL_REFRESH_COOLDOWN_MS = 30 * 60 * 1_000;
-const SCHEDULED_MIN_GAP_MS = 6 * 60 * 60 * 1_000;
+// The cron runs every 2 hours; this only stops two runs close together.
+const SCHEDULED_MIN_GAP_MS = 90 * 60 * 1_000;
 const SYNC_DEADLINE_MS = 40_000;
 const BLOB_CHECK_INTERVAL_MS = 5_000;
 const BLOB_CLOCK_TOLERANCE_MS = 5_000;
@@ -30,8 +33,11 @@ export interface LinkedInListingsResult {
   newJobsCount?: number;
   attemptedRequests: number;
   failedRequests: number;
-  /** LinkedIn refused some requests, so this sync read only part of the list. */
+  /** LinkedIn refused a request, so this sync stopped early. */
   blocked: boolean;
+  /** Searches read in this sync, and how many make up a full cycle. */
+  slotsRead: number;
+  totalSlots: number;
 }
 
 interface Memory {
@@ -39,7 +45,11 @@ interface Memory {
   savedAt: number;
 }
 
+// Which search the next sync starts at; saved with the snapshot.
+const CURSOR_KEY = "cursor";
+
 let memory: Memory | null = null;
+let cursor = 0;
 let lastAttemptAt = 0;
 let lastBlobCheckAt = 0;
 let inFlight: Promise<LinkedInListingsResult> | null = null;
@@ -75,12 +85,15 @@ async function refreshMemoryFromStorage(): Promise<void> {
   const snapshot = await loadJobListingSnapshot("linkedin");
   if (snapshot && (!memory || snapshot.savedAt > memory.savedAt)) {
     memory = { jobs: snapshot.jobs, savedAt: snapshot.savedAt };
+    const saved = snapshot.metadata?.[CURSOR_KEY];
+    if (typeof saved === "number") cursor = saved;
   }
 }
 
 async function runLiveSync(previous: Job[]): Promise<LinkedInListingsResult> {
   lastAttemptAt = Date.now();
-  const crawl = await crawlLinkedInCards(AbortSignal.timeout(SYNC_DEADLINE_MS));
+  const crawl = await crawlLinkedInCards(AbortSignal.timeout(SYNC_DEADLINE_MS), cursor);
+  cursor = crawl.nextCursor;
   const now = Date.now();
 
   const matching = crawl.cards.filter((card) =>
@@ -112,10 +125,11 @@ async function runLiveSync(previous: Job[]): Promise<LinkedInListingsResult> {
       attemptedRequests: crawl.attemptedRequests,
       failedRequests: crawl.failedRequests,
       blocked: crawl.blocked ? 1 : 0,
+      [CURSOR_KEY]: crawl.nextCursor,
     });
   }
   console.info(
-    `linkedin: requests=${crawl.attemptedRequests} failed=${crawl.failedRequests} blocked=${crawl.blocked} cards=${crawl.cards.length} matched=${matching.length} new=${newJobsCount} saved=${jobs.length}`
+    `linkedin: requests=${crawl.attemptedRequests} failed=${crawl.failedRequests} blocked=${crawl.blocked} slots=${crawl.slotsRead}/${crawl.totalSlots} cursor=${crawl.nextCursor} cards=${crawl.cards.length} matched=${matching.length} new=${newJobsCount} saved=${jobs.length}`
   );
 
   return {
@@ -127,6 +141,8 @@ async function runLiveSync(previous: Job[]): Promise<LinkedInListingsResult> {
     attemptedRequests: crawl.attemptedRequests,
     failedRequests: crawl.failedRequests,
     blocked: crawl.blocked,
+    slotsRead: crawl.slotsRead,
+    totalSlots: crawl.totalSlots,
   };
 }
 
@@ -142,6 +158,8 @@ async function load(forceRefresh: boolean): Promise<LinkedInListingsResult> {
     attemptedRequests: 0,
     failedRequests: 0,
     blocked: false,
+    slotsRead: 0,
+    totalSlots: 0,
   });
 
   if (forceRefresh && now - lastAttemptAt < MANUAL_REFRESH_COOLDOWN_MS) return saved("cooldown");
@@ -170,6 +188,7 @@ export interface ScheduledLinkedInResult {
   jobs?: number;
   newJobs?: number;
   blocked?: boolean;
+  slotsRead?: number;
 }
 
 // The cron run. LinkedIn is read far less often than the career sites: it is
@@ -188,10 +207,17 @@ export async function runScheduledLinkedInSync(): Promise<ScheduledLinkedInResul
   });
   inFlight = tracked;
   const result = await tracked;
-  return { ran: true, jobs: result.jobs.length, newJobs: result.newJobsCount, blocked: result.blocked };
+  return {
+    ran: true,
+    jobs: result.jobs.length,
+    newJobs: result.newJobsCount,
+    blocked: result.blocked,
+    slotsRead: result.slotsRead,
+  };
 }
 
 export function clearLinkedInListingsMemory(): void {
   memory = null;
   lastAttemptAt = 0;
+  cursor = 0;
 }

@@ -36,6 +36,8 @@ const result = (extra: object = {}) => ({
   attemptedRequests: 0,
   failedRequests: 0,
   blocked: false,
+  slotsRead: 0,
+  totalSlots: 18,
   ...extra,
 });
 
@@ -56,10 +58,10 @@ describe("GET /api/jobs?source=linkedin", () => {
   });
 
   it("passes a manual refresh through", async () => {
-    mocks.fetchLinkedInListings.mockResolvedValue(result({ syncMode: "live", attemptedRequests: 9, newJobsCount: 2 }));
+    mocks.fetchLinkedInListings.mockResolvedValue(result({ syncMode: "live", attemptedRequests: 4, slotsRead: 4, newJobsCount: 2 }));
     const body = await (await get("source=linkedin&refresh=1")).json();
     expect(mocks.fetchLinkedInListings).toHaveBeenCalledWith(true);
-    expect(body.note).toContain("9 requests");
+    expect(body.note).toContain("Read 4 of 18 LinkedIn searches");
     expect(body.note).toContain("added 2 new");
   });
 
@@ -70,9 +72,10 @@ describe("GET /api/jobs?source=linkedin", () => {
   });
 
   it("tells the user when LinkedIn limited the read and that saved jobs were kept", async () => {
-    mocks.fetchLinkedInListings.mockResolvedValue(result({ syncMode: "live", blocked: true, attemptedRequests: 3 }));
+    mocks.fetchLinkedInListings.mockResolvedValue(result({ syncMode: "live", blocked: true, attemptedRequests: 3, slotsRead: 2 }));
     const body = await (await get("source=linkedin&refresh=1")).json();
     expect(body.note).toMatch(/limited the requests/);
+    expect(body.note).toMatch(/carries on next time/);
     expect(body.note).toMatch(/Saved listings were kept/);
   });
 
