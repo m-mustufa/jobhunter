@@ -103,7 +103,15 @@ interface BuildPromptOptions {
   cachedRoleResearch?: RoleResearchBrief | null;
   requestWebResearch?: boolean;
   correctionIssues?: string[];
+  // The reply that failed the checks. A corrective prompt is sent to a fresh
+  // chat, so without it the model rebuilds everything from scratch and tends
+  // to fail a different check; with it, it only has to fix what is listed.
+  previousResponse?: string;
 }
+
+// Past this the prompt would be unwieldy to paste; the corrective pass then
+// falls back to the list of problems alone.
+const MAX_PREVIOUS_RESPONSE_CHARS = 40_000;
 
 export function buildPrompt(
   job: Pick<Job, "title" | "company" | "location" | "description">,
@@ -126,8 +134,14 @@ export function buildPrompt(
     : options.requestWebResearch
       ? `Use the web-search tool exactly ONCE to research current, reputable expectations for this normalized role in the UAE or its functional domain. Prefer official/professional sources. Put the concise result in roleResearch. If search is unavailable or weak, continue from the full vacancy description without guessing.`
       : `No external role research is supplied. Derive role expectations from the COMPLETE vacancy description and continue normally; do not request or depend on tools.`;
+  const issueList = (options.correctionIssues ?? [])
+    .map((issue, index) => `${index + 1}. ${issue}`)
+    .join("\n");
+  const previousResponse = options.previousResponse?.trim() ?? "";
   const correction = options.correctionIssues?.length
-    ? `\nCORRECTIVE PASS: The previous response failed these checks. Fix every item without changing protected facts:\n${options.correctionIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}\n`
+    ? previousResponse && previousResponse.length <= MAX_PREVIOUS_RESPONSE_CHARS
+      ? `\nCORRECTIVE PASS: Your previous response (given in full below) failed these checks:\n${issueList}\n\nReturn that SAME response with only these problems fixed. Keep everything that is not named above exactly as it is — the same ranked requirements, wording, structure and every protected fact — and change only what each item asks for. Do not start over. Do not weaken any evidence rule to make a check pass; if a claim cannot be supported by the fixed evidence, remove the claim.\n\nPREVIOUS RESPONSE:\n${previousResponse}\n`
+      : `\nCORRECTIVE PASS: The previous response failed these checks. Fix every item without changing protected facts:\n${issueList}\n`
     : "";
 
   return `PROMPT_SCHEMA_REVISION: ${PROMPT_SCHEMA_REVISION}
@@ -1916,10 +1930,14 @@ export async function analyzeJobForCandidate(
     ? { cachedRoleResearch: researchBrief }
     : { requestWebResearch: process.env.ROLE_RESEARCH_ENABLED !== "false" };
   let correctionIssues: string[] = [];
+  let failedResponse: string | undefined;
+  // Only a reply that parsed but failed the quality checks is worth showing again.
+  let previousForCorrection: string | undefined;
 
   try {
     try {
       const firstResult = await callClaude(job, candidateProfile, key, firstOptions, 28_000);
+      failedResponse = JSON.stringify(firstResult.parsed, null, 1);
       if (!researchBrief && firstResult.webSearchRequests > 0) {
         researchBrief = await settleWithin(
           saveRoleResearchBrief(job, firstResult.parsed?.roleResearch, firstResult.researchSources),
@@ -1935,6 +1953,7 @@ export async function analyzeJobForCandidate(
         correctionIssues = ["The first pass timed out. Return concise, complete JSON without web research."];
       } else if (error instanceof TailoringQualityError) {
         correctionIssues = error.issues.slice(0, 10);
+        previousForCorrection = failedResponse;
       } else if (error instanceof WebResearchUnavailableError) {
         correctionIssues = [error.message];
       } else if (error instanceof RetryableClaudeError) {
@@ -1960,6 +1979,7 @@ export async function analyzeJobForCandidate(
       {
         requestWebResearch: false,
         correctionIssues,
+        previousResponse: previousForCorrection,
       },
       Math.min(remainingMs, 24_000)
     );

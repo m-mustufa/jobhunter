@@ -2451,6 +2451,8 @@ function FreeTailorModal({
               {copied
                 ? "Copied ✓ — now open Claude, send it again, then paste the new reply in the box above."
                 : "Needs one fix — click to copy the updated prompt above, send it to Claude again, then paste the new reply in the box above."}
+              {/* What the check found. The updated prompt carries the previous reply, so Claude only fixes this. */}
+              <span className="mt-1.5 block text-xs leading-relaxed text-beacon/80">{importError}</span>
             </button>
           )}
           {importError && !hasCorrection && <p className="mt-2 text-sm text-weak">{importError}</p>}

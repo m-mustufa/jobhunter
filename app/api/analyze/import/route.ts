@@ -54,8 +54,9 @@ export async function POST(req: Request) {
     location: typeof job.location === "string" ? job.location.trim() : "",
     description: job.description.trim(),
   };
+  let parsed: any = null;
   try {
-    const parsed = parseModelResponse(text);
+    parsed = parseModelResponse(text);
     const analysis = toValidatedAnalysis(parsed, candidateProfile, targetJob);
     return NextResponse.json(analysis);
   } catch (error: any) {
@@ -66,6 +67,9 @@ export async function POST(req: Request) {
       const correctionPrompt = `${SYSTEM}\n\n${buildPrompt(targetJob, candidateProfile, {
         requestWebResearch: false,
         correctionIssues: error.issues.slice(0, 10),
+        // The reply that failed, so the corrected prompt asks for a fix of it
+        // rather than a rebuild from scratch.
+        previousResponse: parsed ? JSON.stringify(parsed, null, 1) : undefined,
       })}`;
       return NextResponse.json(
         {
