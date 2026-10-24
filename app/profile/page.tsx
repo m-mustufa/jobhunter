@@ -453,8 +453,8 @@ export default function ProfilePage() {
             <p className="mt-2 max-w-2xl text-sm leading-relaxed text-soft">
               Refresh listings adds newly found jobs at the front while older jobs remain available
               in pagination. Nothing is removed automatically. After clearing, return to search and
-              click Refresh listings to fetch fresh jobs. LinkedIn live syncs are limited to once
-              every 12 hours to protect API credits.
+              click Refresh listings to fetch fresh jobs. LinkedIn is read at most every 12
+              hours (a manual refresh waits 30 minutes) because LinkedIn limits how often it can be read.
             </p>
             <p className="mt-2 text-xs leading-relaxed text-soft/70">
               This removes only saved job listings. Applied Jobs, your profile,

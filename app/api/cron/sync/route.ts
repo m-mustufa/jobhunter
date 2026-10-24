@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { timingSafeEqual } from "node:crypto";
 import { runScheduledSync } from "@/lib/freeJobs.server";
+import { runScheduledLinkedInSync } from "@/lib/linkedinListings.server";
 
 // Called on a schedule (see .github/workflows/sync-jobs.yml) so the saved list
 // is refreshed while nobody has the app open. It sits outside the site-password
@@ -24,7 +25,21 @@ async function handle(req: Request) {
     return NextResponse.json({ error: "Unauthorised." }, { status: 401 });
   }
   try {
-    return NextResponse.json(await runScheduledSync());
+    // The two lists read different sites, so they run side by side. LinkedIn
+    // only reads when its saved list is several hours old, and a LinkedIn
+    // failure or block never affects the career-site sync.
+    const [sites, linkedin] = await Promise.allSettled([runScheduledSync(), runScheduledLinkedInSync()]);
+    if (sites.status === "rejected") throw sites.reason;
+    if (linkedin.status === "rejected") {
+      console.warn("scheduled LinkedIn sync failed", linkedin.reason);
+    }
+    return NextResponse.json({
+      ...sites.value,
+      linkedin:
+        linkedin.status === "fulfilled"
+          ? linkedin.value
+          : { ran: false, reason: linkedin.reason instanceof Error ? linkedin.reason.message : "failed" },
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "The sync failed.";
     console.error("scheduled sync failed", error);
