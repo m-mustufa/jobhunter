@@ -403,7 +403,6 @@ export default function Home() {
   const [fieldFilter, setFieldFilter] = useState("all");
   const [recommendedOnly, setRecommendedOnly] = useState(false);
   const [linkedinOnly, setLinkedinOnly] = useState(false);
-  const [sortNewestFirst, setSortNewestFirst] = useState(false);
   const [keywordSearchOpen, setKeywordSearchOpen] = useState(false);
   const [page, setPage] = useState(1);
 
@@ -787,9 +786,8 @@ export default function Home() {
     if (searching) return;
     const next = !linkedinOnly;
     setLinkedinOnly(next);
-    // LinkedIn postings carry no employer ranking, so they open newest first;
-    // the Sort toggle still lets the user change it.
-    setSortNewestFirst(next);
+    // The LinkedIn list starts plain: the Recommended filter returns to off.
+    setRecommendedOnly(false);
     void runSearch(profile, next);
   }
 
@@ -1254,10 +1252,9 @@ export default function Home() {
       const recommendedOk = !recommendedOnly || recommendation?.recommended === true;
       return titleOk && fieldOk && recommendedOk;
     });
-    return sortNewestFirst
-      ? sortItemsByPostedDate(filtered)
-      : rankBatchItems(filtered, profile, recommendations);
-  }, [items, profile, titleFilter, fieldFilter, recommendedOnly, recommendations, sortNewestFirst]);
+    // Always newest first, whatever the source; Recommended only narrows the list.
+    return sortItemsByPostedDate(filtered);
+  }, [items, profile, titleFilter, fieldFilter, recommendedOnly, recommendations]);
 
   // The first job is selected before the server's Recommended scores arrive,
   // so the list can reorder under it. If the user has not picked a job
@@ -1294,11 +1291,6 @@ export default function Home() {
 
   function toggleRecommendedOnly() {
     setRecommendedOnly((current) => !current);
-    setPage(1);
-  }
-
-  function toggleSortNewestFirst() {
-    setSortNewestFirst((current) => !current);
     setPage(1);
   }
 
@@ -1487,29 +1479,6 @@ export default function Home() {
               <span
                 className={`absolute left-0 top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
                   linkedinOnly ? "translate-x-[19px]" : "translate-x-[3px]"
-                }`}
-              />
-            </button>
-          </div>
-
-          <div className="flex h-11 min-w-[150px] shrink-0 items-center justify-between gap-3 rounded-lg border border-line bg-ink px-3">
-            <span className="text-sm font-medium leading-tight text-bright">
-              Sort: Newest
-            </span>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={sortNewestFirst}
-              aria-label="Sort by newest first"
-              data-testid="sort-newest-toggle"
-              onClick={toggleSortNewestFirst}
-              className={`relative h-6 w-10 shrink-0 rounded-full border transition ${
-                sortNewestFirst ? "border-good bg-good" : "border-line bg-raised"
-              }`}
-            >
-              <span
-                className={`absolute left-0 top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-                  sortNewestFirst ? "translate-x-[19px]" : "translate-x-[3px]"
                 }`}
               />
             </button>
