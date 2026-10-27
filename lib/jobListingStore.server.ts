@@ -3,7 +3,7 @@ import "server-only";
 import { del, get, head, put } from "@vercel/blob";
 import { Job } from "@/lib/types";
 
-export type JobListingProvider = "theirstack" | "free";
+export type JobListingProvider = "theirstack" | "free" | "linkedin";
 
 export interface JobListingSnapshot {
   version: 1;
@@ -25,6 +25,7 @@ export interface TheirStackSyncState {
 const PATHS: Record<JobListingProvider, string> = {
   theirstack: "jobhunter/jobs/theirstack.json",
   free: "jobhunter/jobs/free.json",
+  linkedin: "jobhunter/jobs/linkedin.json",
 };
 const THEIRSTACK_SYNC_STATE_PATH = "jobhunter/jobs/theirstack-sync-state.json";
 // Left behind by the removed Hirebase provider; deleted when listings are cleared.

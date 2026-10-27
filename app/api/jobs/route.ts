@@ -3,22 +3,14 @@ import { JobsResponse } from "@/lib/types";
 import { SAMPLE_JOBS } from "@/lib/sampleJobs";
 import { clearJobListingSnapshots } from "@/lib/jobListingStore.server";
 import { clearFreeJobsMemoryCache, fetchFreeJobs, toLiteJob } from "@/lib/freeJobs.server";
-// Legacy public LinkedIn guest-page crawler is intentionally disabled while
-// we compare the licensed TheirStack feed. Keep this line for easy rollback:
-// import { fetchLinkedInJobDescription, fetchLinkedInJobs } from "@/lib/linkedinJobs.server";
+import { fetchLinkedInJobDescription } from "@/lib/linkedinJobs.server";
 import {
-  clearLinkedInJobsMemoryCache,
-  fetchLinkedInJobs,
-} from "@/lib/theirStackLinkedInJobs.server";
+  clearLinkedInListingsMemory,
+  fetchLinkedInListings,
+} from "@/lib/linkedinListings.server";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
-
-function configuredLinkedInSyncCap(): number {
-  const parsed = Number.parseInt(process.env.THEIRSTACK_MAX_RESULTS || "", 10);
-  if (!Number.isFinite(parsed)) return 150;
-  return Math.min(250, Math.max(25, parsed));
-}
 
 function sampleJobs(keyword: string) {
   return keyword
@@ -60,9 +52,7 @@ export async function DELETE(req: Request) {
   // already-running refresh cannot repopulate the store after this reset.
   try {
     clearFreeJobsMemoryCache();
-    await Promise.all([
-      clearLinkedInJobsMemoryCache(),
-    ]);
+    clearLinkedInListingsMemory();
     await clearJobListingSnapshots();
     return NextResponse.json({
       ok: true,
@@ -83,11 +73,19 @@ export async function GET(req: Request) {
   const source = searchParams.get("source");
   const forceRefresh = searchParams.get("refresh") === "1";
 
+  // A LinkedIn listing arrives without its description; it is read from
+  // LinkedIn's public posting page when the job is opened or tailored.
   if (source === "linkedin" && searchParams.has("jobId")) {
-    return NextResponse.json(
-      { error: "TheirStack listings already include the full job description. Refresh the listing first." },
-      { status: 400 }
-    );
+    try {
+      const description = await fetchLinkedInJobDescription(searchParams.get("jobId") || "");
+      return NextResponse.json({ description });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The description could not be loaded.";
+      return NextResponse.json(
+        { error: `The LinkedIn job description could not be loaded (${message}). Please try again shortly.` },
+        { status: 502 }
+      );
+    }
   }
 
   // LinkedIn mode is deliberately isolated from the career-site/sample
@@ -95,7 +93,7 @@ export async function GET(req: Request) {
   // "LinkedIn only" toggle.
   if (source === "linkedin") {
     try {
-      const result = await fetchLinkedInJobs(forceRefresh);
+      const result = await fetchLinkedInListings(forceRefresh);
       const jobs = keyword
         ? result.jobs.filter((job) =>
             `${job.title} ${job.company} ${job.description}`.toLowerCase().includes(keyword)
@@ -104,33 +102,22 @@ export async function GET(req: Request) {
 
       const notes: string[] = [];
       if (result.syncMode === "stale") {
-        notes.push(
-          `TheirStack sync failed — showing ${result.jobs.length} saved LinkedIn listings. Nothing was removed, but credit use for the failed attempt could not be confirmed.`
-        );
+        notes.push(`LinkedIn could not be reached — showing ${result.jobs.length} saved LinkedIn listings.`);
       } else if (result.syncMode === "cooldown") {
         notes.push(
-          `Already synced or attempted recently — 0 credits used. Next live LinkedIn sync in ${formatSyncWait(result.nextSyncAt)}. ${result.jobs.length} saved listings are available.`
-        );
-      } else if (result.syncMode === "empty") {
-        notes.push(
-          `No saved LinkedIn listings. Click Refresh listings to run the first sync (up to ${configuredLinkedInSyncCap()} credits).`
+          `LinkedIn was read recently. Next live read in ${formatSyncWait(result.nextSyncAt)}. ${result.jobs.length} saved listings are available.`
         );
       } else if (result.syncMode === "saved") {
-        notes.push(
-          `Showing ${result.jobs.length} saved LinkedIn listings — 0 credits used.`
-        );
-      } else if (result.failedSearches > 0) {
-        notes.push(
-          `Synced ${result.apiRecordsReturned ?? 0} returned LinkedIn records and added ${result.newJobsCount ?? 0} new. ${result.failedSearches} of ${result.attemptedSearches} requests failed, so final credit use could not be confirmed. ${result.jobs.length} listings are saved.`
-        );
+        notes.push(`Showing ${result.jobs.length} saved LinkedIn listings.`);
       } else {
-        const creditsUsed = result.apiRecordsReturned ?? 0;
         notes.push(
-          `Synced ${creditsUsed} LinkedIn records (${creditsUsed} credits used), added ${result.newJobsCount ?? 0} new, and kept ${result.jobs.length} saved listings.`
+          `Read ${result.slotsRead} of ${result.totalSlots} LinkedIn searches and added ${result.newJobsCount ?? 0} new. ${result.jobs.length} LinkedIn listings are saved; the other searches are read on the next refreshes.`
         );
       }
-      if (result.descriptionFailures > 0) {
-        notes.push(`${result.descriptionFailures} TheirStack records without descriptions were skipped.`);
+      if (result.blocked) {
+        notes.push(
+          "LinkedIn limited the requests, so this read stopped early. Saved listings were kept; it carries on next time."
+        );
       }
       if (keyword && jobs.length === 0) {
         notes.push("No LinkedIn jobs matched the current keyword.");
@@ -141,24 +128,16 @@ export async function GET(req: Request) {
         sample: false,
         note: notes.join(" "),
         ...(result.syncedAt ? { providerSyncedAt: result.syncedAt } : {}),
-        ...(result.nextSyncAt
-          ? { nextProviderSyncAt: result.nextSyncAt }
-          : {}),
+        ...(result.nextSyncAt ? { nextProviderSyncAt: result.nextSyncAt } : {}),
       };
       return NextResponse.json(response);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "TheirStack could not be reached";
-      const providerWasNotContacted =
-        message.includes("no provider request was made") ||
-        message.includes("THEIRSTACK_API_KEY is not configured") ||
-        message.includes("TheirStack is disabled while DEMO_MODE is on");
+      const message = error instanceof Error ? error.message : "LinkedIn could not be reached";
       const response: JobsResponse = {
         jobs: [],
         sample: false,
         error: message,
-        note: providerWasNotContacted
-          ? `LinkedIn jobs via TheirStack could not be loaded (${message}). Existing listings were not changed; no provider request was sent and 0 credits were used.`
-          : `LinkedIn jobs via TheirStack could not be loaded (${message}). Existing listings were not changed, and credit use for this failed attempt could not be confirmed.`,
+        note: `LinkedIn jobs could not be loaded (${message}). Existing listings were not changed.`,
       };
       return NextResponse.json(response, { status: 502 });
     }

@@ -654,7 +654,7 @@ export default function Home() {
         jobs = fallback.jobs;
         providerSyncedAt = fallback.fetchedAt;
         note = linkedinMode
-          ? "LinkedIn sync could not be completed — showing your last saved results. Credit use for the failed attempt could not be confirmed."
+          ? "LinkedIn could not be read — showing your last saved results."
           : "Could not refresh listings — showing your last saved results.";
       } else {
         note = timedOut
@@ -787,6 +787,9 @@ export default function Home() {
     if (searching) return;
     const next = !linkedinOnly;
     setLinkedinOnly(next);
+    // LinkedIn postings carry no employer ranking, so they open newest first;
+    // the Sort toggle still lets the user change it.
+    setSortNewestFirst(next);
     void runSearch(profile, next);
   }
 
@@ -1654,7 +1657,7 @@ export default function Home() {
       )}
 
       <footer className="mt-16 border-t border-line pt-5 text-center font-mono text-xs text-soft/70">
-        JobHunter — jobs from employer career sites (LinkedIn listings via TheirStack), tailoring via Claude.
+        JobHunter — jobs from employer career sites and LinkedIn&apos;s public search, tailoring via Claude.
       </footer>
       </main>
     </>

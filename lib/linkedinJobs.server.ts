@@ -1,77 +1,91 @@
 import "server-only";
 
 import { load } from "cheerio";
-import { Job } from "@/lib/types";
-import { matchTargetTitle, QUERY_GROUPS } from "@/lib/targetRoles";
+import { matchTargetTitle } from "@/lib/targetRoles";
 
-const LINKEDIN_SEARCH_URL =
-  "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search";
+// LinkedIn's public (signed-out) job search, the same pages a visitor sees. No
+// cookies or account are used. LinkedIn rate-limits this quickly, so the crawl
+// is deliberately small and polite, and it stops at the first sign of a block.
+const LINKEDIN_SEARCH_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search";
 const LINKEDIN_JOB_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting";
-const SEARCH_PAGE_CONCURRENCY = 2;
-const FETCH_TIMEOUT_MS = 4_000;
-const MAX_RESULTS = 70;
-const MIN_TARGET_RESULTS = 60;
-const MAX_FOLLOW_UP_SEARCHES = 8;
-const PAST_MONTH_DAYS = 30;
-const PAST_MONTH_SECONDS = PAST_MONTH_DAYS * 24 * 60 * 60;
-const CACHE_TTL_MS = 15 * 60 * 1_000;
-const DESCRIPTION_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+// LinkedIn's id for "Abu Dhabi, Abu Dhabi Emirate, United Arab Emirates". The
+// text form of `location` is ignored by some LinkedIn pages; the id is not.
+export const ABU_DHABI_GEO_ID = "104524176";
+const PAST_MONTH_SECONDS = 30 * 24 * 60 * 60;
+const FETCH_TIMEOUT_MS = 8_000;
 const MAX_DESCRIPTION_CHARS = 18_000;
-// Focused queries give every role family a chance to contribute. A single
-// 67-title OR expression heavily favors broad titles and returns duplicates
-// on deeper pages.
-const LINKEDIN_QUERIES = QUERY_GROUPS.map((query) =>
-  query.replace(/\s+Abu Dhabi\s*$/i, "").trim()
+const DESCRIPTION_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+const REQUEST_GAP_MS = 700;
+// LinkedIn refused the 5th request in a row from Vercel, so a sync reads only a
+// few searches and the next sync carries on where this one stopped.
+const MAX_REQUESTS_PER_SYNC = 4;
+const PAGE_SIZE = 10;
+
+// Role families searched, one request each. A single huge OR query favours broad
+// titles, so the families stay separate. Same coverage as lib/targetRoles.
+export const LINKEDIN_QUERIES = [
+  '("Vice President" OR VP OR AVP OR "General Manager" OR "Managing Director" OR "Chief Operating Officer" OR "Chief Executive Officer")',
+  '(Director OR "Head of" OR "Department Head" OR "Division Head" OR "Country Manager")',
+  '("IT Manager" OR "Technology Manager" OR "Engineering Manager" OR "Head of Technology" OR "Digital Transformation" OR "Data Manager")',
+  '("Project Director" OR "Senior Project Manager" OR "Program Manager" OR "Construction Manager" OR "Operations Manager")',
+  '("Finance Manager" OR "Commercial Manager" OR "Treasury Manager" OR "Investment Manager" OR "Business Development Manager")',
+  '("HR Manager" OR "Strategy Manager" OR "Transformation Manager" OR Governance OR "Risk Manager" OR "Compliance Manager")',
+  '("Supply Chain Manager" OR "Procurement Manager" OR "Contracts Manager" OR "Quality Manager" OR "HSE Manager")',
+  '("Senior Manager" OR "Team Leader" OR "Section Head" OR Lead)',
+  '("Marketing Manager" OR "Communications Manager" OR "Legal Counsel" OR "Sustainability Manager" OR "Facilities Manager" OR "Category Manager")',
+];
+
+// One slot is one request: a role family and a results page. Every family's first
+// page comes before any second page, so a partial cycle covers the newest jobs first.
+export const LINKEDIN_SLOTS: { query: string; start: number }[] = [0, PAGE_SIZE].flatMap((start) =>
+  LINKEDIN_QUERIES.map((query) => ({ query, start }))
 );
 
 const LINKEDIN_HEADERS = {
   accept: "text/html,application/xhtml+xml",
   "accept-language": "en-US,en;q=0.9",
-  // LinkedIn's public guest pages return different markup to non-browser
-  // clients. This request does not contain cookies, credentials, or a logged-in
-  // session; it only asks for the same public HTML a signed-out browser sees.
   "user-agent":
     process.env.LINKEDIN_CRAWLER_USER_AGENT ||
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
 };
 
-interface LinkedInCard {
+export interface LinkedInCard {
   id: string;
   title: string;
   company: string;
   location: string;
   applyLink: string;
-  postedAt: string | null;
+  /** ISO date (day precision) as LinkedIn gives it, or null. */
   postedIso: string | null;
 }
 
-export interface LinkedInJobsResult {
-  jobs: Job[];
-  attemptedSearches: number;
-  successfulSearches: number;
-  failedSearches: number;
-  descriptionFailures: number;
-  fromCache: boolean;
-  stale: boolean;
+export interface LinkedInCrawl {
+  cards: LinkedInCard[];
+  attemptedRequests: number;
+  failedRequests: number;
+  /** LinkedIn answered 429/403/999: the crawl stopped and the list is partial. */
+  blocked: boolean;
+  /** Where the next sync should start (an index into LINKEDIN_SLOTS). */
+  nextCursor: number;
+  /** Searches read successfully in this sync, out of LINKEDIN_SLOTS.length in a full cycle. */
+  slotsRead: number;
+  totalSlots: number;
 }
 
-interface LinkedInCacheEntry {
-  expiresAt: number;
-  result: Omit<LinkedInJobsResult, "fromCache" | "stale">;
+/** LinkedIn refused to serve us (rate limit or block). */
+export class LinkedInBlockedError extends Error {
+  constructor(readonly status: number) {
+    super(`LinkedIn blocked the request (HTTP ${status})`);
+  }
 }
-
-let linkedInCache: LinkedInCacheEntry | null = null;
-let linkedInRequest: Promise<Omit<LinkedInJobsResult, "fromCache" | "stale">> | null = null;
-const descriptionCache = new Map<string, { description: string; expiresAt: number }>();
-const descriptionRequests = new Map<string, Promise<string>>();
 
 function cleanInlineText(value: string): string {
-  return value.replace(/[\u200B-\u200D\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  return value.replace(/[​-‍﻿]/g, "").replace(/\s+/g, " ").trim();
 }
 
 function cleanMultilineText(value: string): string {
   return value
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/[​-‍﻿]/g, "")
     .split(/\r?\n/)
     .map((line) => line.replace(/[\t ]+/g, " ").trim())
     .filter(Boolean)
@@ -94,23 +108,17 @@ export function parseLinkedInSearchHtml(html: string): LinkedInCard[] {
 
     if (!id || !title || !company || !location) return;
     if (!location.toLowerCase().includes("abu dhabi")) return;
-    // LinkedIn search is fuzzy. Keep the same title contract as the normal
-    // listing feed instead of allowing unrelated roles into this mode.
+    // LinkedIn search is fuzzy; keep the same title contract as the career-site feed.
     if (!matchTargetTitle(title)) return;
 
-    // New listings use `job-search-card__listdate--new` while older cards use
-    // `job-search-card__listdate`. The datetime attribute is the stable part.
-    const postedTime = card.find("time[datetime]").first();
-    const postedIso = postedTime.attr("datetime") || null;
-    const postedLabel = cleanInlineText(postedTime.text()) || postedIso;
     cards.push({
       id,
       title,
       company,
       location,
       applyLink: `https://www.linkedin.com/jobs/view/${id}`,
-      postedAt: postedLabel,
-      postedIso,
+      // The datetime attribute is the stable part; the visible text is "2 days ago".
+      postedIso: card.find("time[datetime]").first().attr("datetime") || null,
     });
   });
 
@@ -129,176 +137,101 @@ export function parseLinkedInDescriptionHtml(html: string): string {
   return cleanMultilineText(description.text()).slice(0, MAX_DESCRIPTION_CHARS);
 }
 
-async function fetchPublicHtml(url: string): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      cache: "no-store",
-      headers: LINKEDIN_HEADERS,
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`LinkedIn responded ${response.status}`);
-    }
-    return await response.text();
-  } finally {
-    clearTimeout(timeout);
+async function fetchPublicHtml(url: string, signal?: AbortSignal): Promise<string> {
+  const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+  const response = await fetch(url, {
+    cache: "no-store",
+    headers: LINKEDIN_HEADERS,
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  // 429 is the rate limit; 999 is LinkedIn's own "request denied" code.
+  if (response.status === 429 || response.status === 403 || response.status === 999) {
+    throw new LinkedInBlockedError(response.status);
   }
+  if (!response.ok) throw new Error(`LinkedIn responded ${response.status}`);
+  return response.text();
 }
 
-async function fetchSearchPage(query: string, start: number): Promise<LinkedInCard[]> {
+export function searchUrl(keywords: string, start: number): string {
   const url = new URL(LINKEDIN_SEARCH_URL);
-  url.searchParams.set("keywords", query);
-  url.searchParams.set("location", "Abu Dhabi, United Arab Emirates");
+  url.searchParams.set("keywords", keywords);
+  url.searchParams.set("geoId", ABU_DHABI_GEO_ID);
   url.searchParams.set("f_TPR", `r${PAST_MONTH_SECONDS}`);
+  url.searchParams.set("sortBy", "DD");
   url.searchParams.set("start", String(start));
-  return parseLinkedInSearchHtml(await fetchPublicHtml(url.toString()));
-}
-
-async function mapWithConcurrency<T, R>(
-  values: T[],
-  concurrency: number,
-  worker: (value: T) => Promise<R>
-): Promise<PromiseSettledResult<R>[]> {
-  const results = new Array<PromiseSettledResult<R>>(values.length);
-  let nextIndex = 0;
-
-  async function runWorker() {
-    while (true) {
-      const index = nextIndex++;
-      if (index >= values.length) return;
-      try {
-        results[index] = { status: "fulfilled", value: await worker(values[index]) };
-      } catch (reason) {
-        results[index] = { status: "rejected", reason };
-      }
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, values.length) }, () => runWorker())
-  );
-  return results;
-}
-
-function postedTimestamp(card: LinkedInCard): number {
-  if (!card.postedIso) return 0;
-  const value = Date.parse(card.postedIso);
-  return Number.isFinite(value) ? value : 0;
+  return url.toString();
 }
 
 function wasPostedWithinPastMonth(card: LinkedInCard, now = Date.now()): boolean {
   if (!card.postedIso) return false;
   const posted = Date.parse(card.postedIso);
   if (!Number.isFinite(posted)) return false;
-
-  // LinkedIn returns date-only values. Compare at UTC calendar-day precision
-  // so a listing on the thirtieth day is not incorrectly dropped after midnight.
+  // Date-only values: compare by calendar day so day 30 is not dropped after midnight.
   const today = new Date(now);
-  const cutoff = Date.UTC(
-    today.getUTCFullYear(),
-    today.getUTCMonth(),
-    today.getUTCDate() - PAST_MONTH_DAYS
-  );
+  const cutoff = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 30);
   return posted >= cutoff && posted <= now;
 }
 
-async function crawlLinkedInJobs(): Promise<Omit<LinkedInJobsResult, "fromCache" | "stale">> {
-  const collectedCards = new Map<string, LinkedInCard>();
-  const firstPageYields = new Map<string, number>();
-  let attemptedSearches = 0;
-  let successfulSearches = 0;
-  let failedSearches = 0;
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Reads the next few searches, starting at `cursor`, one at a time with a short
+ * gap. The first block (429/403/999) stops the crawl, and the next sync retries
+ * the search that was refused. Throws only when not a single search could be read.
+ */
+export async function crawlLinkedInCards(signal?: AbortSignal, cursor = 0): Promise<LinkedInCrawl> {
+  const total = LINKEDIN_SLOTS.length;
+  let index = ((Math.trunc(cursor) % total) + total) % total;
+  const collected = new Map<string, LinkedInCard>();
+  let attempted = 0;
+  let failed = 0;
+  let read = 0;
+  let blocked = false;
   let firstFailure: unknown;
 
-  async function runSearchTasks(
-    tasks: Array<{ query: string; start: number }>,
-    trackYield = false
-  ) {
-    const pageResults = await mapWithConcurrency(
-      tasks,
-      SEARCH_PAGE_CONCURRENCY,
-      (task) => fetchSearchPage(task.query, task.start)
-    );
-    attemptedSearches += pageResults.length;
-    for (let index = 0; index < pageResults.length; index += 1) {
-      const result = pageResults[index];
-      const task = tasks[index];
-      if (result.status === "fulfilled") {
-        successfulSearches += 1;
-        // Keep the upstream filter defensive: if LinkedIn returns a stale or
-        // undated fuzzy result, it must not enter the past-month listing.
-        const validCards = result.value.filter((card) => wasPostedWithinPastMonth(card));
-        if (trackYield) firstPageYields.set(task.query, validCards.length);
-        for (const card of validCards) collectedCards.set(card.id, card);
-      } else {
-        failedSearches += 1;
-        firstFailure ??= result.reason;
-      }
+  while (read + failed < MAX_REQUESTS_PER_SYNC && !blocked && !signal?.aborted) {
+    if (attempted > 0) await pause(REQUEST_GAP_MS);
+    const slot = LINKEDIN_SLOTS[index];
+    attempted += 1;
+    try {
+      const cards = (await fetchPublicHtmlCards(slot.query, slot.start, signal)).filter((card) =>
+        wasPostedWithinPastMonth(card)
+      );
+      for (const card of cards) collected.set(card.id, card);
+      read += 1;
+      index = (index + 1) % total;
+    } catch (error) {
+      failed += 1;
+      firstFailure ??= error;
+      if (error instanceof LinkedInBlockedError) blocked = true;
+      // A block is retried next time; any other failure is skipped so one bad
+      // search cannot hold the cursor in place forever.
+      else index = (index + 1) % total;
     }
   }
 
-  // Search each role family once instead of deep-paging one huge OR query.
-  // This produces broader functional coverage and much less ranking skew.
-  await runSearchTasks(
-    LINKEDIN_QUERIES.map((query) => ({ query, start: 0 })),
-    true
-  );
-
-  // Most runs reach 60-70 unique jobs from the first page of each group. If
-  // they do not, request a second page only from the strongest groups, with a
-  // strict eight-request cap so the route remains safely below 60 seconds.
-  if (collectedCards.size < MIN_TARGET_RESULTS) {
-    const followUpTasks = [...firstPageYields.entries()]
-      .filter(([, count]) => count > 0)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, MAX_FOLLOW_UP_SEARCHES)
-      .map(([query]) => ({ query, start: 10 }));
-
-    for (let index = 0; index < followUpTasks.length; index += SEARCH_PAGE_CONCURRENCY) {
-      await runSearchTasks(followUpTasks.slice(index, index + SEARCH_PAGE_CONCURRENCY));
-      if (collectedCards.size >= MAX_RESULTS) break;
-    }
+  if (read === 0 && failed > 0) {
+    throw firstFailure instanceof Error ? firstFailure : new Error("LinkedIn could not be reached");
   }
-
-  if (successfulSearches === 0) {
-    throw new Error(
-      firstFailure instanceof Error ? firstFailure.message : "LinkedIn could not be reached"
-    );
-  }
-
-  const cards = [...collectedCards.values()]
-    .sort((a, b) => postedTimestamp(b) - postedTimestamp(a))
-    .slice(0, MAX_RESULTS);
-
-  // Search cards are enough to render the listing. Fetching every detail page
-  // in a burst triggers LinkedIn's public-endpoint rate limit, so the full
-  // description is intentionally loaded only for the job the user chooses
-  // to tailor (see fetchLinkedInJobDescription below).
-  const jobs = cards.map((card): Job => {
-    return {
-      id: `linkedin-${card.id}`,
-      title: card.title,
-      company: card.company,
-      location: card.location,
-      salary: null,
-      description: `LinkedIn listing for ${card.title} at ${card.company} in ${card.location}. The full description will be loaded before tailoring.`,
-      applyLink: card.applyLink,
-      source: "LinkedIn",
-      postedAt: card.postedAt,
-    };
-  });
-
   return {
-    jobs,
-    attemptedSearches,
-    successfulSearches,
-    failedSearches,
-    descriptionFailures: 0,
+    cards: [...collected.values()],
+    attemptedRequests: attempted,
+    failedRequests: failed,
+    blocked,
+    nextCursor: index,
+    slotsRead: read,
+    totalSlots: total,
   };
 }
 
+async function fetchPublicHtmlCards(query: string, start: number, signal?: AbortSignal) {
+  return parseLinkedInSearchHtml(await fetchPublicHtml(searchUrl(query, start), signal));
+}
+
+const descriptionCache = new Map<string, { description: string; expiresAt: number }>();
+const descriptionRequests = new Map<string, Promise<string>>();
+
+/** The full text of one LinkedIn posting, fetched when the job is opened or tailored. */
 export async function fetchLinkedInJobDescription(jobId: string): Promise<string> {
   if (!/^\d{6,}$/.test(jobId)) throw new Error("Invalid LinkedIn job ID");
 
@@ -309,47 +242,15 @@ export async function fetchLinkedInJobDescription(jobId: string): Promise<string
   if (existing) return existing;
 
   const request = (async () => {
-    const html = await fetchPublicHtml(`${LINKEDIN_JOB_URL}/${jobId}`);
-    const description = parseLinkedInDescriptionHtml(html);
+    const description = parseLinkedInDescriptionHtml(await fetchPublicHtml(`${LINKEDIN_JOB_URL}/${jobId}`));
     if (!description) throw new Error("LinkedIn did not return a job description");
-    descriptionCache.set(jobId, {
-      description,
-      expiresAt: Date.now() + DESCRIPTION_CACHE_TTL_MS,
-    });
+    descriptionCache.set(jobId, { description, expiresAt: Date.now() + DESCRIPTION_CACHE_TTL_MS });
     return description;
   })();
   descriptionRequests.set(jobId, request);
-
   try {
     return await request;
   } finally {
     if (descriptionRequests.get(jobId) === request) descriptionRequests.delete(jobId);
-  }
-}
-
-export async function fetchLinkedInJobs(forceRefresh = false): Promise<LinkedInJobsResult> {
-  if (!forceRefresh && linkedInCache && linkedInCache.expiresAt > Date.now()) {
-    return { ...linkedInCache.result, fromCache: true, stale: false };
-  }
-
-  // Coalesce concurrent toggle/refresh requests so one server process never
-  // crawls the same combined public search twice at the same time.
-  const request = linkedInRequest || crawlLinkedInJobs();
-  linkedInRequest = request;
-  try {
-    const result = await request;
-    if (result.jobs.length > 0) {
-      linkedInCache = { result, expiresAt: Date.now() + CACHE_TTL_MS };
-    }
-    return { ...result, fromCache: false, stale: false };
-  } catch (error) {
-    // An expired cache is still better than replacing a LinkedIn-only view
-    // with mixed sources during a temporary block or network drop.
-    if (linkedInCache) {
-      return { ...linkedInCache.result, fromCache: true, stale: true };
-    }
-    throw error;
-  } finally {
-    if (linkedInRequest === request) linkedInRequest = null;
   }
 }
