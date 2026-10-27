@@ -666,16 +666,23 @@ function evidenceGuardIssues(
   const ownership =
     /\b(?:lead|leads|leading|led|manage|manages|managed|managing|own|owns|owned|owning|directs|directed|directing|supervise|supervises|supervised|supervising|oversee|oversees|overseeing|oversaw|head|heads|headed|heading|accountable for)\b/i;
   if (ownership.test(highlight) && !ownership.test(evidenceScope)) {
-    issues.push(`${label} upgrades ownership beyond its same-employer evidence.`);
+    const verb = highlight.match(ownership)?.[0] ?? "that verb";
+    issues.push(
+      `${label} upgrades ownership beyond its same-employer evidence: "${quoteOffendingSentence(highlight, ownership)}" says "${verb}", but its source bullet(s) never do. Rewrite that sentence at the same level of involvement as the source (for example carried out, coordinated, contributed to, supported, took part in), without lead/manage/own/direct/oversee words.`
+    );
   }
   const auditOwnership =
     /\b(?:execut(?:e|es|ed|ing)|conduct(?:s|ed|ing)?|perform(?:s|ed|ing)?|lead(?:s|ing)?|led|manage(?:s|d|ment|ing)?|direct(?:s|ed|ing))\b[^.]{0,60}\baudits?\b/i;
   if (auditOwnership.test(highlight) && !auditOwnership.test(evidenceText)) {
-    issues.push(`${label} upgrades participation in audits into audit ownership.`);
+    issues.push(
+      `${label} upgrades participation in audits into audit ownership: "${quoteOffendingSentence(highlight, auditOwnership)}" — describe the audit work at the same level as the source (for example took part in, supported, prepared for) instead of executing, conducting or leading it.`
+    );
   }
   const qualification = /\b(certified|certification|degree|bachelor(?:'s)?|master(?:'s)?|chartered)\b/i;
   if (qualification.test(highlight) && !qualification.test(sourceLower)) {
-    issues.push(`${label} adds an unsupported qualification.`);
+    issues.push(
+      `${label} adds an unsupported qualification: "${quoteOffendingSentence(highlight, qualification)}" — delete that sentence; qualifications may only appear if the source bullet(s) state them.`
+    );
   }
 
   // Require a meaningful share of each rewritten claim to remain directly
@@ -687,7 +694,9 @@ function evidenceGuardIssues(
     const evidenceTokens = comparableTokens(evidenceText);
     const supportedTokenCount = [...claimTokens].filter((token) => evidenceTokens.has(token)).length;
     if (supportedTokenCount / claimTokens.size < 0.28) {
-      issues.push(`${label} is not sufficiently grounded in its selected candidate evidence.`);
+      issues.push(
+        `${label} is not sufficiently grounded in its selected candidate evidence: "${highlight.slice(0, 220)}" — rebuild it from the words and facts of its source bullet(s) only, without adding material from the vacancy.`
+      );
     }
   }
 
@@ -1312,7 +1321,9 @@ function validateTailoringQuality(
     const requirementTokens = comparableTokens(requirement.requirement);
     const overlap = [...requirementTokens].filter((token) => jobDescriptionTokens.has(token)).length;
     if (requirementTokens.size >= 3 && overlap < Math.max(1, Math.ceil(requirementTokens.size * 0.2))) {
-      issues.push(`${requirement.id} is not sufficiently grounded in the full job description.`);
+      // A ranked requirement is a label for the model's own analysis and never
+      // appears in the CV, so a loosely worded one is not a reason to reject the reply.
+      console.warn(`${requirement.id} is not sufficiently grounded in the full job description.`);
     }
   });
   const rawSummary = normalizeSummaryText(raw?.tailoredSummary);

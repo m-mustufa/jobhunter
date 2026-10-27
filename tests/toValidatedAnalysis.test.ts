@@ -44,6 +44,14 @@ describe("toValidatedAnalysis", () => {
       expect(issuesOf(reply)).toEqual([]);
     });
 
+    it("keeps a reply whose own requirement label is not worded like the vacancy", () => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const reply = baseReply();
+      // A ranked requirement is analysis metadata; it never appears in the CV.
+      reply.rankedRequirements[5].requirement = "Operate rocket thrusters in low orbit";
+      expect(issuesOf(reply)).toEqual([]);
+    });
+
     it("keeps a long highlight and never cuts it", () => {
       const reply = baseReply();
       const long =
@@ -70,6 +78,28 @@ describe("toValidatedAnalysis", () => {
       reply.experienceRewrites[0].tailoredHighlights[2].text =
         "Created a supplier scorecard that lifted on-time delivery by 40% and cut repeat defects.";
       expect(issuesOf(reply).join(" ")).toMatch(/unsupported numeric evidence/);
+    });
+
+    it("rejects an ownership upgrade and names the sentence, the verb and what to write instead", () => {
+      const reply = baseReply();
+      reply.experienceRewrites[1].tailoredHighlights[0].text =
+        "Led contractor welding checks against approved procedures. Logged every non-conformance.";
+      const [issue] = issuesOf(reply).filter((text) => /upgrades ownership/.test(text));
+      expect(issue).toBeDefined();
+      expect(issue).toContain('"Led contractor welding checks against approved procedures."');
+      expect(issue).toContain('says "Led"');
+      expect(issue).toMatch(/same level of involvement as the source/);
+      // The sentence that was fine is not blamed.
+      expect(issue).not.toContain("Logged every non-conformance");
+    });
+
+    it("rejects an unsupported qualification and quotes the sentence", () => {
+      const reply = baseReply();
+      reply.experienceRewrites[1].tailoredHighlights[2].text =
+        "Coached junior engineers on inspection methods. Brings a certified approach to documentation standards.";
+      const [issue] = issuesOf(reply).filter((text) => /unsupported qualification/.test(text));
+      expect(issue).toBeDefined();
+      expect(issue).toContain("Brings a certified approach to documentation standards.");
     });
 
     it("rejects a tool or standard the evidence does not contain", () => {
