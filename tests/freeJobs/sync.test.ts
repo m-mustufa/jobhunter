@@ -137,6 +137,37 @@ describe("free job sync", () => {
     }
   });
 
+  it("keeps a site's jobs when the site suddenly lists nothing at all", async () => {
+    state.listings = { alpha: { ids: ["a1", "a2"] }, beta: { ids: ["b1"] } };
+    await sync();
+
+    // An empty answer looks like a changed page format, not every job closing.
+    state.listings.alpha = { ids: [] };
+    for (let i = 0; i < 3; i += 1) {
+      const result = await sync();
+      expect(result.failedSources).toEqual(["Alpha Co"]);
+      expect(idsOf(result.jobs, "Alpha Co")).toEqual(["a1", "a2"]);
+      expect(idsOf(result.jobs, "Beta Co")).toEqual(["b1"]);
+    }
+  });
+
+  it("does not flag a site that lists nothing when it has never had jobs saved", async () => {
+    state.listings = { alpha: { ids: [] }, beta: { ids: ["b1"] } };
+    const result = await sync();
+    expect(result.failedSources).toEqual([]);
+    expect(idsOf(result.jobs, "Beta Co")).toEqual(["b1"]);
+  });
+
+  it("still lets a site's closed jobs go when it lists others", async () => {
+    state.listings = { alpha: { ids: ["a1", "a2"] }, beta: { ids: ["b1"] } };
+    await sync();
+
+    state.listings.alpha = { ids: ["a1"] };
+    await sync();
+    const result = await sync();
+    expect(idsOf(result.jobs, "Alpha Co")).toEqual(["a1"]);
+  });
+
   it("drops at once a job the site still lists but that is now too old", async () => {
     state.listings = { alpha: { ids: ["a1", "a2"] }, beta: { ids: ["b1"] } };
     await sync();
