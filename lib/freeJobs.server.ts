@@ -124,6 +124,16 @@ async function syncSource(
     signal.throwIfAborted();
     const adapter = ADAPTERS[source.adapter];
     const candidates = await adapter.list(source, signal);
+    // A site that suddenly lists nothing at all, while we hold jobs from it, has
+    // far more likely changed its format or answered with an empty page than
+    // closed every posting. Treat it like an unreachable site so its saved jobs
+    // are kept (they still age out under the usual rules).
+    if (candidates.length === 0) {
+      const prefix = jobIdPrefix(source);
+      for (const id of previousById.keys()) {
+        if (id.startsWith(prefix)) throw new Error("the site listed no postings; keeping its saved listings");
+      }
+    }
     const incomplete = candidates.incomplete === true;
     const matching = candidates.filter((candidate) =>
       passesListCriteria(candidate, { skipLocation: candidate.locationUnknown })
