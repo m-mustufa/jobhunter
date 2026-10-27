@@ -100,6 +100,19 @@ describe("/api/profile", () => {
     expect(mocks.saveStoredProfile).toHaveBeenCalledWith({ profile, masterCV: "Master CV text" });
   });
 
+  it("stores only the profile fields the app knows, in their proper types", async () => {
+    mocks.saveStoredProfile.mockResolvedValue(true);
+    const messy = { ...profile, skills: "not a list", links: [1, 2], injected: "<script>", summary: 42 };
+    await putProfile(jsonRequest("/api/profile", "PUT", { profile: messy, masterCV: "x" }));
+    const saved = mocks.saveStoredProfile.mock.calls[0][0].profile;
+    expect(saved.skills).toEqual([]);
+    expect(saved.links).toEqual(["1", "2"]);
+    expect(saved.summary).toBe("");
+    expect(saved).not.toHaveProperty("injected");
+    expect(saved.experience).toEqual(profile.experience);
+    expect(saved.name).toBe(profile.name);
+  });
+
   it.each([
     ["a body that is not JSON", "{nope"],
     ["no profile", { masterCV: "x" }],
