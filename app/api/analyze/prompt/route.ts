@@ -24,6 +24,20 @@ export async function POST(req: Request) {
     );
   }
 
+  // The same check the import route makes: a prompt built from a vacancy with
+  // no text would send Claude nothing to tailor against.
+  if (
+    typeof job.title !== "string" ||
+    !job.title.trim() ||
+    typeof job.description !== "string" ||
+    !job.description.trim()
+  ) {
+    return NextResponse.json(
+      { error: "The target job and its full description are required." },
+      { status: 400 }
+    );
+  }
+
   const candidateProfile = sanitizeProfile(profile);
   const prompt = `${SYSTEM}\n\n${buildPrompt(job, candidateProfile, {
     requestWebResearch: process.env.ROLE_RESEARCH_ENABLED !== "false",
