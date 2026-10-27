@@ -47,6 +47,14 @@ describe("isTightManagerialTitle", () => {
     expect(isTightManagerialTitle("Technical Lead")).toBe(true);
   });
 
+  it("rejects junior and clerical titles even when they hold a management word", () => {
+    for (const title of ["Junior Legal Counsel", "Jr. Manager", "Graduate Manager Programme", "Trainee Manager", "Document Controller", "Entry Level Manager"]) {
+      expect(isTightManagerialTitle(title), title).toBe(false);
+    }
+    expect(isTightManagerialTitle("Senior Legal Counsel")).toBe(true);
+    expect(isTightManagerialTitle("Financial Controller")).toBe(true);
+  });
+
   it("rejects individual-contributor titles", () => {
     for (const title of ["Software Engineer", "Lead Engineer", "Senior Specialist", "Operations Officer", "Project Coordinator"]) {
       expect(isTightManagerialTitle(title), title).toBe(false);

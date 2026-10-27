@@ -48,7 +48,13 @@ const SOFT_LEAD_WORD =
 const INDIVIDUAL_CONTRIBUTOR =
   /\b(?:engineer|developer|scientist|analyst|architect|consultant|specialist|officer|associate|supervisor|coordinator|assistant|programmer|designer|technician)\b/i;
 
+// Entry-level and clerical titles that still contain a management-looking word
+// ("Junior Legal Counsel", "Graduate Manager", "Document Controller").
+const JUNIOR_TITLE =
+  /\b(?:junior|jr|graduate|trainee|intern|internship|apprentice|entry[\s-]+level|document\s+controller)\b/i;
+
 export function isTightManagerialTitle(title: string): boolean {
+  if (JUNIOR_TITLE.test(title)) return false;
   if (MANAGEMENT_WORD.test(title)) return true;
   return SOFT_LEAD_WORD.test(title) && !INDIVIDUAL_CONTRIBUTOR.test(title);
 }
