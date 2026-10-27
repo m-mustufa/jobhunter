@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { loadStoredProfile, saveStoredProfile } from "@/lib/profileStore.server";
+import { sanitizeProfile } from "@/lib/profile";
 
 export const dynamic = "force-dynamic";
 
@@ -25,7 +26,9 @@ export async function PUT(req: Request) {
     return NextResponse.json({ error: "Both profile and masterCV are required." }, { status: 400 });
   }
 
-  const ok = await saveStoredProfile({ profile, masterCV });
+  // Store the same shape the rest of the app reads: known fields only, every
+  // list a list and every text a string.
+  const ok = await saveStoredProfile({ profile: sanitizeProfile(profile), masterCV });
   if (!ok) {
     return NextResponse.json(
       { error: "Blob storage isn't configured (missing BLOB_READ_WRITE_TOKEN) or the write failed." },
