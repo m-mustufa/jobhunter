@@ -1,70 +1,54 @@
-# JobHunter
+<img src="public/jobhunter-ai-job-search-agent-banner.png" alt="JobHunter AI job search and CV tailoring agent built with Next.js, TypeScript and Claude AI" width="100%" />
 
-An AI job-hunting agent for Abu Dhabi: one click searches executive,
-managerial, government, technical-leadership, and senior-specialist roles
-across hundreds of title and spelling variants, highlights locally recommended
-roles, then generates an AI-tailored CV + cover letter for any single role you
-choose to apply to.
+# JobHunter: AI Job Search & CV Tailoring Agent
 
-## What it does
+JobHunter is an **AI job-hunting agent** built with **Next.js, TypeScript and Claude AI**. One click searches executive, managerial, government and senior-specialist roles in Abu Dhabi across ~40 employer career sites and LinkedIn. It then writes a **tailored CV and cover letter** for the single job you choose to apply to.
 
-- Reads the **career sites of ~40 Abu Dhabi employers** directly, using the
-  public job feeds their own careers pages use (Oracle Recruiting Cloud,
-  Workday, SmartRecruiters, Lever, Phenom, Workable, Eightfold, SuccessFactors).
-  No paid job API and no key are needed. Each refresh keeps only roles that
-  pass the rules in `lib/freeJobs/criteria.ts`: a real management title (VP,
-  Director, Head, Manager, Lead...), a location in Abu Dhabi, posted in the
-  past 30 days, and a full description. Government and sovereign employers
-  rank first. The list is saved server-side, refreshes itself when it is more
-  than 6 hours old, and a manual Refresh is allowed every 5 minutes. A site
-  that cannot be reached keeps its saved listings, and the stalest sites are
-  synced first, so pressing Refresh again completes any that were missed.
-  Employers are listed in `lib/freeJobs/sources.ts`; add one by finding its
-  platform from a job's apply URL and confirming it returns jobs.
-- The **LinkedIn only** toggle uses **TheirStack** to retrieve LinkedIn-source
-  vacancies posted in Abu Dhabi during the past 30 days, including the full
-  job description. Normal reads never contact TheirStack. Live LinkedIn syncs
-  have a durable 12-hour cooldown and subsequently request only records
-  discovered since the previous successful sync, excluding already-seen IDs.
-- Current 30-day listings are ordered first, then by employer tier
-  (government/GRE, then large or established employers), local candidate
-  recommendation, and recency. Relevant SMEs and recruiter-posted vacancies
-  remain available; company priority is ordering, not exclusion.
-  A local **Recommended** marker and filter help surface promising vacancies
-  without an AI or provider call. The UI intentionally avoids showing a
-  percentage score that could underestimate the candidate or imply a
-  guaranteed outcome.
-- Click **"Tailor CV for this job"** on any single result to run one primary
-  **Claude** pass for that job. It returns a tailored profile, reordered and
-  rewritten experience bullets, a cover letter, a short gap analysis, and an
-  audit trail showing which master-CV statement backs each claim. An optional
-  corrective pass can run once using the complete job description only.
-- Tailoring is **truthful by design**: Claude only re-orders, re-emphasizes,
-  and rephrases what's already in your master CV. It never invents
-  experience — gaps are called out explicitly instead.
-- Once tailored, **"Apply with this CV"** downloads a finished, ready-to-attach
-  CV + cover letter (PDF and/or DOCX, per your Profile's CV Format setting),
-  then opens the original posting. A matching "Download" button on the Cover
-  Letter tab does the same for just the letter.
-- A **Profile** page (contact details, summary, skills, experience,
-  education, a photo, and your preferred download format) fills every
-  generated document — Master CV is generated from it automatically, so the
-  two can't drift apart. Fill it in manually, or upload an existing CV
-  (.pdf/.docx — e.g. LinkedIn's own "Save to PDF" export) to auto-extract it
-  via Claude, including pulling out an embedded photo if the file has one.
-  Everything persists locally in your browser.
-- An explicitly enabled `DEMO_MODE=true` provides labelled local sample data;
-  production never silently substitutes fabricated jobs for a missing API key.
+**Live app:** [jobhunter-lemon.vercel.app](https://jobhunter-lemon.vercel.app) <sub>(password-protected because it holds private CV data)</sub>
 
-## Run locally
+## ✨ Features
+
+- **Career-site search, no paid job API.** Reads the public job feeds behind ~40 Abu Dhabi employers' career pages (Oracle Recruiting Cloud, Workday, SmartRecruiters, Lever, Phenom, Workable, Eightfold, SuccessFactors). Only real management titles in Abu Dhabi, posted in the past 30 days, with a full description are kept.
+- **LinkedIn-only mode.** Uses TheirStack to fetch LinkedIn vacancies posted in Abu Dhabi, with a durable 12-hour cooldown and incremental syncs to protect paid credits.
+- **One-click CV tailoring with Claude.** Returns a tailored profile, rewritten experience bullets, a cover letter, a short gap analysis and an audit trail that shows which master-CV statement backs each claim.
+- **Truthful by design.** Claude only re-orders, re-emphasizes and rephrases what is already in your master CV. It never invents experience; gaps are called out instead.
+- **Ready-to-send documents.** "Apply with this CV" downloads the finished CV and cover letter (PDF and/or DOCX), then opens the original posting.
+- **Profile import.** Upload an existing CV (.pdf/.docx, including LinkedIn's "Save to PDF") and Claude extracts it into your profile, including an embedded photo.
+- **Secure by default.** API keys stay server-side, the site is password-gated and login attempts are throttled.
+
+## 🛠 Tech Stack
+
+`Next.js 14 (App Router)` `TypeScript` `React 18` `Tailwind CSS` `Claude API` `Vercel Blob` `@react-pdf/renderer` `docx` `Vitest` `Playwright`
+
+## ⚙️ How it works
+
+```text
+Refresh listings
+   |
+   +-- Career-site feeds (~40 employers)  +-- TheirStack (LinkedIn only)
+   |
+   +-- Filter: Abu Dhabi + management title + last 30 days + full description
+   +-- Deduplicate, rank (government first, then employer tier, recommendation, recency)
+   +-- Save to private Vercel Blob storage
+
+"Tailor CV for this job"
+   |
+   +-- One Claude pass on the full job description (+ optional bounded role research)
+   +-- Tailored CV, cover letter, gap analysis and audit trail
+   +-- Download PDF / DOCX and open the original posting
+```
+
+## 🚀 Run locally
 
 ```bash
 npm install
 cp .env.example .env.local   # add your keys (see below)
 npm run dev                  # http://localhost:3000
+npm test                     # Vitest suite
 ```
 
-## Keys
+<details>
+<summary><b>Environment variables</b></summary>
 
 | Variable | Needed? | What it's for |
 |---|---|---|
@@ -81,81 +65,54 @@ npm run dev                  # http://localhost:3000
 | `SITE_PASSWORD` | Required for a public deployment | Password-gates the site so public/bot traffic cannot access private CV data or burn paid API usage. Use a strong unique value. |
 | `DEMO_MODE` | Optional | Set to `true` to block all real Claude/TheirStack calls and use sample data — useful for local dev. Leave unset in production. |
 
-**Jobs cache note**: the server keeps each provider's successful snapshot in
-memory and private Blob storage. Normal searches reuse saved data. Career-site
-listings refresh themselves when the saved list is over 6 hours old and
-otherwise only when you click **Refresh listings** (at most once every 5
-minutes).
-TheirStack live syncs are limited to once every 12 hours and incremental
-refreshes return only newly discovered records where possible. Saved jobs are
-never removed automatically. Profile & CV includes a **Clear saved listings**
-action protected by an exact `Confirm` entry; clearing listing payloads does
-not clear either provider's request guard.
-TheirStack live refreshes are refused when Blob storage is not configured, so a
-server restart cannot silently bypass the paid-request cooldown.
-The Recommended marker/filter and employer-priority ordering are local; they
-never contact a job provider or Claude. Tailoring treats the complete vacancy
-description as its primary source. On a role-research cache miss, it may make
-at most one bounded web search during the primary Claude pass; the result is
-cached by normalized role and functional domain for 30-60 days. Any corrective
-pass is job-description-only and never repeats the web search. With Blob
-storage configured, the role-research cache also survives process restarts.
-Only the on-demand "Tailor CV for this job" action and CV-upload extraction use
-paid Claude calls.
+</details>
 
-## Deploy to Vercel (public link in ~5 min)
+<details>
+<summary><b>Jobs cache and paid-call limits</b></summary>
 
-1. Push this folder to a GitHub repo.
-2. Go to vercel.com → **New Project** → import the repo.
-3. Add the environment variables above under **Settings → Environment Variables**.
-4. Deploy. You get a public URL like `https://jobhunter-demo.vercel.app`.
+- The server keeps each provider's successful snapshot in memory and private Blob storage. Normal searches reuse saved data.
+- Career-site listings refresh themselves when the saved list is over 6 hours old, and otherwise only when you click **Refresh listings** (at most once every 5 minutes). A site that cannot be reached keeps its saved listings, and the stalest sites are synced first.
+- TheirStack live syncs are limited to once every 12 hours and return only newly discovered records where possible. Live refreshes are refused when Blob storage is not configured, so a server restart cannot bypass the paid-request cooldown.
+- Saved jobs are never removed automatically. **Clear saved listings** (Profile & CV) requires an exact `Confirm` entry and does not clear either provider's request guard.
+- The Recommended marker/filter and employer-priority ordering are local; they never contact a job provider or Claude. The UI intentionally avoids a percentage score that could underestimate the candidate or imply a guaranteed outcome.
+- Tailoring treats the complete vacancy description as its primary source. On a role-research cache miss it may make at most one bounded web search during the primary Claude pass; the result is cached by normalized role and functional domain for 30-60 days. Any corrective pass is job-description-only.
+- Only "Tailor CV for this job" and CV-upload extraction use paid Claude calls. An explicitly enabled `DEMO_MODE=true` provides labelled sample data; production never silently substitutes fabricated jobs for a missing key.
 
-That URL is what you share with the client.
+</details>
 
-## How search works
+<details>
+<summary><b>How search works</b></summary>
 
-The shared taxonomy now covers hundreds of executive, managerial, government,
-oil-and-gas, technical-leadership, and senior-professional title variants. It
-includes common abbreviations and reversed word orders such as `Head of X`,
-`X Head`, `X Director`, `X Manager`, and `X Lead`.
+The shared title taxonomy covers hundreds of executive, managerial, government, oil-and-gas, technical-leadership and senior-professional title variants, including abbreviations and reversed word orders such as `Head of X`, `X Head`, `X Director`, `X Manager` and `X Lead`. See [lib/targetRoles.ts](lib/targetRoles.ts).
 
-Job titles searched: the original spec list (VP, AVP, GM, DGM, Business Unit
-Head, Division Head, Department Head, Senior Manager, Department Manager,
-Area Manager, Senior Project Manager, Project Director, Engineering Manager,
-Operations Manager, Commercial Manager, Finance Manager, HR Manager, IT
-Manager, Data Management Manager, Quality/QA-QC Manager, HSE Manager, Supply
-Chain Manager, Procurement Manager, Contracts Manager, Business Development
-Manager, Strategy and Transformation Manager, Governance/Risk/Compliance
-Manager, Team Leader, Section Head, Lead) plus client-approved additions
-(Managing/Executive/Senior/Portfolio Director, the C-suite — CEO/COO/CFO/
-CTO/CIO/CHRO/CCO/CSO/CRO/CCO/CMO, Country Manager/Head, Regional Director/
-Manager, General Counsel, Legal Manager/Counsel, Marketing Manager,
-Communications Manager, Internal Audit Manager, Risk Manager, Compliance
-Manager, Sustainability/ESG Manager, Investment/Treasury/Portfolio Manager,
-Category/Facilities/Program Manager) — see
-[lib/targetRoles.ts](lib/targetRoles.ts).
+Career-site jobs are matched against this list and tightened to real management titles (see `FREE_JOBS_TITLE_MODE`), using the rules in `lib/freeJobs/criteria.ts`. Employers are listed in `lib/freeJobs/sources.ts`; add one by finding its platform from a job's apply URL and confirming it returns jobs.
 
-Career-site jobs are matched against this title list and then tightened to
-real management titles (see `FREE_JOBS_TITLE_MODE`). TheirStack reserves most
-of each paid sync for executive, government, director, and explicitly senior
-roles before using the remaining capacity for broad manager/lead discovery.
-Every record is checked again for Abu Dhabi and a matching managerial title,
-deduplicated, and merged into durable saved listing history. The default UI
-order places current 30-day jobs first, then prioritizes employer tier, the
-candidate's local recommendation, and recency. Defaults allow up to 150
-LinkedIn records per eligible live sync without weakening the existing cache
-or 12-hour LinkedIn credit guard.
-The dedicated **Employers** page shows the bundled, curated Abu Dhabi employer
-directory (`lib/employerDirectory.ts`), grouped by sector, with a LinkedIn
-jobs link for each. It is static data; no provider is called.
+TheirStack reserves most of each paid sync for executive, government, director and explicitly senior roles before using the remaining capacity for broad manager/lead discovery. Every record is checked again for Abu Dhabi and a matching managerial title, deduplicated and merged into saved listing history.
 
-## Notes
+The **Employers** page shows a curated, static Abu Dhabi employer directory (`lib/employerDirectory.ts`), grouped by sector, with a LinkedIn jobs link for each.
 
-- Keys stay server-side (in the API routes) — they're never exposed to the browser.
-- Edit your Profile and Master CV in the app via the **Profile & CV** button
-  (top right), or change the defaults in `lib/profile.ts` / `lib/masterCV.ts`.
-- Stack: Next.js (App Router) + TypeScript + Tailwind. `@react-pdf/renderer`
-  and `docx` generate the downloadable PDF/DOCX files client-side
-  (lazy-loaded on click, not in the main bundle); `pdf-parse` and `mammoth`
-  extract text (and, best-effort, an embedded photo) from uploaded resume
-  files server-side for the Profile importer.
+</details>
+
+<details>
+<summary><b>Deploy to Vercel</b></summary>
+
+1. Import the repo in Vercel (**New Project**).
+2. Add the environment variables above under **Settings → Environment Variables**. Set `SITE_PASSWORD` for any public deployment.
+3. Deploy.
+
+</details>
+
+<details>
+<summary><b>Project notes</b></summary>
+
+- Keys stay server-side in the API routes and are never exposed to the browser.
+- Edit the Profile and Master CV in the app via **Profile & CV**, or change the defaults in `lib/profile.ts` / `lib/masterCV.ts`. The Master CV is generated from the Profile, so the two can't drift apart.
+- `@react-pdf/renderer` and `docx` generate the PDF/DOCX files client-side (lazy-loaded on click, not in the main bundle). `pdf-parse` and `mammoth` extract text and, best-effort, an embedded photo from uploaded CVs server-side.
+
+</details>
+
+## 👋 Built by
+
+**Muhammad Mustafa**, Senior Full-Stack SaaS & AI Developer with 10+ years of experience. I build AI agents, SaaS products and full-stack web apps with React, Next.js, Node.js and TypeScript for startups and businesses in the UAE and worldwide.
+
+**Need an AI agent or SaaS product like this?** [aisaaswithmustafa.com](https://aisaaswithmustafa.com/) · [LinkedIn](https://www.linkedin.com/in/muhammad-mustafa-16477a99/) · [Email](mailto:mustufa50@gmail.com)
